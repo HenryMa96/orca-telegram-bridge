@@ -366,6 +366,7 @@ export async function dispatchToOrcaBotAndWait(
     tgChatId: string
     senderLabel: string
     userText: string
+    imagePaths?: string[]
     timeoutMs: number
     pollIntervalMs?: number
     signal?: AbortSignal
@@ -403,15 +404,28 @@ export async function dispatchToOrcaBotAndWait(
     }
   }
 
-  const preview = params.userText.replace(/\s+/g, ' ').trim().slice(0, 40) || 'Telegram message'
+  const cleanText = params.userText.trim()
+  const imagePaths = (params.imagePaths ?? []).filter(Boolean)
+  const previewBase = cleanText || (imagePaths.length > 0 ? '[Image]' : 'Telegram message')
+  const preview = previewBase.replace(/\s+/g, ' ').trim().slice(0, 40)
   const subject = targetChatId === 'new' ? `Telegram: ${preview}` : `Telegram reply: ${preview}`
   const requestMarker = `[tg:${params.tgChatId}:${Date.now()}]`
-  const body = [
+  const bodyParts = [
     `Telegram message from owner (${params.senderLabel}, chat ${params.tgChatId}) ${requestMarker}.`,
-    'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).',
+    'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).'
+  ]
+  if (imagePaths.length > 0) {
+    bodyParts.push(
+      '',
+      'Attached Telegram image(s) saved locally (use your Read tool on these path(s) to view them):',
+      ...imagePaths.map((p) => `- ${p}`)
+    )
+  }
+  bodyParts.push(
     '',
-    params.userText
-  ].join('\n')
+    cleanText || 'Please inspect the attached image(s) above and respond.'
+  )
+  const body = bodyParts.join('\n')
 
   await runner.sendToBot({
     botName: params.botName,

@@ -18,6 +18,29 @@ export type TelegramChat = {
   first_name?: string
 }
 
+export type TelegramPhotoSize = {
+  file_id: string
+  file_unique_id: string
+  width: number
+  height: number
+  file_size?: number
+}
+
+export type TelegramDocument = {
+  file_id: string
+  file_unique_id: string
+  file_name?: string
+  mime_type?: string
+  file_size?: number
+}
+
+export type TelegramFile = {
+  file_id: string
+  file_unique_id: string
+  file_size?: number
+  file_path?: string
+}
+
 export type TelegramMessage = {
   message_id: number
   from?: TelegramUser
@@ -25,6 +48,8 @@ export type TelegramMessage = {
   date: number
   text?: string
   caption?: string
+  photo?: TelegramPhotoSize[]
+  document?: TelegramDocument
 }
 
 export type TelegramUpdate = {
@@ -93,6 +118,16 @@ export interface TelegramClient {
     params: { chatId: number | string; action: 'typing' },
     options?: TelegramRequestOptions
   ): Promise<boolean>
+  getFile(
+    token: string,
+    fileId: string,
+    options?: TelegramRequestOptions
+  ): Promise<TelegramFile>
+  downloadFile(
+    token: string,
+    filePath: string,
+    options?: TelegramRequestOptions
+  ): Promise<Buffer>
 }
 
 export function resolveProxyUrl(explicitProxy?: string): string | undefined {
@@ -323,6 +358,92 @@ async function sendTelegramHttp<T>(
   })
 }
 
+const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+async function downloadTelegramFileBytes(
+  token: string,
+  filePath: string,
+  options: TelegramRequestOptions = {}
+): Promise<Buffer> {
+  const cleanPath = filePath.replace(/^\/+/, '')
+  if (!cleanPath || cleanPath.includes('..')) {
+    throw new TelegramApiError('Invalid Telegram file path', 400, false)
+  }
+
+  const proxyUrl = resolveProxyUrl(options.proxyUrl)
+  const timeoutMs = options.timeoutMs ?? 30_000
+
+  return new Promise<Buffer>((resolve, reject) => {
+    const agent = proxyUrl ? createProxyAgent(proxyUrl) : undefined
+    const req = https.request(
+      {
+        hostname: 'api.telegram.org',
+        port: 443,
+        path: `/file/bot${token}/${cleanPath}`,
+        method: 'GET',
+        agent
+      },
+      (res) => {
+        const status = res.statusCode ?? 0
+        const chunks: Buffer[] = []
+        let total = 0
+        res.on('data', (chunk: Buffer) => {
+          total += chunk.length
+          if (total > MAX_TELEGRAM_DOWNLOAD_BYTES) {
+            req.destroy(new TelegramApiError('Telegram file exceeds 20 MB limit', 413, false))
+            return
+          }
+          chunks.push(chunk)
+        })
+        res.on('end', () => {
+          if (status < 200 || status >= 300) {
+            reject(
+              new TelegramApiError(
+                `Failed downloading Telegram file (${status})`,
+                status,
+                status >= 500
+              )
+            )
+            return
+          }
+          resolve(Buffer.concat(chunks))
+        })
+      }
+    )
+
+    const onAbort = () => {
+      req.destroy(new TelegramApiError('Request aborted', 0, false))
+    }
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        onAbort()
+        return
+      }
+      options.signal.addEventListener('abort', onAbort, { once: true })
+    }
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new TelegramApiError(`Telegram file download timed out after ${timeoutMs}ms`, 0, true))
+    })
+
+    req.on('error', (err) => {
+      options.signal?.removeEventListener('abort', onAbort)
+      if (err instanceof TelegramApiError) {
+        reject(err)
+      } else {
+        reject(new TelegramApiError(err.message, 0, true))
+      }
+    })
+
+    req.on('close', () => {
+      options.signal?.removeEventListener('abort', onAbort)
+    })
+
+    req.end()
+  })
+}
+
 export function createTelegramClient(): TelegramClient {
   return {
     getMe(token, options) {
@@ -389,6 +510,17 @@ export function createTelegramClient(): TelegramClient {
         { chat_id: params.chatId, action: params.action },
         options
       )
+    },
+    getFile(token, fileId, options) {
+      return callTelegramApi<TelegramFile>(
+        token,
+        'getFile',
+        { file_id: fileId },
+        { ...options, timeoutMs: options?.timeoutMs ?? 15_000 }
+      )
+    },
+    downloadFile(token, filePath, options) {
+      return downloadTelegramFileBytes(token, filePath, options)
     }
   }
 }

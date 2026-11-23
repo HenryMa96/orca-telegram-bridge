@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
   computeTailHashes,
@@ -64,9 +67,56 @@ export type BridgeDeps = {
   telegram: TelegramClient
   orcaCli: OrcaCliRunner
   renderTable?: (table: ExtractedTable) => Promise<Buffer | null>
+  downloadDir?: string
   pollIntervalMs?: number
   outboundPollIntervalMs?: number
   retryBackoffMs?: number
+}
+
+type IncomingTelegramImage = {
+  fileId: string
+  mimeType?: string
+  preferredExt?: string
+}
+
+const ALLOWED_IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'])
+
+function extractIncomingImage(msg: TelegramMessage): IncomingTelegramImage | null {
+  if (msg.photo && msg.photo.length > 0) {
+    const largest = msg.photo.reduce((best, item) => {
+      const bestScore = best.file_size ?? best.width * best.height
+      const itemScore = item.file_size ?? item.width * item.height
+      return itemScore >= bestScore ? item : best
+    })
+    return { fileId: largest.file_id, preferredExt: '.jpg' }
+  }
+  if (msg.document && msg.document.mime_type?.toLowerCase().startsWith('image/')) {
+    const docExt = msg.document.file_name
+      ? path.extname(msg.document.file_name).toLowerCase()
+      : ''
+    return {
+      fileId: msg.document.file_id,
+      mimeType: msg.document.mime_type,
+      preferredExt: ALLOWED_IMAGE_EXTS.has(docExt) ? docExt : undefined
+    }
+  }
+  return null
+}
+
+function resolveSafeImageExt(
+  filePath?: string,
+  mimeType?: string,
+  preferredExt?: string
+): string {
+  const fromPath = filePath ? path.extname(filePath).toLowerCase() : ''
+  if (ALLOWED_IMAGE_EXTS.has(fromPath)) return fromPath
+  if (preferredExt && ALLOWED_IMAGE_EXTS.has(preferredExt)) return preferredExt
+  const mime = mimeType?.toLowerCase()
+  if (mime === 'image/png') return '.png'
+  if (mime === 'image/webp') return '.webp'
+  if (mime === 'image/gif') return '.gif'
+  if (mime === 'image/bmp') return '.bmp'
+  return '.jpg'
 }
 
 function parseAllowedIds(raw: string): Set<string> {
@@ -364,7 +414,8 @@ export class TelegramBridgeController {
     const msg = update.message
     if (!msg) return
     const text = (msg.text ?? msg.caption ?? '').trim()
-    if (!text) return
+    const image = extractIncomingImage(msg)
+    if (!text && !image) return
 
     const tgChatId = String(msg.chat.id)
     const fromId = msg.from ? String(msg.from.id) : tgChatId
@@ -388,7 +439,7 @@ export class TelegramBridgeController {
       return
     }
 
-    await this.enqueueChatWork(tgChatId, () => this.processAuthorizedMessage(msg, text))
+    await this.enqueueChatWork(tgChatId, () => this.processAuthorizedMessage(msg, text, image))
   }
 
   private enqueueChatWork(tgChatId: string, work: () => Promise<void>): Promise<void> {
@@ -405,14 +456,18 @@ export class TelegramBridgeController {
     return next
   }
 
-  private async processAuthorizedMessage(msg: TelegramMessage, text: string): Promise<void> {
+  private async processAuthorizedMessage(
+    msg: TelegramMessage,
+    text: string,
+    image: IncomingTelegramImage | null = null
+  ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
 
     const tgChatId = String(msg.chat.id)
     const senderLabel = formatSenderLabel(msg)
 
-    if (text.startsWith('/')) {
+    if (!image && text.startsWith('/')) {
       const handled = await this.handleSlashCommand(token, msg, text)
       if (handled) return
     }
@@ -429,7 +484,11 @@ export class TelegramBridgeController {
       )
       return
     }
-    await this.appendLog('info', `[TG ${senderLabel} -> ${binding.botName}] ${text.slice(0, 120)}`)
+    const logPreview = text ? text.slice(0, 120) : '[Image]'
+    await this.appendLog(
+      'info',
+      `[TG ${senderLabel} -> ${binding.botName}] ${image && text ? `[Image] ${logPreview}` : logPreview}`
+    )
     this.emitState()
 
     this.activeTelegramTgChats.add(tgChatId)
@@ -439,12 +498,28 @@ export class TelegramBridgeController {
 
     let boundOrcaChatId = binding.orcaChatId
     try {
+      const imagePaths: string[] = []
+      if (image) {
+        try {
+          await this.deps.telegram.sendChatAction(
+            token,
+            { chatId: msg.chat.id, action: 'typing' },
+            { proxyUrl: this.config.proxyUrl, timeoutMs: 8000 }
+          )
+        } catch {
+          // Non-fatal typing failure.
+        }
+        const savedPath = await this.downloadTelegramImage(token, image, msg.message_id)
+        imagePaths.push(savedPath)
+      }
+
       const result = await dispatchToOrcaBotAndWait(this.deps.orcaCli, {
         botName: binding.botName,
         boundChatId: binding.orcaChatId,
         tgChatId,
         senderLabel,
         userText: text,
+        imagePaths,
         timeoutMs: this.config.replyTimeoutSec * 1000,
         pollIntervalMs: this.deps.pollIntervalMs,
         signal: this.pollAbort?.signal,
@@ -524,6 +599,57 @@ export class TelegramBridgeController {
       if (boundOrcaChatId) {
         this.activeTelegramOrcaChats.delete(boundOrcaChatId)
       }
+    }
+  }
+
+  private async downloadTelegramImage(
+    token: string,
+    image: IncomingTelegramImage,
+    messageId: number
+  ): Promise<string> {
+    const fileMeta = await this.deps.telegram.getFile(token, image.fileId, {
+      proxyUrl: this.config.proxyUrl,
+      timeoutMs: 15_000,
+      signal: this.pollAbort?.signal
+    })
+    if (!fileMeta.file_path) {
+      throw new Error('Telegram did not return a downloadable file_path for this image.')
+    }
+    const bytes = await this.deps.telegram.downloadFile(token, fileMeta.file_path, {
+      proxyUrl: this.config.proxyUrl,
+      timeoutMs: 30_000,
+      signal: this.pollAbort?.signal
+    })
+
+    const dir = this.deps.downloadDir ?? path.join(os.tmpdir(), 'orca-telegram-bridge', 'images')
+    await fs.mkdir(dir, { recursive: true })
+    await this.cleanupOldDownloadedImages(dir)
+
+    const ext = resolveSafeImageExt(fileMeta.file_path, image.mimeType, image.preferredExt)
+    const filename = `tg-${Date.now()}-${messageId}-${Math.random().toString(36).slice(2, 6)}${ext}`
+    const targetPath = path.join(dir, filename)
+    await fs.writeFile(targetPath, bytes)
+    return targetPath
+  }
+
+  private async cleanupOldDownloadedImages(dir: string): Promise<void> {
+    try {
+      const cutoffMs = Date.now() - 24 * 60 * 60 * 1000
+      const entries = await fs.readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isFile()) continue
+        const full = path.join(dir, entry.name)
+        try {
+          const stat = await fs.stat(full)
+          if (stat.mtimeMs < cutoffMs) {
+            await fs.unlink(full)
+          }
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+    } catch {
+      // Best-effort cleanup.
     }
   }
 

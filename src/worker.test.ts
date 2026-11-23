@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
@@ -86,6 +89,17 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async sendChatAction(_token, params) {
       sentActions.push({ chatId: params.chatId, action: params.action })
       return true
+    },
+    async getFile(_token, fileId) {
+      return {
+        file_id: fileId,
+        file_unique_id: `u_${fileId}`,
+        file_size: 16,
+        file_path: fileId.includes('png') ? 'documents/file_1.png' : 'photos/file_0.jpg'
+      }
+    },
+    async downloadFile() {
+      return Buffer.from('fake-image-bytes')
     },
     ...overrides.telegram
   }
@@ -518,4 +532,110 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   assert.deepEqual(capturedWorker.refusals, [])
   await controller.dispose()
   await capturedWorker.deactivate()
+})
+
+test('controller downloads Telegram photo and image document and passes local paths to Orca bot', async () => {
+  const tempDownloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-tg-bridge-test-'))
+  const downloadedFileIds: string[] = []
+  const host = mockHost({
+    capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: false
+    }
+  })
+
+  const deps = makeMockDeps({
+    telegram: {
+      async getFile(_token, fileId) {
+        downloadedFileIds.push(fileId)
+        return {
+          file_id: fileId,
+          file_unique_id: `u_${fileId}`,
+          file_path: fileId === 'doc-png-1' ? 'documents/screenshot.png' : 'photos/photo_lg.jpg'
+        }
+      },
+      async downloadFile(_token, filePath) {
+        return Buffer.from(`bytes-for-${filePath}`)
+      }
+    }
+  })
+
+  let controller!: TelegramBridgeController
+  const capturedWorker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        controller = new TelegramBridgeController(orca, {
+          telegram: deps.telegram,
+          orcaCli: deps.orcaCli,
+          downloadDir: tempDownloadDir,
+          pollIntervalMs: 10
+        })
+        await controller.init()
+      }
+    },
+    { host }
+  )
+
+  try {
+    // 1. Compressed photo without caption picks largest resolution
+    await controller.handleIncomingUpdate({
+      update_id: 10,
+      message: {
+        message_id: 21,
+        from: { id: 777888, is_bot: false, first_name: 'Demo', username: 'demouser' },
+        chat: { id: 777888, type: 'private' },
+        date: 2000,
+        photo: [
+          { file_id: 'photo-sm', file_unique_id: 'sm', width: 90, height: 90, file_size: 1200 },
+          { file_id: 'photo-lg', file_unique_id: 'lg', width: 1280, height: 720, file_size: 48000 }
+        ]
+      }
+    })
+
+    assert.deepEqual(downloadedFileIds, ['photo-lg'])
+    assert.equal(deps.sentToBots.length, 1)
+    assert.match(deps.sentToBots[0].subject, /\[Image\]/)
+    assert.match(deps.sentToBots[0].body, /Attached Telegram image\(s\) saved locally/)
+    assert.match(deps.sentToBots[0].body, /\.jpg/)
+    assert.equal(deps.sentMessages[0].text, 'Reply #1 from Assistant')
+
+    // 2. Uncompressed image document with caption preserves .png and caption
+    await controller.handleIncomingUpdate({
+      update_id: 11,
+      message: {
+        message_id: 22,
+        from: { id: 777888, is_bot: false, first_name: 'Demo', username: 'demouser' },
+        chat: { id: 777888, type: 'private' },
+        date: 2001,
+        caption: 'Describe this screenshot',
+        document: {
+          file_id: 'doc-png-1',
+          file_unique_id: 'doc1',
+          file_name: '../../evil.png',
+          mime_type: 'image/png',
+          file_size: 2048
+        }
+      }
+    })
+
+    assert.deepEqual(downloadedFileIds, ['photo-lg', 'doc-png-1'])
+    assert.equal(deps.sentToBots.length, 2)
+    assert.match(deps.sentToBots[1].body, /\.png/)
+    assert.match(deps.sentToBots[1].body, /Describe this screenshot/)
+    assert.ok(!deps.sentToBots[1].body.includes('evil.png'))
+
+    const savedFiles = await fs.readdir(tempDownloadDir)
+    assert.equal(savedFiles.length, 2)
+    assert.deepEqual(capturedWorker.refusals, [])
+  } finally {
+    await controller.dispose()
+    await capturedWorker.deactivate()
+    await fs.rm(tempDownloadDir, { recursive: true, force: true })
+  }
 })
