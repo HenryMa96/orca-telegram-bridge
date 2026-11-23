@@ -24,7 +24,7 @@ import {
   Text,
   type PanelContext
 } from 'orca'
-import type { BridgeConnectionStatus, BridgeState } from './protocol'
+import type { BridgeConnectionStatus, BridgeState, SaveConfigInput } from './protocol'
 
 const bridgeState = atom<BridgeState | null>(null)
 const activeTab = atom<'setup' | 'bindings' | 'logs'>('setup', 'setup', { persist: 'plugin' })
@@ -80,15 +80,17 @@ async function saveConfig(): Promise<void> {
   set(feedback, null)
   try {
     const parsedTimeout = Number.parseInt(read(timeoutDraft), 10)
-    const next = await plugin.request('bridge.saveConfig', {
-      botToken: read(tokenDraft).trim() || undefined,
+    const cleanToken = read(tokenDraft).trim()
+    const payload: SaveConfigInput = {
       enabled: read(enabledDraft),
       defaultBot: read(defaultBotDraft).trim(),
       allowedUserIds: read(allowedIdsDraft).trim(),
       proxyUrl: read(proxyUrlDraft).trim(),
       replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
-      syncOrcaOutbound: read(syncOrcaOutboundDraft)
-    })
+      syncOrcaOutbound: read(syncOrcaOutboundDraft),
+      ...(cleanToken ? { botToken: cleanToken } : {})
+    }
+    const next = await plugin.request('bridge.saveConfig', payload)
     set(tokenDraft, '')
     set(bridgeState, next)
     hydrateForm(next, true)

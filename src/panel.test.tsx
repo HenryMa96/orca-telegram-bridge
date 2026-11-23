@@ -41,9 +41,20 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
 
 test('renders bridge status, allows saving config, and handles unauthorized user banner', async () => {
   let currentState = makeState({ lastBlockedUserId: '999000' })
+  let lastSavedInput: Record<string, unknown> | null = null
   const host = mockHost({
     requests: {
       'bridge.getState': () => currentState,
+      'bridge.saveConfig': (input: Record<string, unknown>) => {
+        lastSavedInput = input
+        currentState = makeState({
+          config: {
+            ...currentState.config,
+            syncOrcaOutbound: Boolean(input.syncOrcaOutbound)
+          }
+        })
+        return currentState
+      },
       'bridge.allowUserId': ({ userId }: { userId: string }) => {
         currentState = makeState({
           lastBlockedUserId: null,
@@ -66,6 +77,11 @@ test('renders bridge status, allows saving config, and handles unauthorized user
 
   await view.press({ text: 'Allow 999000' })
   assert.equal(view.find({ text: 'Allow 999000' }), null)
+
+  await view.press({ text: 'Save Settings' })
+  assert.ok(lastSavedInput !== null)
+  assert.equal('botToken' in lastSavedInput!, false)
+  assert.ok(view.find({ text: 'Settings saved.' }))
 
   await view.press({ text: 'Test Connection' })
   assert.ok(view.find({ text: /Connected to @demo_orca_bot/ }))
