@@ -11,7 +11,7 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
 - **Telegram → Orca image forwarding** — downloads compressed photos and uncompressed image documents locally and passes their file path(s) to the Orca bot (with optional caption)
 - **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram
-- **Telegram `/` command menu** (`setMyCommands`): `/help`, `/new`, `/bots`, `/use`, `/chats`, `/bind`, `/status`
+- **Telegram `/` command menu** (`setMyCommands`) + **interactive inline buttons**: `/help`, `/new`, `/home`, `/bots`, `/use`, `/chats`, `/bind`, `/rename`, `/sync`, `/automations`, `/run`, `/status`
 - **Rich Markdown + Table PNG rendering**:
   - Converts Markdown headings, bold, italic, strikethrough, blockquotes, task lists, links, and fenced code blocks to Telegram HTML
   - Renders standard Markdown tables (`| col |`) into crisp PNG images via Python Pillow (`sendPhoto`), automatically falling back to formatted text when Python/Pillow is not installed
@@ -36,13 +36,18 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 
 | Command | Description |
 | --- | --- |
-| `/help` | Show current target bot, session ID, and command list |
+| `/help` | Show current target bot, session ID, sync status, and command list |
 | `/new` | Reset current chat binding and start a fresh Orca session |
-| `/bots` | List all available Orca bots |
+| `/home` | Bind Telegram chat to the current bot's Home Chat |
+| `/bots` | List all available Orca bots with inline switch buttons |
 | `/use <name>` | Switch target Orca bot |
-| `/chats` | List recent active Orca chats for the current bot |
+| `/chats` | List recent active Orca chats with inline bind/new/home buttons |
 | `/bind <chatId>` | Bind Telegram chat to an existing Orca chat |
-| `/status` | Show Telegram bot, target Orca bot, session, and polling status |
+| `/rename <title>` | Rename the currently bound Orca chat |
+| `/sync [on\|off]` | Toggle or set Orca → Telegram outbound sync |
+| `/automations` | List Orca automations with inline run buttons |
+| `/run <id>` | Trigger an Orca automation immediately |
+| `/status` | Show Telegram bot, target Orca bot, session, sync, and polling status |
 
 ## Develop & Validate
 

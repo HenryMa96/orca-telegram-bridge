@@ -33,7 +33,10 @@ import {
   splitTelegramMessage,
   TelegramApiError,
   type TelegramBotCommand,
+  type TelegramCallbackQuery,
   type TelegramClient,
+  type TelegramInlineKeyboardButton,
+  type TelegramInlineKeyboardMarkup,
   type TelegramMessage,
   type TelegramUpdate
 } from './telegram-api'
@@ -56,10 +59,15 @@ type SyncCursor = {
 export const TELEGRAM_COMMANDS: TelegramBotCommand[] = [
   { command: 'help', description: 'Show available commands' },
   { command: 'new', description: 'Start a fresh Orca chat session' },
-  { command: 'bots', description: 'List available Orca bots' },
+  { command: 'home', description: 'Bind to current bot Home Chat' },
+  { command: 'bots', description: 'List & switch Orca bots' },
   { command: 'use', description: 'Switch target Orca bot (/use <name>)' },
-  { command: 'chats', description: 'List recent chats of current bot' },
+  { command: 'chats', description: 'List & switch recent Orca chats' },
   { command: 'bind', description: 'Bind to an Orca chat (/bind <id>)' },
+  { command: 'rename', description: 'Rename bound Orca chat (/rename <title>)' },
+  { command: 'sync', description: 'Toggle Orca -> TG sync (/sync on|off)' },
+  { command: 'automations', description: 'List & trigger Orca automations' },
+  { command: 'run', description: 'Run an automation now (/run <id>)' },
   { command: 'status', description: 'Show connection and session status' }
 ]
 
@@ -411,6 +419,11 @@ export class TelegramBridgeController {
       await this.orca.storage.set(STORAGE_OFFSET, this.updateOffset)
     }
 
+    if (update.callback_query) {
+      await this.handleIncomingCallbackQuery(update.callback_query)
+      return
+    }
+
     const msg = update.message
     if (!msg) return
     const text = (msg.text ?? msg.caption ?? '').trim()
@@ -440,6 +453,33 @@ export class TelegramBridgeController {
     }
 
     await this.enqueueChatWork(tgChatId, () => this.processAuthorizedMessage(msg, text, image))
+  }
+
+  private async handleIncomingCallbackQuery(cq: TelegramCallbackQuery): Promise<void> {
+    const fromId = String(cq.from.id)
+    const tgChatId = cq.message ? String(cq.message.chat.id) : fromId
+    const allowed = parseAllowedIds(this.config.allowedUserIds)
+    const token = await this.readToken()
+
+    if (!allowed.has(fromId) && !allowed.has(tgChatId)) {
+      this.lastBlockedUserId = fromId
+      await this.orca.storage.set(STORAGE_LAST_BLOCKED, fromId)
+      await this.appendLog('warn', `Blocked unauthorized Telegram callback from ${fromId}.`)
+      this.emitState()
+      if (token) {
+        await this.safeAnswerCallbackQuery(token, cq.id, '未授权访问，请先加入白名单。', true)
+      }
+      return
+    }
+
+    if (!token || !cq.message || !cq.data) {
+      if (token) {
+        await this.safeAnswerCallbackQuery(token, cq.id)
+      }
+      return
+    }
+
+    await this.enqueueChatWork(tgChatId, () => this.processCallbackQuery(token, cq))
   }
 
   private enqueueChatWork(tgChatId: string, work: () => Promise<void>): Promise<void> {
@@ -717,15 +757,21 @@ export class TelegramBridgeController {
 
     if (cmd === '/start' || cmd === '/help') {
       const helpText = [
-        `当前连接 Bot：${binding.botName}`,
+        `当前连接 Bot：${binding.botName || '(未检测到)'}`,
         `当前会话：${binding.orcaChatId || '(新会话，将在下一条消息创建)'}`,
+        `双向同步 (Orca -> TG)：${this.config.syncOrcaOutbound ? '开启' : '关闭'}`,
         '',
         '可用指令：',
-        '/bots - 列出本机所有 Orca Bot',
+        '/bots - 列出并点击切换 Orca Bot',
         '/use <名称> - 切换目标 Bot',
+        '/chats - 查看并点击绑定历史会话',
+        '/home - 绑定当前 Bot 的 Home Chat',
         '/new - 清空当前上下文，开启新对话',
-        '/chats - 查看当前 Bot 的历史会话',
         '/bind <chatId> - 绑定到指定的 Orca 会话',
+        '/rename <新标题> - 重命名当前绑定的会话',
+        '/sync [on|off] - 开关 Orca 端消息双向同步',
+        '/automations - 查看并触发自动化任务',
+        '/run <id> - 立即执行指定自动化任务',
         '/status - 查看连接与会话状态'
       ].join('\n')
       await this.safeSendTelegram(token, msg.chat.id, helpText, msg.message_id)
@@ -739,7 +785,23 @@ export class TelegramBridgeController {
             (b) => `• ${b.name}${b.name === binding.botName ? ' (当前)' : ''}${b.specialty ? ` — ${b.specialty}` : ''}`
           )
         : ['未检测到 Orca Bot。']
-      await this.safeSendTelegram(token, msg.chat.id, lines.join('\n'), msg.message_id)
+      const keyboardRows: TelegramInlineKeyboardButton[][] = []
+      for (let i = 0; i < this.bots.length; i += 2) {
+        keyboardRows.push(
+          this.bots.slice(i, i + 2).map((b) => ({
+            text: `${b.name === binding.botName ? '✓ ' : ''}${b.name.slice(0, 24)}`,
+            callback_data: `u:${b.id}`
+          }))
+        )
+      }
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        lines.join('\n'),
+        msg.message_id,
+        false,
+        keyboardRows.length > 0 ? { inline_keyboard: keyboardRows } : undefined
+      )
       return true
     }
 
@@ -760,16 +822,7 @@ export class TelegramBridgeController {
         )
         return true
       }
-      await this.upsertBinding({
-        tgChatId,
-        botId: match.id,
-        botName: match.name,
-        orcaChatId: null,
-        updatedAt: Date.now()
-      })
-      await this.pruneUnusedSyncCursors()
-      await this.appendLog('info', `Switched Telegram chat ${tgChatId} to bot "${match.name}".`)
-      this.emitState()
+      await this.switchBotForChat(tgChatId, match)
       await this.safeSendTelegram(
         token,
         msg.chat.id,
@@ -780,20 +833,33 @@ export class TelegramBridgeController {
     }
 
     if (cmd === '/new') {
-      await this.upsertBinding({
-        tgChatId,
-        botId: binding.botId,
-        botName: binding.botName,
-        orcaChatId: null,
-        updatedAt: Date.now()
-      })
-      await this.pruneUnusedSyncCursors()
-      await this.appendLog('info', `Started fresh session binding for Telegram chat ${tgChatId}.`)
-      this.emitState()
+      await this.resetChatSessionForBinding(tgChatId, binding)
       await this.safeSendTelegram(
         token,
         msg.chat.id,
         `已重置上下文，下一条消息将在 ${binding.botName} 中创建新会话。`,
+        msg.message_id
+      )
+      return true
+    }
+
+    if (cmd === '/home') {
+      const chats = await this.deps.orcaCli.listBotChats(binding.botName)
+      const homeChat = chats.find((c) => c.home && !c.closed)
+      if (!homeChat) {
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          `未找到 ${binding.botName} 的可用 Home Chat。`,
+          msg.message_id
+        )
+        return true
+      }
+      await this.bindSpecificChat(tgChatId, binding, homeChat)
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        `已绑定到 ${binding.botName} 的 Home Chat（${homeChat.id}）。`,
         msg.message_id
       )
       return true
@@ -805,10 +871,30 @@ export class TelegramBridgeController {
       const lines = active.length
         ? active.map(
             (c) =>
-              `• ${c.title || '(无标题)'}${c.id === binding.orcaChatId ? ' (当前)' : ''}\n  ID: ${c.id}`
+              `• ${c.title || '(无标题)'}${c.home ? ' [Home]' : ''}${c.id === binding.orcaChatId ? ' (当前)' : ''}\n  ID: ${c.id}`
           )
         : ['暂无可用会话。']
-      await this.safeSendTelegram(token, msg.chat.id, lines.join('\n'), msg.message_id)
+      const keyboardRows: TelegramInlineKeyboardButton[][] = active.map((c) => {
+        const labelBase = c.home ? '🏠 Home' : (c.title || c.id).slice(0, 28)
+        return [
+          {
+            text: `${c.id === binding.orcaChatId ? '✓ ' : ''}${labelBase}`,
+            callback_data: `b:${c.id}`
+          }
+        ]
+      })
+      keyboardRows.push([
+        { text: '🏠 Home Chat', callback_data: 'c:home' },
+        { text: '➕ 新建会话', callback_data: 'c:new' }
+      ])
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        lines.join('\n'),
+        msg.message_id,
+        false,
+        { inline_keyboard: keyboardRows }
+      )
       return true
     }
 
@@ -828,33 +914,140 @@ export class TelegramBridgeController {
         )
         return true
       }
-      await this.upsertBinding({
-        tgChatId,
-        botId: binding.botId,
-        botName: binding.botName,
-        orcaChatId: target.id,
-        title: target.title,
-        updatedAt: Date.now()
-      })
-      try {
-        const snap = await this.deps.orcaCli.readSession(target.id, 80)
-        this.syncCursors[target.id] = {
-          tailHashes: computeTailHashes(extractMessageItems(snap.entries)),
-          ...(snap.state !== 'working' ? { lastActivityAt: target.lastActivityAt } : {}),
-          pendingWorking: snap.state === 'working'
-        }
-        await this.saveSyncCursors()
-      } catch {
-        // Cursor will baseline on next sync tick if needed.
-      }
-      await this.pruneUnusedSyncCursors()
-      this.emitState()
+      await this.bindSpecificChat(tgChatId, binding, target)
       await this.safeSendTelegram(
         token,
         msg.chat.id,
         `已绑定到 ${binding.botName} 的会话：${target.title || target.id}`,
         msg.message_id
       )
+      return true
+    }
+
+    if (cmd === '/rename') {
+      if (!arg) {
+        await this.safeSendTelegram(token, msg.chat.id, '用法：/rename <新标题>', msg.message_id)
+        return true
+      }
+      if (!binding.orcaChatId) {
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          '当前还没有绑定的 Orca 会话，请先发送一条消息或用 /bind 绑定会话。',
+          msg.message_id
+        )
+        return true
+      }
+      try {
+        await this.deps.orcaCli.renameChat(binding.orcaChatId, arg)
+        await this.upsertBinding({
+          ...binding,
+          title: arg,
+          updatedAt: Date.now()
+        })
+        await this.appendLog('info', `Renamed Orca chat ${binding.orcaChatId} to "${arg}".`)
+        this.emitState()
+        await this.safeSendTelegram(token, msg.chat.id, `已将当前会话重命名为：${arg}`, msg.message_id)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await this.safeSendTelegram(token, msg.chat.id, `重命名失败：${message}`, msg.message_id)
+      }
+      return true
+    }
+
+    if (cmd === '/sync') {
+      const normalized = arg.toLowerCase()
+      if (!normalized) {
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          `双向同步 (Orca -> TG) 当前状态：${this.config.syncOrcaOutbound ? '开启' : '关闭'}`,
+          msg.message_id,
+          false,
+          {
+            inline_keyboard: [
+              [
+                {
+                  text: `${this.config.syncOrcaOutbound ? '✓ ' : ''}开启双向同步`,
+                  callback_data: 's:on'
+                },
+                {
+                  text: `${!this.config.syncOrcaOutbound ? '✓ ' : ''}关闭双向同步`,
+                  callback_data: 's:off'
+                }
+              ]
+            ]
+          }
+        )
+        return true
+      }
+      if (['on', 'true', '1', 'enable'].includes(normalized)) {
+        await this.setSyncOrcaOutbound(true)
+        await this.safeSendTelegram(token, msg.chat.id, '已开启 Orca -> Telegram 双向同步。', msg.message_id)
+        return true
+      }
+      if (['off', 'false', '0', 'disable'].includes(normalized)) {
+        await this.setSyncOrcaOutbound(false)
+        await this.safeSendTelegram(token, msg.chat.id, '已关闭 Orca -> Telegram 双向同步。', msg.message_id)
+        return true
+      }
+      await this.safeSendTelegram(token, msg.chat.id, '用法：/sync [on|off]', msg.message_id)
+      return true
+    }
+
+    if (cmd === '/automations') {
+      try {
+        const automations = await this.deps.orcaCli.listAutomations()
+        if (automations.length === 0) {
+          await this.safeSendTelegram(token, msg.chat.id, '当前没有已配置的自动化任务。', msg.message_id)
+          return true
+        }
+        const slice = automations.slice(0, 8)
+        const lines = slice.map((a) => {
+          const stateText = a.enabled ? '启用' : '停用'
+          const lastText = a.lastRunStatus ? `，上次：${a.lastRunStatus}` : ''
+          return `• ${a.name} (${stateText}${lastText})\n  ID: ${a.id}`
+        })
+        const keyboardRows: TelegramInlineKeyboardButton[][] = slice.map((a) => [
+          {
+            text: `▶️ 运行：${a.name.slice(0, 26)}`,
+            callback_data: `r:${a.id}`
+          }
+        ])
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          lines.join('\n'),
+          msg.message_id,
+          false,
+          { inline_keyboard: keyboardRows }
+        )
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await this.safeSendTelegram(token, msg.chat.id, `获取自动化任务失败：${message}`, msg.message_id)
+      }
+      return true
+    }
+
+    if (cmd === '/run') {
+      if (!arg) {
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          '用法：/run <automationId>（可先用 /automations 查看任务 ID 或直接点击按钮运行）',
+          msg.message_id
+        )
+        return true
+      }
+      try {
+        await this.deps.orcaCli.runAutomation(arg)
+        await this.appendLog('info', `Triggered Orca automation ${arg} from Telegram.`)
+        this.emitState()
+        await this.safeSendTelegram(token, msg.chat.id, `已触发自动化任务：${arg}`, msg.message_id)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await this.safeSendTelegram(token, msg.chat.id, `触发失败：${message}`, msg.message_id)
+      }
       return true
     }
 
@@ -873,12 +1066,206 @@ export class TelegramBridgeController {
     return false
   }
 
+  private async processCallbackQuery(token: string, cq: TelegramCallbackQuery): Promise<void> {
+    const msg = cq.message
+    const data = cq.data || ''
+    if (!msg) return
+    const tgChatId = String(msg.chat.id)
+    const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId))
+
+    if (data.startsWith('u:')) {
+      const botId = data.slice(2)
+      await this.refreshBots()
+      const match = this.bots.find((b) => b.id === botId)
+      if (!match) {
+        await this.safeAnswerCallbackQuery(token, cq.id, '未找到该 Bot，请重新运行 /bots。', true)
+        return
+      }
+      await this.switchBotForChat(tgChatId, match)
+      await this.safeAnswerCallbackQuery(token, cq.id, `已切换到 ${match.name}`)
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        `已切换到 Bot：${match.name}（下一条消息将新建会话）`
+      )
+      return
+    }
+
+    if (data.startsWith('b:')) {
+      const chatId = data.slice(2)
+      const chats = await this.deps.orcaCli.listBotChats(binding.botName)
+      const target = chats.find((c) => c.id === chatId && !c.closed)
+      if (!target) {
+        await this.safeAnswerCallbackQuery(token, cq.id, '会话已关闭或不存在，请重新运行 /chats。', true)
+        return
+      }
+      await this.bindSpecificChat(tgChatId, binding, target)
+      await this.safeAnswerCallbackQuery(token, cq.id, '已绑定会话')
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        `已绑定到 ${binding.botName} 的会话：${target.title || target.id}`
+      )
+      return
+    }
+
+    if (data === 'c:new') {
+      await this.resetChatSessionForBinding(tgChatId, binding)
+      await this.safeAnswerCallbackQuery(token, cq.id, '已重置上下文')
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        `已重置上下文，下一条消息将在 ${binding.botName} 中创建新会话。`
+      )
+      return
+    }
+
+    if (data === 'c:home') {
+      const chats = await this.deps.orcaCli.listBotChats(binding.botName)
+      const homeChat = chats.find((c) => c.home && !c.closed)
+      if (!homeChat) {
+        await this.safeAnswerCallbackQuery(token, cq.id, '未找到 Home Chat。', true)
+        return
+      }
+      await this.bindSpecificChat(tgChatId, binding, homeChat)
+      await this.safeAnswerCallbackQuery(token, cq.id, '已绑定 Home Chat')
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        `已绑定到 ${binding.botName} 的 Home Chat（${homeChat.id}）。`
+      )
+      return
+    }
+
+    if (data === 's:on' || data === 's:off') {
+      const enabled = data === 's:on'
+      await this.setSyncOrcaOutbound(enabled)
+      await this.safeAnswerCallbackQuery(
+        token,
+        cq.id,
+        enabled ? '已开启双向同步' : '已关闭双向同步'
+      )
+      await this.safeSendTelegram(
+        token,
+        msg.chat.id,
+        enabled ? '已开启 Orca -> Telegram 双向同步。' : '已关闭 Orca -> Telegram 双向同步。'
+      )
+      return
+    }
+
+    if (data.startsWith('r:')) {
+      const automationId = data.slice(2)
+      try {
+        await this.deps.orcaCli.runAutomation(automationId)
+        await this.appendLog('info', `Triggered Orca automation ${automationId} via Telegram button.`)
+        this.emitState()
+        await this.safeAnswerCallbackQuery(token, cq.id, '已触发自动化任务')
+        await this.safeSendTelegram(token, msg.chat.id, `已触发自动化任务：${automationId}`)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await this.safeAnswerCallbackQuery(token, cq.id, `触发失败：${message.slice(0, 120)}`, true)
+      }
+      return
+    }
+
+    await this.safeAnswerCallbackQuery(token, cq.id)
+  }
+
+  private async switchBotForChat(tgChatId: string, match: BotSummary): Promise<void> {
+    await this.upsertBinding({
+      tgChatId,
+      botId: match.id,
+      botName: match.name,
+      orcaChatId: null,
+      updatedAt: Date.now()
+    })
+    await this.pruneUnusedSyncCursors()
+    await this.appendLog('info', `Switched Telegram chat ${tgChatId} to bot "${match.name}".`)
+    this.emitState()
+  }
+
+  private async resetChatSessionForBinding(tgChatId: string, binding: ChatBinding): Promise<void> {
+    await this.upsertBinding({
+      tgChatId,
+      botId: binding.botId,
+      botName: binding.botName,
+      orcaChatId: null,
+      updatedAt: Date.now()
+    })
+    await this.pruneUnusedSyncCursors()
+    await this.appendLog('info', `Started fresh session binding for Telegram chat ${tgChatId}.`)
+    this.emitState()
+  }
+
+  private async bindSpecificChat(
+    tgChatId: string,
+    binding: ChatBinding,
+    target: { id: string; title: string; lastActivityAt: number }
+  ): Promise<void> {
+    await this.upsertBinding({
+      tgChatId,
+      botId: binding.botId,
+      botName: binding.botName,
+      orcaChatId: target.id,
+      title: target.title,
+      updatedAt: Date.now()
+    })
+    try {
+      const snap = await this.deps.orcaCli.readSession(target.id, 80)
+      this.syncCursors[target.id] = {
+        tailHashes: computeTailHashes(extractMessageItems(snap.entries)),
+        ...(snap.state !== 'working' ? { lastActivityAt: target.lastActivityAt } : {}),
+        pendingWorking: snap.state === 'working'
+      }
+      await this.saveSyncCursors()
+    } catch {
+      // Cursor will baseline on next sync tick if needed.
+    }
+    await this.pruneUnusedSyncCursors()
+    this.emitState()
+  }
+
+  private async setSyncOrcaOutbound(enabled: boolean): Promise<void> {
+    const prev = this.config.syncOrcaOutbound
+    await this.orca.settings.set('syncOrcaOutbound', enabled)
+    this.config.syncOrcaOutbound = enabled
+    if (!prev && enabled) {
+      await this.resetSyncCursors()
+    }
+    if (enabled && this.pollAbort && !this.outboundLoopPromise) {
+      this.ensureOutboundLoopStarted(this.pollAbort)
+    }
+    await this.appendLog(
+      'info',
+      enabled ? 'Enabled Orca -> Telegram outbound sync.' : 'Disabled Orca -> Telegram outbound sync.'
+    )
+    this.emitState()
+  }
+
+  private async safeAnswerCallbackQuery(
+    token: string,
+    callbackQueryId: string,
+    text?: string,
+    showAlert = false
+  ): Promise<void> {
+    try {
+      await this.deps.telegram.answerCallbackQuery(
+        token,
+        { callbackQueryId, text, showAlert },
+        { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000 }
+      )
+    } catch {
+      // Non-fatal callback ack failure.
+    }
+  }
+
   private async safeSendTelegram(
     token: string,
     chatId: number | string,
     text: string,
     replyToMessageId?: number,
-    formatMarkdown = false
+    formatMarkdown = false,
+    replyMarkup?: TelegramInlineKeyboardMarkup
   ): Promise<void> {
     if (formatMarkdown) {
       const html = markdownToTelegramHtml(text)
@@ -886,7 +1273,7 @@ export class TelegramBridgeController {
         try {
           await this.deps.telegram.sendMessage(
             token,
-            { chatId, text: html, replyToMessageId, parseMode: 'HTML' },
+            { chatId, text: html, replyToMessageId, parseMode: 'HTML', replyMarkup },
             { proxyUrl: this.config.proxyUrl, timeoutMs: 15_000 }
           )
           return
@@ -898,7 +1285,7 @@ export class TelegramBridgeController {
     try {
       await this.deps.telegram.sendMessage(
         token,
-        { chatId, text, replyToMessageId },
+        { chatId, text, replyToMessageId, replyMarkup },
         { proxyUrl: this.config.proxyUrl, timeoutMs: 15_000 }
       )
     } catch (err) {

@@ -29,10 +29,23 @@ export type OrcaSessionRead = {
   limited?: boolean
 }
 
+export type OrcaAutomationSummary = {
+  id: string
+  name: string
+  enabled: boolean
+  rrule?: string | null
+  nextRunAt?: number | null
+  lastRunAt?: number | null
+  lastRunStatus?: string | null
+}
+
 export interface OrcaCliRunner {
   listBots(): Promise<BotSummary[]>
   listBotChats(botName: string): Promise<OrcaChatSummary[]>
   readSession(sessionId: string, limit?: number): Promise<OrcaSessionRead>
+  renameChat(sessionId: string, name: string): Promise<void>
+  listAutomations(): Promise<OrcaAutomationSummary[]>
+  runAutomation(id: string): Promise<void>
   sendToBot(params: {
     botName: string
     chatId: string | 'new'
@@ -207,6 +220,49 @@ export function createOrcaCliRunner(): OrcaCliRunner {
         ? sessionId
         : `orca_session_id:${sessionId}`
       return runOrcaJson<OrcaSessionRead>(['agent', 'read', id, '--limit', String(limit), '--json'])
+    },
+    async renameChat(sessionId, name) {
+      await runOrcaJson<unknown>([
+        'chat',
+        'rename',
+        '--session',
+        sessionId,
+        '--name',
+        name,
+        '--json'
+      ])
+    },
+    async listAutomations() {
+      const result = await runOrcaJson<{
+        automations?: {
+          id: string
+          name: string
+          enabled?: boolean
+          rrule?: string | null
+          nextRunAt?: number | null
+          lastRunAt?: number | null
+        }[]
+        items?: {
+          automationId: string
+          usageSummary?: { lastRunStatus?: string | null }
+        }[]
+      }>(['automations', 'list', '--json'])
+      const statusById = new Map<string, string | null>()
+      for (const item of result.items || []) {
+        statusById.set(item.automationId, item.usageSummary?.lastRunStatus ?? null)
+      }
+      return (result.automations || []).map((a) => ({
+        id: a.id,
+        name: a.name,
+        enabled: a.enabled !== false,
+        rrule: a.rrule ?? null,
+        nextRunAt: a.nextRunAt ?? null,
+        lastRunAt: a.lastRunAt ?? null,
+        lastRunStatus: statusById.get(a.id) ?? null
+      }))
+    },
+    async runAutomation(id) {
+      await runOrcaJson<unknown>(['automations', 'run', id, '--json'])
     },
     async sendToBot({ botName, chatId, subject, body, signal }) {
       await runOrcaJson<unknown>(

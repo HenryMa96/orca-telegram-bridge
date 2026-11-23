@@ -52,9 +52,26 @@ export type TelegramMessage = {
   document?: TelegramDocument
 }
 
+export type TelegramInlineKeyboardButton = {
+  text: string
+  callback_data: string
+}
+
+export type TelegramInlineKeyboardMarkup = {
+  inline_keyboard: TelegramInlineKeyboardButton[][]
+}
+
+export type TelegramCallbackQuery = {
+  id: string
+  from: TelegramUser
+  message?: TelegramMessage
+  data?: string
+}
+
 export type TelegramUpdate = {
   update_id: number
   message?: TelegramMessage
+  callback_query?: TelegramCallbackQuery
 }
 
 export type TelegramRequestOptions = {
@@ -99,9 +116,19 @@ export interface TelegramClient {
       text: string
       replyToMessageId?: number
       parseMode?: 'Markdown' | 'HTML'
+      replyMarkup?: TelegramInlineKeyboardMarkup
     },
     options?: TelegramRequestOptions
   ): Promise<TelegramMessage>
+  answerCallbackQuery(
+    token: string,
+    params: {
+      callbackQueryId: string
+      text?: string
+      showAlert?: boolean
+    },
+    options?: TelegramRequestOptions
+  ): Promise<boolean>
   sendPhoto(
     token: string,
     params: {
@@ -460,7 +487,7 @@ export function createTelegramClient(): TelegramClient {
         {
           offset: params.offset,
           timeout: timeoutSec,
-          allowed_updates: ['message']
+          allowed_updates: ['message', 'callback_query']
         },
         {
           ...options,
@@ -479,8 +506,23 @@ export function createTelegramClient(): TelegramClient {
       if (params.parseMode) {
         body.parse_mode = params.parseMode
       }
+      if (params.replyMarkup) {
+        body.reply_markup = params.replyMarkup
+      }
       body.disable_web_page_preview = true
       return callTelegramApi<TelegramMessage>(token, 'sendMessage', body, options)
+    },
+    answerCallbackQuery(token, params, options) {
+      const body: Record<string, unknown> = {
+        callback_query_id: params.callbackQueryId
+      }
+      if (params.text !== undefined) {
+        body.text = params.text
+      }
+      if (params.showAlert !== undefined) {
+        body.show_alert = params.showAlert
+      }
+      return callTelegramApi<boolean>(token, 'answerCallbackQuery', body, options)
     },
     sendPhoto(token, params, options) {
       const fields: Record<string, string> = {

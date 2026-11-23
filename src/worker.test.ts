@@ -16,7 +16,8 @@ import {
   markdownToTelegramHtml,
   splitTelegramMessage,
   type TelegramBotCommand,
-  type TelegramClient
+  type TelegramClient,
+  type TelegramInlineKeyboardMarkup
 } from './telegram-api'
 import * as main from './worker'
 import { TelegramBridgeController } from './worker'
@@ -27,11 +28,15 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     text: string
     replyToMessageId?: number
     parseMode?: string
+    replyMarkup?: TelegramInlineKeyboardMarkup
   }[] = []
   const sentPhotos: { chatId: number | string; bytes: number; caption?: string }[] = []
   const sentActions: { chatId: number | string; action: string }[] = []
+  const answeredCallbacks: { callbackQueryId: string; text?: string; showAlert?: boolean }[] = []
   const registeredCommands: TelegramBotCommand[][] = []
   const sentToBots: { botName: string; chatId: string; subject: string; body: string }[] = []
+  const renamedChats: { sessionId: string; name: string }[] = []
+  const triggeredAutomations: string[] = []
 
   let chats: OrcaChatSummary[] = [
     {
@@ -65,7 +70,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
         chatId: params.chatId,
         text: params.text,
         replyToMessageId: params.replyToMessageId,
-        parseMode: params.parseMode
+        parseMode: params.parseMode,
+        replyMarkup: params.replyMarkup
       })
       return {
         message_id: 900 + sentMessages.length,
@@ -73,6 +79,14 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
         date: Math.floor(Date.now() / 1000),
         text: params.text
       }
+    },
+    async answerCallbackQuery(_token, params) {
+      answeredCallbacks.push({
+        callbackQueryId: params.callbackQueryId,
+        text: params.text,
+        showAlert: params.showAlert
+      })
+      return true
     },
     async sendPhoto(_token, params) {
       sentPhotos.push({
@@ -125,6 +139,23 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
       }
       return { ...s, entries: [...s.entries] }
     },
+    async renameChat(sessionId, name) {
+      renamedChats.push({ sessionId, name })
+      chats = chats.map((c) => (c.id === sessionId ? { ...c, title: name } : c))
+    },
+    async listAutomations() {
+      return [
+        {
+          id: 'auto-1',
+          name: 'Daily backup',
+          enabled: true,
+          lastRunStatus: 'completed'
+        }
+      ]
+    },
+    async runAutomation(id) {
+      triggeredAutomations.push(id)
+    },
     async sendToBot({ botName, chatId, subject, body }) {
       sentToBots.push({ botName, chatId, subject, body })
       readPollCount = 0
@@ -163,7 +194,18 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     ...overrides.orcaCli
   }
 
-  return { telegram, orcaCli, sentMessages, sentPhotos, sentActions, registeredCommands, sentToBots }
+  return {
+    telegram,
+    orcaCli,
+    sentMessages,
+    sentPhotos,
+    sentActions,
+    answeredCallbacks,
+    registeredCommands,
+    sentToBots,
+    renamedChats,
+    triggeredAutomations
+  }
 }
 
 test('extractTablesFromMarkdown extracts GFM tables outside code fences', () => {
@@ -638,4 +680,181 @@ test('controller downloads Telegram photo and image document and passes local pa
     await capturedWorker.deactivate()
     await fs.rm(tempDownloadDir, { recursive: true, force: true })
   }
+})
+
+test('controller supports interactive inline buttons, /sync, /home, /rename, and /automations + /run', async () => {
+  const host = mockHost({
+    capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: false
+    }
+  })
+
+  const deps = makeMockDeps()
+  let controller!: TelegramBridgeController
+  const capturedWorker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        controller = new TelegramBridgeController(orca, {
+          telegram: deps.telegram,
+          orcaCli: deps.orcaCli,
+          pollIntervalMs: 10
+        })
+        await controller.init()
+      }
+    },
+    { host }
+  )
+
+  // 1. /bots returns inline keyboard buttons and callback switches bot
+  await controller.handleIncomingUpdate({
+    update_id: 20,
+    message: {
+      message_id: 30,
+      from: { id: 777888, is_bot: false, first_name: 'Demo', username: 'demouser' },
+      chat: { id: 777888, type: 'private' },
+      date: 2000,
+      text: '/bots'
+    }
+  })
+  assert.ok(deps.sentMessages[0].replyMarkup?.inline_keyboard.length)
+  assert.equal(deps.sentMessages[0].replyMarkup?.inline_keyboard[0][1].callback_data, 'u:bot-2')
+
+  // Unauthorized callback is rejected
+  await controller.handleIncomingUpdate({
+    update_id: 21,
+    callback_query: {
+      id: 'cb-unauth',
+      from: { id: 999999, is_bot: false, first_name: 'Stranger' },
+      message: {
+        message_id: 901,
+        chat: { id: 999999, type: 'private' },
+        date: 2001
+      },
+      data: 'u:bot-2'
+    }
+  })
+  assert.equal(deps.answeredCallbacks[0].showAlert, true)
+  assert.equal(controller.getState().bindings[0].botName, 'Assistant')
+
+  // Authorized callback switches bot
+  await controller.handleIncomingUpdate({
+    update_id: 22,
+    callback_query: {
+      id: 'cb-auth',
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      message: {
+        message_id: 901,
+        chat: { id: 777888, type: 'private' },
+        date: 2002
+      },
+      data: 'u:bot-2'
+    }
+  })
+  assert.equal(controller.getState().bindings[0].botName, 'Daily standup notes')
+  assert.equal(controller.getState().bindings[0].botId, 'bot-2')
+
+  // 2. /home binds to Home Chat and /rename renames it
+  await controller.handleIncomingUpdate({
+    update_id: 23,
+    message: {
+      message_id: 31,
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      chat: { id: 777888, type: 'private' },
+      date: 2003,
+      text: '/home'
+    }
+  })
+  assert.equal(controller.getState().bindings[0].orcaChatId, 'home-chat-1')
+
+  await controller.handleIncomingUpdate({
+    update_id: 24,
+    message: {
+      message_id: 32,
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      chat: { id: 777888, type: 'private' },
+      date: 2004,
+      text: '/rename Work Sync'
+    }
+  })
+  assert.deepEqual(deps.renamedChats, [{ sessionId: 'home-chat-1', name: 'Work Sync' }])
+  assert.equal(controller.getState().bindings[0].title, 'Work Sync')
+
+  // 3. /sync toggles syncOrcaOutbound via text and inline callback
+  await controller.handleIncomingUpdate({
+    update_id: 25,
+    message: {
+      message_id: 33,
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      chat: { id: 777888, type: 'private' },
+      date: 2005,
+      text: '/sync on'
+    }
+  })
+  assert.equal(controller.getState().config.syncOrcaOutbound, true)
+
+  await controller.handleIncomingUpdate({
+    update_id: 26,
+    callback_query: {
+      id: 'cb-sync-off',
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      message: {
+        message_id: 904,
+        chat: { id: 777888, type: 'private' },
+        date: 2006
+      },
+      data: 's:off'
+    }
+  })
+  assert.equal(controller.getState().config.syncOrcaOutbound, false)
+
+  // 4. /automations lists tasks with run buttons, and /run + button trigger them
+  await controller.handleIncomingUpdate({
+    update_id: 27,
+    message: {
+      message_id: 34,
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      chat: { id: 777888, type: 'private' },
+      date: 2007,
+      text: '/automations'
+    }
+  })
+  const autoMsg = deps.sentMessages[deps.sentMessages.length - 1]
+  assert.match(autoMsg.text, /Daily backup/)
+  assert.equal(autoMsg.replyMarkup?.inline_keyboard[0][0].callback_data, 'r:auto-1')
+
+  await controller.handleIncomingUpdate({
+    update_id: 28,
+    callback_query: {
+      id: 'cb-run',
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      message: {
+        message_id: 906,
+        chat: { id: 777888, type: 'private' },
+        date: 2008
+      },
+      data: 'r:auto-1'
+    }
+  })
+  await controller.handleIncomingUpdate({
+    update_id: 29,
+    message: {
+      message_id: 35,
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      chat: { id: 777888, type: 'private' },
+      date: 2009,
+      text: '/run auto-1'
+    }
+  })
+  assert.deepEqual(deps.triggeredAutomations, ['auto-1', 'auto-1'])
+
+  assert.deepEqual(capturedWorker.refusals, [])
+  await controller.dispose()
+  await capturedWorker.deactivate()
 })
