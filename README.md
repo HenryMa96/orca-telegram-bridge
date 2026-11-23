@@ -26,13 +26,13 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 Once listed on [orca.dev/plugins](https://orca.dev/plugins), install directly:
 
 ```sh
-orca plugin install HenryMa96.telegram-bridge
+orca plugin install henryma96.telegram-bridge
 ```
 
 or straight from this repository:
 
 ```sh
-orca plugin install HenryMa96/orca-telegram-bridge
+orca plugin install henryma96/orca-telegram-bridge
 ```
 
 ## Setup
