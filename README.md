@@ -21,6 +21,20 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 - **Orca** `>= 1.4.248`
 - **Optional (for table-to-PNG rendering)**: Python 3 with `Pillow` installed (`pip install pillow`)
 
+## Install
+
+Once listed on [orca.dev/plugins](https://orca.dev/plugins), install directly:
+
+```sh
+orca plugin install HenryMa96.telegram-bridge
+```
+
+or straight from this repository:
+
+```sh
+orca plugin install HenryMa96/orca-telegram-bridge
+```
+
 ## Setup
 
 1. Install or load the plugin in Orca:
