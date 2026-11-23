@@ -82,6 +82,13 @@
         "default": 300,
         "minimum": 30,
         "maximum": 1800
+      },
+      {
+        "key": "syncOrcaOutbound",
+        "title": "Sync Orca Messages to Telegram",
+        "description": "Forward messages sent in Orca and bot replies from bound chats back to Telegram.",
+        "type": "boolean",
+        "default": false
       }
     ]
   },

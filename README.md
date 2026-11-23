@@ -9,6 +9,7 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 - **Encrypted Bot Token storage** via `orca.secrets` (OS keyring)
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
+- **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram
 - **Telegram `/` command menu** (`setMyCommands`): `/help`, `/new`, `/bots`, `/use`, `/chats`, `/bind`, `/status`
 - **Rich Markdown + Table PNG rendering**:
   - Converts Markdown headings, bold, italic, strikethrough, blockquotes, task lists, links, and fenced code blocks to Telegram HTML

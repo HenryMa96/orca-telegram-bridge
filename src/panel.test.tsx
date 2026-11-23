@@ -17,7 +17,8 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
       defaultBot: 'Assistant',
       allowedUserIds: '123456',
       proxyUrl: 'http://127.0.0.1:7890',
-      replyTimeoutSec: 300
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: false
     },
     bots: [
       { id: 'bot-1', name: 'Assistant', specialty: 'Workspace assistant', agent: 'claude' }

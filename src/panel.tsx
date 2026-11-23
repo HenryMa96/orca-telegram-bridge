@@ -35,6 +35,7 @@ const defaultBotDraft = atom('')
 const allowedIdsDraft = atom('')
 const proxyUrlDraft = atom('')
 const timeoutDraft = atom('300')
+const syncOrcaOutboundDraft = atom(false)
 const busy = atom(false)
 const feedback = atom<{ tone: 'success' | 'danger' | 'accent'; text: string } | null>(null)
 const formHydrated = atom(false)
@@ -46,6 +47,7 @@ function hydrateForm(state: BridgeState, force = false): void {
   set(allowedIdsDraft, state.config.allowedUserIds)
   set(proxyUrlDraft, state.config.proxyUrl)
   set(timeoutDraft, String(state.config.replyTimeoutSec))
+  set(syncOrcaOutboundDraft, state.config.syncOrcaOutbound)
   set(formHydrated, true)
 }
 
@@ -84,7 +86,8 @@ async function saveConfig(): Promise<void> {
       defaultBot: read(defaultBotDraft).trim(),
       allowedUserIds: read(allowedIdsDraft).trim(),
       proxyUrl: read(proxyUrlDraft).trim(),
-      replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300
+      replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
+      syncOrcaOutbound: read(syncOrcaOutboundDraft)
     })
     set(tokenDraft, '')
     set(bridgeState, next)
@@ -316,6 +319,11 @@ export default function Panel() {
                   label="Enable automatic polling"
                   checked={read(enabledDraft)}
                   onChange={(v) => set(enabledDraft, v)}
+                />
+                <Switch
+                  label="Sync Orca-side messages to Telegram"
+                  checked={read(syncOrcaOutboundDraft)}
+                  onChange={(v) => set(syncOrcaOutboundDraft, v)}
                 />
                 <Row gap="xs">
                   <Button size="sm" disabled={isBusy} onPress={saveConfig}>

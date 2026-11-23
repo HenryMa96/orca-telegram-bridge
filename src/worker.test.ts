@@ -1,6 +1,13 @@
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
-import type { OrcaChatSummary, OrcaCliRunner, OrcaSessionRead } from './orca-bridge'
+import {
+  computeTailHashes,
+  extractMessageItems,
+  findUnsyncedTail,
+  type OrcaChatSummary,
+  type OrcaCliRunner,
+  type OrcaSessionRead
+} from './orca-bridge'
 import { extractTablesFromMarkdown } from './table-render'
 import {
   markdownToTelegramHtml,
@@ -225,13 +232,180 @@ test('worker activates cleanly without token and saves config', async () => {
     defaultBot: 'Assistant',
     allowedUserIds: '42',
     proxyUrl: '',
-    replyTimeoutSec: 120
-  })) as { status: string; config: { hasToken: boolean; allowedUserIds: string } }
+    replyTimeoutSec: 120,
+    syncOrcaOutbound: true
+  })) as { status: string; config: { hasToken: boolean; allowedUserIds: string; syncOrcaOutbound: boolean } }
   assert.equal(saved.status, 'stopped')
   assert.equal(saved.config.hasToken, true)
   assert.equal(saved.config.allowedUserIds, '42')
+  assert.equal(saved.config.syncOrcaOutbound, true)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
+})
+
+test('findUnsyncedTail aligns sliding windows and repeated messages accurately', () => {
+  const items1 = extractMessageItems([
+    { kind: 'message', role: 'user', text: 'first' },
+    { kind: 'message', role: 'assistant', text: 'reply 1' },
+    { kind: 'message', role: 'user', text: 'ok' }
+  ])
+  const tail = computeTailHashes(items1)
+
+  // User sends the exact same text 'ok' again later
+  const items2 = extractMessageItems([
+    { kind: 'message', role: 'user', text: 'first' },
+    { kind: 'message', role: 'assistant', text: 'reply 1' },
+    { kind: 'message', role: 'user', text: 'ok' },
+    { kind: 'message', role: 'assistant', text: 'reply 2' },
+    { kind: 'message', role: 'user', text: 'ok' }
+  ])
+  const res = findUnsyncedTail(items2, tail)
+  assert.equal(res.matched, true)
+  assert.deepEqual(res.unsynced, [
+    { role: 'assistant', text: 'reply 2' },
+    { role: 'user', text: 'ok' }
+  ])
+
+  // Sliding window drops earliest item ('first') but still aligns on trailing suffix
+  const slid = items2.slice(1)
+  const slidRes = findUnsyncedTail(slid, tail)
+  assert.equal(slidRes.matched, true)
+  assert.deepEqual(slidRes.unsynced, [
+    { role: 'assistant', text: 'reply 2' },
+    { role: 'user', text: 'ok' }
+  ])
+})
+
+test('syncOrcaBoundChatsOnce forwards Orca-side user messages and bot replies without duplicating TG turns', async () => {
+  const boundChatId = 'orca-bound-1'
+  let chatActivityAt = 1000
+  const session: OrcaSessionRead = {
+    orcaSessionId: boundChatId,
+    state: 'done',
+    entries: [
+      { kind: 'message', role: 'user', text: 'Old history question' },
+      { kind: 'message', role: 'assistant', text: 'Old history reply' }
+    ]
+  }
+  const sentMessages: { chatId: number | string; text: string }[] = []
+
+  const host = mockHost({
+    capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
+    },
+    storage: {
+      'tg.bindings': [
+        {
+          tgChatId: '777888',
+          botId: 'bot-1',
+          botName: 'Assistant',
+          orcaChatId: boundChatId,
+          updatedAt: 1000
+        }
+      ]
+    }
+  })
+
+  const deps = makeMockDeps({
+    telegram: {
+      async sendMessage(_token, params) {
+        sentMessages.push({ chatId: params.chatId, text: params.text })
+        return {
+          message_id: 100 + sentMessages.length,
+          chat: { id: Number(params.chatId), type: 'private' },
+          date: 1000,
+          text: params.text
+        }
+      }
+    },
+    orcaCli: {
+      async listBotChats() {
+        return [
+          {
+            id: boundChatId,
+            title: 'Bound Chat',
+            lastActivityAt: chatActivityAt,
+            lastAsked: null,
+            lastSaid: null,
+            home: false,
+            self: false,
+            closed: false
+          }
+        ]
+      },
+      async readSession() {
+        return { ...session, entries: [...session.entries] }
+      }
+    }
+  })
+
+  let controller!: TelegramBridgeController
+  const capturedWorker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        controller = new TelegramBridgeController(orca, {
+          telegram: deps.telegram,
+          orcaCli: deps.orcaCli,
+          pollIntervalMs: 10
+        })
+        await controller.init()
+      }
+    },
+    { host }
+  )
+
+  // 1. First sync pass establishes baseline without dumping old history
+  await controller.syncOrcaBoundChatsOnce()
+  assert.equal(sentMessages.length, 0)
+
+  // 2. User sends a message directly in Orca UI while bot is still working
+  chatActivityAt = 2000
+  session.state = 'working'
+  session.entries.push({ kind: 'message', role: 'user', text: 'Check today tasks in Orca' })
+  session.entries.push({ kind: 'message', role: 'assistant', text: 'Partial draft...' })
+
+  await controller.syncOrcaBoundChatsOnce()
+  // User prompt forwards immediately; partial assistant output waits until done
+  assert.equal(sentMessages.length, 1)
+  assert.match(sentMessages[0].text, /Check today tasks in Orca/)
+
+  // 3. Bot finishes in Orca -> assistant reply forwards to Telegram
+  session.state = 'done'
+  session.entries.push({ kind: 'message', role: 'assistant', text: 'Final answer.' })
+
+  await controller.syncOrcaBoundChatsOnce()
+  assert.equal(sentMessages.length, 2)
+  assert.match(sentMessages[1].text, /Partial draft\.\.\./)
+  assert.match(sentMessages[1].text, /Final answer\./)
+
+  // 4. Subsequent poll with no new activity sends nothing
+  await controller.syncOrcaBoundChatsOnce()
+  assert.equal(sentMessages.length, 2)
+
+  // 5. Turning syncOrcaOutbound off stops forwarding new Orca messages
+  await controller.saveConfig({
+    enabled: false,
+    defaultBot: 'Assistant',
+    allowedUserIds: '777888',
+    proxyUrl: '',
+    replyTimeoutSec: 300,
+    syncOrcaOutbound: false
+  })
+  chatActivityAt = 3000
+  session.entries.push({ kind: 'message', role: 'user', text: 'Should stay local' })
+  session.entries.push({ kind: 'message', role: 'assistant', text: 'Local reply' })
+  await controller.syncOrcaBoundChatsOnce()
+  assert.equal(sentMessages.length, 2)
+
+  await controller.dispose()
+  await capturedWorker.deactivate()
 })
 
 test('controller blocks unauthorized users, auto-picks bot, runs slash commands, and bridges multi-turn chat', async () => {

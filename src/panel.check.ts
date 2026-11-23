@@ -7,7 +7,8 @@ export default defineCheck({
       defaultBot: '',
       allowedUserIds: '',
       proxyUrl: '',
-      replyTimeoutSec: 300
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: false
     }
   },
   configuredPaused: {
@@ -19,7 +20,8 @@ export default defineCheck({
       defaultBot: 'Assistant',
       allowedUserIds: '123456789',
       proxyUrl: 'http://127.0.0.1:7890',
-      replyTimeoutSec: 300
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
     },
     storage: {
       'tg.bindings': [

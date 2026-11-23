@@ -38,6 +38,7 @@ export type BridgeConfig = {
   allowedUserIds: string
   proxyUrl: string
   replyTimeoutSec: number
+  syncOrcaOutbound: boolean
 }
 
 export type BridgeState = {
@@ -62,6 +63,7 @@ export type SaveConfigInput = {
   allowedUserIds: string
   proxyUrl: string
   replyTimeoutSec: number
+  syncOrcaOutbound: boolean
 }
 
 export type TestConnectionResult = {

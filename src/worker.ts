@@ -1,8 +1,13 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
+  computeTailHashes,
   createOrcaCliRunner,
   dispatchToOrcaBotAndWait,
-  type OrcaCliRunner
+  extractMessageItems,
+  findUnsyncedTail,
+  isTelegramOriginatedUserMessage,
+  type OrcaCliRunner,
+  type OrcaMessageItem
 } from './orca-bridge'
 import type {
   BotSummary,
@@ -35,8 +40,15 @@ const STORAGE_OFFSET = 'tg.updateOffset'
 const STORAGE_BINDINGS = 'tg.bindings'
 const STORAGE_LOGS = 'tg.logs'
 const STORAGE_LAST_BLOCKED = 'tg.lastBlockedUserId'
+const STORAGE_SYNC_CURSORS = 'tg.syncCursors'
 const STATUS_BAR_ID = 'telegram-status'
 const MAX_LOGS = 60
+
+type SyncCursor = {
+  tailHashes: string[]
+  lastActivityAt?: number
+  pendingWorking?: boolean
+}
 
 export const TELEGRAM_COMMANDS: TelegramBotCommand[] = [
   { command: 'help', description: 'Show available commands' },
@@ -53,6 +65,7 @@ export type BridgeDeps = {
   orcaCli: OrcaCliRunner
   renderTable?: (table: ExtractedTable) => Promise<Buffer | null>
   pollIntervalMs?: number
+  outboundPollIntervalMs?: number
   retryBackoffMs?: number
 }
 
@@ -102,6 +115,7 @@ export class TelegramBridgeController {
   private lastPollAt: number | null = null
   private bots: BotSummary[] = []
   private bindings: ChatBinding[] = []
+  private syncCursors: Record<string, SyncCursor> = {}
   private logs: BridgeLogEntry[] = []
   private updateOffset = 0
   private config: BridgeConfig = {
@@ -110,14 +124,19 @@ export class TelegramBridgeController {
     defaultBot: '',
     allowedUserIds: '',
     proxyUrl: '',
-    replyTimeoutSec: 300
+    replyTimeoutSec: 300,
+    syncOrcaOutbound: false
   }
 
   private cachedToken: string | null = null
   private commandsRegistered = false
   private pollAbort: AbortController | null = null
   private pollLoopPromise: Promise<void> | null = null
+  private outboundLoopPromise: Promise<void> | null = null
   private readonly chatQueues = new Map<string, Promise<void>>()
+  private readonly activeTelegramTgChats = new Set<string>()
+  private readonly activeTelegramOrcaChats = new Set<string>()
+  private outboundSyncRunning = false
   private disposed = false
 
   constructor(orca: OrcaWorkerApi, deps: BridgeDeps) {
@@ -157,8 +176,12 @@ export class TelegramBridgeController {
   }
 
   async reloadFromSettingsAndSecrets(): Promise<void> {
+    const prevSync = this.config.syncOrcaOutbound
     await this.loadPersistedState()
     await this.refreshBots()
+    if (!prevSync && this.config.syncOrcaOutbound) {
+      await this.resetSyncCursors()
+    }
     if (!this.config.hasToken) {
       await this.stopPolling()
       this.status = 'needs_token'
@@ -176,11 +199,15 @@ export class TelegramBridgeController {
     if (!this.pollAbort) {
       this.startPolling()
     } else {
+      if (this.config.syncOrcaOutbound && !this.outboundLoopPromise) {
+        this.ensureOutboundLoopStarted(this.pollAbort)
+      }
       this.emitState()
     }
   }
 
   async saveConfig(input: SaveConfigInput): Promise<BridgeState> {
+    const prevSync = this.config.syncOrcaOutbound
     if (input.clearToken) {
       try {
         await this.orca.secrets.delete(SECRET_BOT_TOKEN)
@@ -196,12 +223,14 @@ export class TelegramBridgeController {
 
     const defaultBot = input.defaultBot.trim() || this.bots[0]?.name || ''
     const timeout = Math.min(1800, Math.max(30, Math.round(input.replyTimeoutSec || 300)))
+    const syncOrcaOutbound = Boolean(input.syncOrcaOutbound)
 
     await this.orca.settings.set('enabled', Boolean(input.enabled))
     await this.orca.settings.set('defaultBot', defaultBot)
     await this.orca.settings.set('allowedUserIds', input.allowedUserIds.trim())
     await this.orca.settings.set('proxyUrl', input.proxyUrl.trim())
     await this.orca.settings.set('replyTimeoutSec', timeout)
+    await this.orca.settings.set('syncOrcaOutbound', syncOrcaOutbound)
 
     this.config = {
       hasToken: Boolean(this.cachedToken),
@@ -209,7 +238,11 @@ export class TelegramBridgeController {
       defaultBot,
       allowedUserIds: input.allowedUserIds.trim(),
       proxyUrl: input.proxyUrl.trim(),
-      replyTimeoutSec: timeout
+      replyTimeoutSec: timeout,
+      syncOrcaOutbound
+    }
+    if (!prevSync && syncOrcaOutbound) {
+      await this.resetSyncCursors()
     }
     this.lastError = null
     await this.refreshBots()
@@ -309,6 +342,7 @@ export class TelegramBridgeController {
   async resetBinding(tgChatId: string): Promise<BridgeState> {
     this.bindings = this.bindings.filter((b) => b.tgChatId !== tgChatId)
     await this.orca.storage.set(STORAGE_BINDINGS, this.bindings)
+    await this.pruneUnusedSyncCursors()
     await this.appendLog('info', `Reset Orca chat binding for Telegram chat ${tgChatId}.`)
     this.emitState()
     return this.getState()
@@ -398,6 +432,12 @@ export class TelegramBridgeController {
     await this.appendLog('info', `[TG ${senderLabel} -> ${binding.botName}] ${text.slice(0, 120)}`)
     this.emitState()
 
+    this.activeTelegramTgChats.add(tgChatId)
+    if (binding.orcaChatId) {
+      this.activeTelegramOrcaChats.add(binding.orcaChatId)
+    }
+
+    let boundOrcaChatId = binding.orcaChatId
     try {
       const result = await dispatchToOrcaBotAndWait(this.deps.orcaCli, {
         botName: binding.botName,
@@ -409,6 +449,8 @@ export class TelegramBridgeController {
         pollIntervalMs: this.deps.pollIntervalMs,
         signal: this.pollAbort?.signal,
         onChatBound: async (chatId, title) => {
+          boundOrcaChatId = chatId
+          this.activeTelegramOrcaChats.add(chatId)
           await this.upsertBinding({
             tgChatId,
             botId: binding.botId,
@@ -432,6 +474,8 @@ export class TelegramBridgeController {
         }
       })
 
+      boundOrcaChatId = result.chatId
+      this.activeTelegramOrcaChats.add(result.chatId)
       await this.upsertBinding({
         tgChatId,
         botId: binding.botId,
@@ -441,52 +485,27 @@ export class TelegramBridgeController {
         updatedAt: Date.now()
       })
 
-      const renderTable = this.deps.renderTable ?? renderTableToPng
-      const { textWithMarkers, tables } = extractTablesFromMarkdown(result.replyText)
-      const renderedImages: { index: number; png: Buffer }[] = []
+      const delivery = await this.sendFormattedReplyToTelegram(
+        token,
+        msg.chat.id,
+        result.replyText,
+        msg.message_id
+      )
 
-      for (let i = 0; i < tables.length; i++) {
-        const png = await renderTable(tables[i])
-        if (png) {
-          renderedImages.push({ index: i + 1, png })
-        }
+      const existingCursor = this.syncCursors[result.chatId]
+      this.syncCursors[result.chatId] = {
+        tailHashes: result.tailHashes,
+        ...(existingCursor?.lastActivityAt !== undefined
+          ? { lastActivityAt: existingCursor.lastActivityAt }
+          : {}),
+        pendingWorking: false
       }
-
-      // Only swap tables for markers if all tables rendered as PNGs; otherwise keep raw markdown fallback.
-      const finalText =
-        renderedImages.length === tables.length && renderedImages.length > 0
-          ? textWithMarkers
-          : result.replyText
-
-      const chunks = splitTelegramMessage(finalText, 3500)
-      for (let i = 0; i < chunks.length; i++) {
-        await this.safeSendTelegram(
-          token,
-          msg.chat.id,
-          chunks[i],
-          i === 0 ? msg.message_id : undefined,
-          true
-        )
-      }
-
-      if (renderedImages.length === tables.length) {
-        for (const img of renderedImages) {
-          await this.safeSendTelegramPhoto(
-            token,
-            msg.chat.id,
-            img.png,
-            `table-${img.index}.png`,
-            tables.length > 1 ? `表格 ${img.index}` : undefined
-          )
-        }
-      }
+      await this.saveSyncCursors()
 
       await this.appendLog(
         'info',
-        `[${binding.botName} -> TG ${tgChatId}] Sent ${chunks.length} message(s)${
-          renderedImages.length === tables.length && renderedImages.length > 0
-            ? ` + ${renderedImages.length} table image(s)`
-            : ''
+        `[${binding.botName} -> TG ${tgChatId}] Sent ${delivery.messageCount} message(s)${
+          delivery.imageCount > 0 ? ` + ${delivery.imageCount} table image(s)` : ''
         }.`
       )
       this.emitState()
@@ -500,7 +519,63 @@ export class TelegramBridgeController {
         `处理失败：${message}`,
         msg.message_id
       )
+    } finally {
+      this.activeTelegramTgChats.delete(tgChatId)
+      if (boundOrcaChatId) {
+        this.activeTelegramOrcaChats.delete(boundOrcaChatId)
+      }
     }
+  }
+
+  private async sendFormattedReplyToTelegram(
+    token: string,
+    chatId: number | string,
+    rawMarkdown: string,
+    replyToMessageId?: number
+  ): Promise<{ messageCount: number; imageCount: number }> {
+    const renderTable = this.deps.renderTable ?? renderTableToPng
+    const { textWithMarkers, tables } = extractTablesFromMarkdown(rawMarkdown)
+    const renderedImages: { index: number; png: Buffer }[] = []
+
+    for (let i = 0; i < tables.length; i++) {
+      const png = await renderTable(tables[i])
+      if (png) {
+        renderedImages.push({ index: i + 1, png })
+      }
+    }
+
+    // Only swap tables for markers if all tables rendered as PNGs; otherwise keep raw markdown fallback.
+    const finalText =
+      renderedImages.length === tables.length && renderedImages.length > 0
+        ? textWithMarkers
+        : rawMarkdown
+
+    const chunks = splitTelegramMessage(finalText, 3500)
+    for (let i = 0; i < chunks.length; i++) {
+      await this.safeSendTelegram(
+        token,
+        chatId,
+        chunks[i],
+        i === 0 ? replyToMessageId : undefined,
+        true
+      )
+    }
+
+    let imageCount = 0
+    if (renderedImages.length === tables.length && renderedImages.length > 0) {
+      for (const img of renderedImages) {
+        await this.safeSendTelegramPhoto(
+          token,
+          chatId,
+          img.png,
+          `table-${img.index}.png`,
+          tables.length > 1 ? `表格 ${img.index}` : undefined
+        )
+        imageCount++
+      }
+    }
+
+    return { messageCount: chunks.length, imageCount }
   }
 
   private async handleSlashCommand(
@@ -566,6 +641,7 @@ export class TelegramBridgeController {
         orcaChatId: null,
         updatedAt: Date.now()
       })
+      await this.pruneUnusedSyncCursors()
       await this.appendLog('info', `Switched Telegram chat ${tgChatId} to bot "${match.name}".`)
       this.emitState()
       await this.safeSendTelegram(
@@ -585,6 +661,7 @@ export class TelegramBridgeController {
         orcaChatId: null,
         updatedAt: Date.now()
       })
+      await this.pruneUnusedSyncCursors()
       await this.appendLog('info', `Started fresh session binding for Telegram chat ${tgChatId}.`)
       this.emitState()
       await this.safeSendTelegram(
@@ -633,6 +710,18 @@ export class TelegramBridgeController {
         title: target.title,
         updatedAt: Date.now()
       })
+      try {
+        const snap = await this.deps.orcaCli.readSession(target.id, 80)
+        this.syncCursors[target.id] = {
+          tailHashes: computeTailHashes(extractMessageItems(snap.entries)),
+          ...(snap.state !== 'working' ? { lastActivityAt: target.lastActivityAt } : {}),
+          pendingWorking: snap.state === 'working'
+        }
+        await this.saveSyncCursors()
+      } catch {
+        // Cursor will baseline on next sync tick if needed.
+      }
+      await this.pruneUnusedSyncCursors()
       this.emitState()
       await this.safeSendTelegram(
         token,
@@ -648,6 +737,7 @@ export class TelegramBridgeController {
         `Telegram Bot: ${this.botUsername ? `@${this.botUsername}` : '未知'}`,
         `目标 Orca Bot: ${binding.botName}`,
         `绑定会话 ID: ${binding.orcaChatId || '(未创建，发消息自动新建)'}`,
+        `双向同步 (Orca -> TG): ${this.config.syncOrcaOutbound ? '开启' : '关闭'}`,
         `轮询状态: ${this.status}`
       ]
       await this.safeSendTelegram(token, msg.chat.id, lines.join('\n'), msg.message_id)
@@ -740,6 +830,17 @@ export class TelegramBridgeController {
       }
       this.pollLoopPromise = null
     })
+
+    if (this.config.syncOrcaOutbound) {
+      this.ensureOutboundLoopStarted(abort)
+    }
+  }
+
+  private ensureOutboundLoopStarted(abort: AbortController): void {
+    if (this.disposed || this.outboundLoopPromise) return
+    this.outboundLoopPromise = this.runOutboundSyncLoop(abort).finally(() => {
+      this.outboundLoopPromise = null
+    })
   }
 
   private async stopPolling(): Promise<void> {
@@ -749,6 +850,237 @@ export class TelegramBridgeController {
     }
     if (this.pollLoopPromise) {
       await this.pollLoopPromise
+    }
+    if (this.outboundLoopPromise) {
+      await this.outboundLoopPromise
+    }
+  }
+
+  private async runOutboundSyncLoop(abort: AbortController): Promise<void> {
+    const intervalMs = this.deps.outboundPollIntervalMs ?? 3000
+    while (!abort.signal.aborted && !this.disposed) {
+      await sleep(intervalMs, abort.signal)
+      if (abort.signal.aborted || this.disposed) break
+      if (!this.config.syncOrcaOutbound || !this.config.enabled) continue
+      try {
+        await this.syncOrcaBoundChatsOnce()
+      } catch (err) {
+        if (abort.signal.aborted || this.disposed) break
+        const msg = err instanceof Error ? err.message : String(err)
+        this.orca.log(`[warn] Orca outbound sync error: ${msg}`)
+      }
+    }
+  }
+
+  async syncOrcaBoundChatsOnce(): Promise<void> {
+    if (this.disposed || !this.config.syncOrcaOutbound || this.outboundSyncRunning) return
+    const token = await this.readToken()
+    if (!token) return
+    const allowed = parseAllowedIds(this.config.allowedUserIds)
+    if (allowed.size === 0) return
+
+    const boundList = this.bindings.filter((b) => Boolean(b.orcaChatId))
+    if (boundList.length === 0) return
+
+    this.outboundSyncRunning = true
+    try {
+      const byBot = new Map<string, ChatBinding[]>()
+      for (const rawBinding of boundList) {
+        const binding = await this.resolveBindingBot(rawBinding)
+        if (!binding.orcaChatId || !binding.botName) continue
+        if (
+          this.activeTelegramTgChats.has(binding.tgChatId) ||
+          this.activeTelegramOrcaChats.has(binding.orcaChatId)
+        ) {
+          continue
+        }
+        const list = byBot.get(binding.botName) ?? []
+        list.push(binding)
+        byBot.set(binding.botName, list)
+      }
+
+      for (const [botName, bindings] of byBot.entries()) {
+        if (this.disposed) break
+        let chats
+        try {
+          chats = await this.deps.orcaCli.listBotChats(botName)
+        } catch {
+          continue
+        }
+        const chatMap = new Map(chats.map((c) => [c.id, c]))
+
+        for (const binding of bindings) {
+          const orcaChatId = binding.orcaChatId
+          if (!orcaChatId) continue
+          if (
+            this.activeTelegramTgChats.has(binding.tgChatId) ||
+            this.activeTelegramOrcaChats.has(orcaChatId)
+          ) {
+            continue
+          }
+          const chatMeta = chatMap.get(orcaChatId)
+          if (!chatMeta || chatMeta.closed) continue
+          await this.syncSingleBoundChat(token, binding, orcaChatId, chatMeta.lastActivityAt)
+        }
+      }
+    } finally {
+      this.outboundSyncRunning = false
+    }
+  }
+
+  private async syncSingleBoundChat(
+    token: string,
+    binding: ChatBinding,
+    orcaChatId: string,
+    lastActivityAt: number
+  ): Promise<void> {
+    const existing = this.syncCursors[orcaChatId]
+    if (existing && !existing.pendingWorking && existing.lastActivityAt === lastActivityAt) {
+      return
+    }
+
+    let session
+    try {
+      session = await this.deps.orcaCli.readSession(orcaChatId, 80)
+    } catch {
+      return
+    }
+
+    const items = extractMessageItems(session.entries)
+    const isWorking = session.state === 'working'
+
+    if (!existing) {
+      this.syncCursors[orcaChatId] = {
+        tailHashes: computeTailHashes(items),
+        ...(isWorking ? {} : { lastActivityAt }),
+        pendingWorking: isWorking
+      }
+      await this.saveSyncCursors()
+      return
+    }
+
+    const { matched, unsynced } = findUnsyncedTail(items, existing.tailHashes)
+    if (!matched) {
+      this.syncCursors[orcaChatId] = {
+        tailHashes: computeTailHashes(items),
+        ...(isWorking ? {} : { lastActivityAt }),
+        pendingWorking: isWorking
+      }
+      await this.saveSyncCursors()
+      return
+    }
+
+    if (unsynced.length === 0) {
+      this.syncCursors[orcaChatId] = {
+        tailHashes: existing.tailHashes,
+        ...(isWorking ? {} : { lastActivityAt }),
+        pendingWorking: isWorking
+      }
+      await this.saveSyncCursors()
+      return
+    }
+
+    let readyItems: OrcaMessageItem[] = unsynced
+    if (isWorking) {
+      // While the bot is still generating, only flush up to the last user prompt;
+      // wait for completion before forwarding assistant messages.
+      let lastUserIdx = -1
+      for (let i = unsynced.length - 1; i >= 0; i--) {
+        if (unsynced[i].role === 'user') {
+          lastUserIdx = i
+          break
+        }
+      }
+      if (lastUserIdx < 0) {
+        this.syncCursors[orcaChatId] = {
+          tailHashes: existing.tailHashes,
+          pendingWorking: true
+        }
+        await this.saveSyncCursors()
+        return
+      }
+      readyItems = unsynced.slice(0, lastUserIdx + 1)
+    }
+
+    if (readyItems.length === 0) return
+
+    let forwardedUserCount = 0
+    let forwardedAssistantCount = 0
+
+    // Group consecutive assistant messages so multi-step tool turns arrive as one clean reply.
+    for (let i = 0; i < readyItems.length; i++) {
+      const item = readyItems[i]
+      if (item.role === 'user') {
+        if (!isTelegramOriginatedUserMessage(item.text)) {
+          const userPayload = `🗣️ **你在 Orca (${binding.botName}) 发送：**\n\n${item.text}`
+          const chunks = splitTelegramMessage(userPayload, 3500)
+          for (const chunk of chunks) {
+            await this.safeSendTelegram(token, binding.tgChatId, chunk, undefined, true)
+          }
+          forwardedUserCount++
+        }
+        continue
+      }
+
+      const assistantParts = [item.text]
+      while (i + 1 < readyItems.length && readyItems[i + 1].role === 'assistant') {
+        i++
+        assistantParts.push(readyItems[i].text)
+      }
+      await this.sendFormattedReplyToTelegram(
+        token,
+        binding.tgChatId,
+        assistantParts.join('\n\n')
+      )
+      forwardedAssistantCount++
+    }
+
+    const unconsumedCount = unsynced.length - readyItems.length
+    const syncedPrefix = unconsumedCount > 0 ? items.slice(0, items.length - unconsumedCount) : items
+    const stillPending = isWorking || unconsumedCount > 0
+
+    this.syncCursors[orcaChatId] = {
+      tailHashes: computeTailHashes(syncedPrefix),
+      ...(stillPending ? {} : { lastActivityAt }),
+      pendingWorking: stillPending
+    }
+    await this.saveSyncCursors()
+
+    if (forwardedUserCount > 0 || forwardedAssistantCount > 0) {
+      await this.appendLog(
+        'info',
+        `[Orca -> TG ${binding.tgChatId}] Synced ${forwardedUserCount} user + ${forwardedAssistantCount} assistant message(s) from ${binding.botName}.`
+      )
+      this.emitState()
+    }
+  }
+
+  private async resetSyncCursors(): Promise<void> {
+    this.syncCursors = {}
+    await this.saveSyncCursors()
+  }
+
+  private async pruneUnusedSyncCursors(): Promise<void> {
+    const activeIds = new Set(
+      this.bindings.map((b) => b.orcaChatId).filter((id): id is string => Boolean(id))
+    )
+    let changed = false
+    for (const chatId of Object.keys(this.syncCursors)) {
+      if (!activeIds.has(chatId)) {
+        delete this.syncCursors[chatId]
+        changed = true
+      }
+    }
+    if (changed) {
+      await this.saveSyncCursors()
+    }
+  }
+
+  private async saveSyncCursors(): Promise<void> {
+    try {
+      await this.orca.storage.set(STORAGE_SYNC_CURSORS, this.syncCursors)
+    } catch {
+      // Non-fatal in mock/read-only runs.
     }
   }
 
@@ -833,7 +1165,9 @@ export class TelegramBridgeController {
       replyTimeoutSec:
         typeof settings.replyTimeoutSec === 'number' && Number.isFinite(settings.replyTimeoutSec)
           ? settings.replyTimeoutSec
-          : 300
+          : 300,
+      syncOrcaOutbound:
+        typeof settings.syncOrcaOutbound === 'boolean' ? settings.syncOrcaOutbound : false
     }
 
     const savedOffset = await this.orca.storage.get(STORAGE_OFFSET)
@@ -847,6 +1181,12 @@ export class TelegramBridgeController {
 
     const savedBlocked = await this.orca.storage.get(STORAGE_LAST_BLOCKED)
     this.lastBlockedUserId = typeof savedBlocked === 'string' ? savedBlocked : null
+
+    const savedCursors = await this.orca.storage.get(STORAGE_SYNC_CURSORS)
+    this.syncCursors =
+      savedCursors && typeof savedCursors === 'object' && !Array.isArray(savedCursors)
+        ? (savedCursors as Record<string, SyncCursor>)
+        : {}
   }
 
   private async readToken(): Promise<string | null> {

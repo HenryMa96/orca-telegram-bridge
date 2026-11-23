@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -250,6 +251,87 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+export type OrcaMessageItem = {
+  role: 'user' | 'assistant'
+  text: string
+}
+
+const TAIL_HASH_LIMIT = 20
+
+export function extractMessageItems(entries: OrcaSessionEntry[]): OrcaMessageItem[] {
+  const items: OrcaMessageItem[] = []
+  for (const entry of entries) {
+    if (
+      entry.kind === 'message' &&
+      (entry.role === 'user' || entry.role === 'assistant') &&
+      entry.text?.trim()
+    ) {
+      items.push({ role: entry.role, text: entry.text.trim() })
+    }
+  }
+  return items
+}
+
+export function hashMessageItem(item: OrcaMessageItem): string {
+  return createHash('sha256')
+    .update(`${item.role}\0${item.text}`, 'utf8')
+    .digest('hex')
+    .slice(0, 16)
+}
+
+export function computeTailHashes(items: OrcaMessageItem[], limit = TAIL_HASH_LIMIT): string[] {
+  return items.slice(-limit).map(hashMessageItem)
+}
+
+export function isTelegramOriginatedUserMessage(text: string): boolean {
+  return /^Telegram message from owner \([^)]+\) \[tg:[^:\]]+:\d+\]\./.test(text.trim())
+}
+
+/**
+ * Aligns saved `tailHashes` against the current `items` window and returns any
+ * messages appended after the aligned anchor.
+ *
+ * Returns `{ matched: false, unsynced: [] }` when `tailHashes` is empty or cannot
+ * be aligned (so callers can re-baseline safely without flooding old history).
+ */
+export function findUnsyncedTail(
+  items: OrcaMessageItem[],
+  tailHashes: string[]
+): { matched: boolean; unsynced: OrcaMessageItem[] } {
+  if (tailHashes.length === 0) {
+    return { matched: false, unsynced: [] }
+  }
+  if (items.length === 0) {
+    return { matched: true, unsynced: [] }
+  }
+
+  const itemHashes = items.map(hashMessageItem)
+  const maxAnchorLen = Math.min(tailHashes.length, itemHashes.length)
+
+  // Prefer the longest suffix of `tailHashes` that matches a contiguous subarray in `itemHashes`,
+  // scanning from the rightmost position so repeated short texts stay aligned to the latest turn.
+  for (let anchorLen = maxAnchorLen; anchorLen >= 1; anchorLen--) {
+    const anchor = tailHashes.slice(tailHashes.length - anchorLen)
+    for (let start = itemHashes.length - anchorLen; start >= 0; start--) {
+      let ok = true
+      for (let k = 0; k < anchorLen; k++) {
+        if (itemHashes[start + k] !== anchor[k]) {
+          ok = false
+          break
+        }
+      }
+      if (ok) {
+        return {
+          matched: true,
+          unsynced: items.slice(start + anchorLen)
+        }
+      }
+    }
+  }
+
+  return { matched: false, unsynced: [] }
+}
+
 function extractMessagePairs(entries: OrcaSessionEntry[]): {
   userMessages: string[]
   lastUserIndex: number
@@ -290,7 +372,7 @@ export async function dispatchToOrcaBotAndWait(
     onChatBound?: (chatId: string, title?: string) => Promise<void> | void
     onWorkingTick?: () => Promise<void> | void
   }
-): Promise<{ chatId: string; title?: string; replyText: string }> {
+): Promise<{ chatId: string; title?: string; replyText: string; tailHashes: string[] }> {
   const pollIntervalMs = params.pollIntervalMs ?? 1500
   const chatsBefore = await runner.listBotChats(params.botName)
 
@@ -392,7 +474,8 @@ export async function dispatchToOrcaBotAndWait(
         return {
           chatId: activeChatId,
           title: resolvedTitle,
-          replyText: latestAssistant
+          replyText: latestAssistant,
+          tailHashes: computeTailHashes(extractMessageItems(session.entries))
         }
       }
     }
