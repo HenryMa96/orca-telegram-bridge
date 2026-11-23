@@ -1,0 +1,102 @@
+{
+  "manifestVersion": 2,
+  "id": "telegram-bridge",
+  "name": "Telegram Bridge",
+  "version": "0.1.0",
+  "description": "Two-way Telegram bot bridge that routes messages to your Orca bots and sends replies back.",
+  "license": "MIT",
+  "icon": "assets/icon.png",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "telegram-bridge",
+        "title": "Telegram",
+        "icon": "bot",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "telegram-status",
+        "text": "TG: Init",
+        "icon": "bot",
+        "tone": "neutral",
+        "tooltip": "Telegram Bridge status (click to toggle polling)",
+        "command": "telegram-bridge.togglePolling"
+      }
+    ],
+    "commands": [
+      {
+        "id": "telegram-bridge.togglePolling",
+        "title": "Telegram Bridge: Toggle Polling"
+      },
+      {
+        "id": "telegram-bridge.testConnection",
+        "title": "Telegram Bridge: Test Connection"
+      }
+    ],
+    "settings": [
+      {
+        "key": "enabled",
+        "title": "Enable Telegram Polling",
+        "description": "Keep polling Telegram for incoming messages while Orca is running.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "defaultBot",
+        "title": "Default Orca Bot",
+        "description": "Default Orca bot name to route Telegram messages to (leave blank to use the first available bot).",
+        "type": "string",
+        "default": "",
+        "placeholder": "e.g. Assistant"
+      },
+      {
+        "key": "allowedUserIds",
+        "title": "Allowed Telegram User IDs",
+        "description": "Comma-separated numeric Telegram user IDs allowed to drive your Orca bots.",
+        "type": "string",
+        "default": "",
+        "placeholder": "123456789"
+      },
+      {
+        "key": "proxyUrl",
+        "title": "HTTP Proxy URL",
+        "description": "Optional HTTP proxy for api.telegram.org (e.g. http://127.0.0.1:7890).",
+        "type": "string",
+        "default": "",
+        "placeholder": "http://127.0.0.1:7890"
+      },
+      {
+        "key": "replyTimeoutSec",
+        "title": "Reply Timeout (seconds)",
+        "description": "Maximum seconds to wait for an Orca bot reply.",
+        "type": "integer",
+        "default": 300,
+        "minimum": 30,
+        "maximum": 1800
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "secrets:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
+}
