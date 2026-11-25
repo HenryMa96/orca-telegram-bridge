@@ -973,52 +973,51 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNa
         const invalid = idsError !== null && (id === '' ? idsError === NEEDS_ID : !isTelegramId(id))
         const name = Object.hasOwn(knownNames, id) ? knownNames[id] : undefined
         return (
-          <Row key={row.key} gap="xs" align="center">
-            <Input
-              key={`id:${row.key}`}
-              label={`Telegram ID ${i + 1}`}
-              labelHidden
-              value={row.id}
-              placeholder="e.g. 123456789 or -1001234567890"
-              invalid={invalid}
-              onChange={(v) => {
-                updateRow(row.key, { id: v })
-                set(allowedIdsError, null)
-              }}
-            />
-            {/* A field rather than loose text: every row gets the same width, so the role selects
-                line up whatever the name's length. `value` without `onChange` is read-only; not
-                disabled, which would grey the name out. */}
-            <Input
-              key={`name:${row.key}`}
-              label={`Telegram name ${i + 1}`}
-              labelHidden
-              value={name ?? ''}
-              placeholder="No name yet"
-            />
-            <Select
-              key={`role:${row.key}`}
-              label={`Role for Telegram ID ${i + 1}`}
-              labelHidden
-              value={row.roleId}
-              options={roleOptions}
-              onChange={(v) => updateRow(row.key, { roleId: v })}
-            />
-            <IconButton
-              key={`remove:${row.key}`}
-              icon="close"
-              label={`Remove Telegram ID ${i + 1}`}
-              size="sm"
-              variant="ghost"
-              onPress={() => {
-                edit(
-                  assignmentRowsDraft,
-                  read(assignmentRowsDraft).filter((r) => r.key !== row.key)
-                )
-                set(allowedIdsError, null)
-              }}
-            />
-          </Row>
+          // The name goes under the ID, not in the row: Orca sizes the role Select by its label, so
+          // anything sharing the row changes width with the chosen role.
+          <Stack key={row.key} gap="none">
+            <Row key={`line:${row.key}`} gap="xs" align="center">
+              <Input
+                key={`id:${row.key}`}
+                label={`Telegram ID ${i + 1}`}
+                labelHidden
+                value={row.id}
+                placeholder="e.g. 123456789 or -1001234567890"
+                invalid={invalid}
+                onChange={(v) => {
+                  updateRow(row.key, { id: v })
+                  set(allowedIdsError, null)
+                }}
+              />
+              <Select
+                key={`role:${row.key}`}
+                label={`Role for Telegram ID ${i + 1}`}
+                labelHidden
+                value={row.roleId}
+                options={roleOptions}
+                onChange={(v) => updateRow(row.key, { roleId: v })}
+              />
+              <IconButton
+                key={`remove:${row.key}`}
+                icon="close"
+                label={`Remove Telegram ID ${i + 1}`}
+                size="sm"
+                variant="ghost"
+                onPress={() => {
+                  edit(
+                    assignmentRowsDraft,
+                    read(assignmentRowsDraft).filter((r) => r.key !== row.key)
+                  )
+                  set(allowedIdsError, null)
+                }}
+              />
+            </Row>
+            {name && (
+              <Text key={`name:${row.key}`} muted size="xs">
+                {name}
+              </Text>
+            )}
+          </Stack>
         )
       })}
       {idsError && (

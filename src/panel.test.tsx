@@ -4,7 +4,8 @@ import {
   mount,
   test,
   type MockHostOptions,
-  type TestPanel
+  type TestPanel,
+  type TreeSnapshot
 } from 'orca/testing'
 import * as panel from './panel'
 import type {
@@ -1296,9 +1297,26 @@ test('rows: added rows get Member, each role select is saved, removed rows are g
   await view.unmount()
 })
 
-// The name shown in the read-only field next to this ID row; '' when none.
+// The name shown under this ID row; '' when none. The entry is the innermost Stack holding the ID
+// field (Text has no testId).
 function nameOf(view: TestPanel, row: number): string {
-  return String(view.find({ label: `Telegram name ${row}` })?.props.value ?? '')
+  const words = (node: TreeSnapshot | string): string =>
+    typeof node === 'string' ? node : (node.children ?? []).map(words).join('')
+  const holds = (node: TreeSnapshot | string): boolean =>
+    typeof node !== 'string' &&
+    ((node.type === 'Input' && node.props?.label === `Telegram ID ${row}`) || (node.children ?? []).some(holds))
+  const entryOf = (node: TreeSnapshot | string): TreeSnapshot | null => {
+    if (typeof node === 'string' || !holds(node)) return null
+    for (const child of node.children ?? []) {
+      const inner = entryOf(child)
+      if (inner) return inner
+    }
+    return node.type === 'Stack' ? node : null
+  }
+  const tree = view.tree()
+  const entry = tree === null ? null : entryOf(tree)
+  const text = (entry?.children ?? []).find((c): c is TreeSnapshot => typeof c !== 'string' && c.type === 'Text')
+  return text ? words(text) : ''
 }
 
 test('each ID row shows the name the bridge knows for its trimmed ID, follows edits, and nothing when unknown', async () => {
