@@ -77,6 +77,8 @@ export type Messages = {
   // A command or button the sender's role does not allow.
   notAllowedForRole: string
   unsupportedImage: string
+  // A file above the 20 MB a Telegram bot may download.
+  fileTooLarge: string
   // While a slow answer is awaited: the time since the message was sent to the Orca bot.
   workingLine: (elapsedMs: number) => string
   // The one plain line for a failed answer, by kind; the technical cause stays in the Logs.
@@ -184,6 +186,7 @@ const en: Messages = {
   callbackUnauthorized: 'Access denied. Add your ID to the allowlist first.',
   notAllowedForRole: "This isn't available for you. Ask the bot's owner.",
   unsupportedImage: 'This image format is not supported. Send a JPG, PNG, WEBP, GIF or BMP image.',
+  fileTooLarge: 'This file is larger than 20 MB, the most a Telegram bot can download. Send a smaller file or a link.',
   workingLine: (elapsedMs) => `Working… ${elapsedText(elapsedMs, LATIN_UNITS)}`,
   errorTimeout: 'The Orca bot is still working and went past the wait time. Try again in a few minutes.',
   errorOrcaUnreachable: "I couldn't reach Orca on this computer.",
@@ -313,6 +316,7 @@ const ptBR: Messages = {
   callbackUnauthorized: 'Acesso negado. Adicione seu ID à lista de permitidos primeiro.',
   notAllowedForRole: 'Isto não está disponível para você. Fale com o dono do bot.',
   unsupportedImage: 'Formato de imagem não suportado. Envie uma imagem JPG, PNG, WEBP, GIF ou BMP.',
+  fileTooLarge: 'Este arquivo passa de 20 MB, o máximo que um bot do Telegram consegue baixar. Envie um arquivo menor ou um link.',
   workingLine: (elapsedMs) => `Trabalhando… ${elapsedText(elapsedMs, LATIN_UNITS)}`,
   errorTimeout: 'O bot do Orca ainda está trabalhando e passou do tempo de espera. Tente de novo em alguns minutos.',
   errorOrcaUnreachable: 'Não consegui falar com o Orca neste computador.',
@@ -442,6 +446,7 @@ const es: Messages = {
   callbackUnauthorized: 'Acceso denegado. Primero agrega tu ID a la lista de permitidos.',
   notAllowedForRole: 'Esto no está disponible para ti. Pregunta al dueño del bot.',
   unsupportedImage: 'Formato de imagen no compatible. Envía una imagen JPG, PNG, WEBP, GIF o BMP.',
+  fileTooLarge: 'Este archivo supera los 20 MB, lo máximo que un bot de Telegram puede descargar. Envía un archivo más pequeño o un enlace.',
   workingLine: (elapsedMs) => `Trabajando… ${elapsedText(elapsedMs, LATIN_UNITS)}`,
   errorTimeout: 'El bot de Orca sigue trabajando y superó el tiempo de espera. Vuelve a intentarlo en unos minutos.',
   errorOrcaUnreachable: 'No pude conectar con Orca en esta computadora.',
@@ -571,6 +576,7 @@ const zhCN: Messages = {
   callbackUnauthorized: '未授权访问，请先加入白名单。',
   notAllowedForRole: '此功能对你不可用，请联系机器人的所有者。',
   unsupportedImage: '暂不支持该图片格式，请发送 JPG、PNG、WEBP、GIF 或 BMP 图片。',
+  fileTooLarge: '该文件超过 20 MB，这是 Telegram 机器人能下载的上限。请发送更小的文件或链接。',
   workingLine: (elapsedMs) => `处理中… ${elapsedText(elapsedMs, { s: ' 秒', min: ' 分', minS: ' 秒' })}`,
   errorTimeout: 'Orca Bot 仍在处理，已超过等待时间。请过几分钟再试。',
   errorOrcaUnreachable: '无法连接到这台电脑上的 Orca。',

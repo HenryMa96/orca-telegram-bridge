@@ -284,6 +284,32 @@ test('a role prompt is fenced with a fresh nonce after the rules, before the use
   }
 })
 
+test('files are listed after the images with their original name; without a caption the user asks to open them', async () => {
+  const linesFor = async (userText: string) => {
+    const { runner, sentBodies } = makeRunner({
+      afterSend: (_poll, ourUser) => ({ orcaSessionId: BOUND_CHAT.id, state: 'done', entries: [ourUser, assistant('ok')] })
+    })
+    await dispatchToOrcaBotAndWait(runner, {
+      ...dispatchParams,
+      userText,
+      imagePaths: ['/tmp/images/tg-1-2-ab.jpg'],
+      // A name with a line break stays on its line.
+      files: [{ path: '/tmp/files/tg-1-2-ab-Q3_report.xlsx', name: 'Q3\nreport.xlsx' }]
+    })
+    return sentBodies[0].split('\n')
+  }
+  const lines = await linesFor('')
+  const images = lines.findIndex((l) => l.startsWith('Attached Telegram image(s)'))
+  const files = lines.indexOf(
+    'Attached Telegram file(s) saved locally (open them with your tools; the original name is in parentheses):'
+  )
+  assert.ok(images >= 0 && files > images)
+  assert.equal(lines[files + 1], '- /tmp/files/tg-1-2-ab-Q3_report.xlsx (Q3 report.xlsx)')
+  assert.equal(lines.at(-1), 'Please open the attached file(s) above and respond.')
+
+  assert.equal((await linesFor('Sum column B')).at(-1), 'Sum column B')
+})
+
 test('getOrcaBinary uses orca-ide on Linux, never the GNOME screen reader', () => {
   const env: NodeJS.ProcessEnv = {}
   const bundled = '/opt/Orca/resources/bin/orca-ide'

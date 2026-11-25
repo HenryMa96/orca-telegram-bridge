@@ -738,6 +738,8 @@ export async function dispatchToOrcaBotAndWait(
     senderLabel: string
     userText: string
     imagePaths?: string[]
+    // Files (any type) saved from Telegram, each with the name the sender gave it.
+    files?: { path: string; name: string }[]
     // Set only for a group message not addressed to the bot: the group's reply policy.
     unaddressedGroupReply?: GroupReply
     // Set when the bridge's reply language is 'auto': the chat's known language (else English), for
@@ -769,7 +771,8 @@ export async function dispatchToOrcaBotAndWait(
 
   const cleanText = params.userText.trim()
   const imagePaths = (params.imagePaths ?? []).filter(Boolean)
-  const previewBase = cleanText || (imagePaths.length > 0 ? '[Image]' : 'Telegram message')
+  const files = (params.files ?? []).filter((f) => f.path)
+  const previewBase = cleanText || (imagePaths.length > 0 ? '[Image]' : files.length > 0 ? '[File]' : 'Telegram message')
   const preview = previewBase.replace(/\s+/g, ' ').trim().slice(0, 40)
   const subject = targetChatId === 'new' ? `Telegram: ${preview}` : `Telegram reply: ${preview}`
   const requestMarker = `[tg:${params.tgChatId}:${Date.now()}]`
@@ -813,9 +816,20 @@ export async function dispatchToOrcaBotAndWait(
       ...imagePaths.map((p) => `- ${p}`)
     )
   }
+  if (files.length > 0) {
+    bodyParts.push(
+      '',
+      'Attached Telegram file(s) saved locally (open them with your tools; the original name is in parentheses):',
+      // The name comes from the sender: kept on its one line so it cannot add lines of its own.
+      ...files.map((f) => `- ${f.path} (${f.name.replace(/\s+/g, ' ').trim()})`)
+    )
+  }
   bodyParts.push(
     '',
-    cleanText || 'Please inspect the attached image(s) above and respond.'
+    cleanText ||
+      (files.length > 0
+        ? 'Please open the attached file(s) above and respond.'
+        : 'Please inspect the attached image(s) above and respond.')
   )
   const body = bodyParts.join('\n')
 

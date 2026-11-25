@@ -87,6 +87,7 @@ import {
   type TelegramChat,
   type TelegramChatMemberUpdated,
   type TelegramClient,
+  type TelegramDocument,
   type TelegramInlineKeyboardButton,
   type TelegramInlineKeyboardMarkup,
   type TelegramMessage,
@@ -234,6 +235,22 @@ function resolveSafeImageExt(filePath: string | undefined, fallbackExt: string):
   return ALLOWED_IMAGE_EXTS.has(fromPath) ? fromPath : fallbackExt
 }
 
+// The name a downloaded file is saved under: Telegram's file name with every char outside
+// [A-Za-z0-9._-] replaced, so no path separator survives and the file stays in its folder; at most
+// 80 chars, keeping the extension. No name: "file" plus the extension of Telegram's own path.
+function safeDocumentName(fileName: string | undefined, telegramPath: string): string {
+  const name = (fileName || `file${path.extname(telegramPath)}`).replace(/[^A-Za-z0-9._-]/g, '_')
+  if (name.length <= 80) return name
+  const ext = path.extname(name).slice(0, 16)
+  return name.slice(0, 80 - ext.length) + ext
+}
+
+// For the logs: a document's extension and size, never its name.
+function describeDocument(doc: TelegramDocument): string {
+  const ext = path.extname(doc.file_name ?? '').toLowerCase().replace(/[^a-z0-9._-]/g, '_').slice(0, 16)
+  return `document ${ext || '(no extension)'} ${doc.file_size ?? 'unknown'} bytes`
+}
+
 // User ids are positive; group and supergroup chat ids are negative.
 function parseAllowedIds(raw: string): Set<string> {
   return new Set(
@@ -272,7 +289,7 @@ const MAX_NAME_LOOKUPS = 50
 // behind the sender ("your owner's agent: Telegram: …"). Only such a title is replaced, so a name
 // given with /rename or in Orca stays.
 function isAutomaticChatTitle(title: string | undefined): boolean {
-  return title !== undefined && /(^|: )Telegram: /.test(title)
+  return title !== undefined && /^(your owner's agent: )?Telegram: /.test(title)
 }
 
 // "telegram@drecchia" for a person, "telegram@Ana Souza" without a username, "telegram@Ops Team"
@@ -1248,7 +1265,11 @@ export class BridgeRuntime {
     const unsupportedImage =
       !image && Boolean(msg.document?.mime_type?.toLowerCase().startsWith('image/'))
     const voice = msg.voice ?? msg.audio ?? null
-    const group = inGroup ? this.groupMessageText(msg, Boolean(image || voice)) : null
+    // Any other document (spreadsheet, PDF, archive…) goes to the Orca bot as a file.
+    const file = !image && !unsupportedImage ? (msg.document ?? null) : null
+    // Telegram lets a bot download 20 MB at most; an unknown size is tried.
+    const fileTooLarge = (file?.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES
+    const group = inGroup ? this.groupMessageText(msg, Boolean(image || voice || file)) : null
     const text = inGroup ? (group?.text ?? null) : (msg.text ?? msg.caption ?? '').trim()
     if (text === null) {
       await this.appendLog(
@@ -1258,7 +1279,7 @@ export class BridgeRuntime {
       )
       return null
     }
-    if (!text && !image && !unsupportedImage && !voice) return null
+    if (!text && !image && !unsupportedImage && !voice && !file) return null
 
     const fromId = msg.from ? String(msg.from.id) : tgChatId
     const allowed = parseAllowedIds(this.config.allowedUserIds)
@@ -1300,7 +1321,7 @@ export class BridgeRuntime {
     // Telegram refused this person's or group's own menu while it knew no chat with them; now it does.
     if (this.unsetScopeIds.has(fromId) || this.unsetScopeIds.has(tgChatId)) this.commandsRegistered = false
     // Each command is checked in handleSlashCommand; anything else is a message and needs 'chat'.
-    const isCommand = !image && !unsupportedImage && !voice && text.startsWith('/')
+    const isCommand = !image && !unsupportedImage && !voice && !file && text.startsWith('/')
     if (!isCommand && !(await this.mayChat(msg))) return null
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
@@ -1324,19 +1345,32 @@ export class BridgeRuntime {
           }
           return
         }
+        if (file && fileTooLarge) {
+          await this.appendLog(
+            'info',
+            'bridge',
+            `Refused ${describeDocument(file)} in message ${msg.message_id}, chat ${tgChatId}: over the 20 MB a Telegram bot can download.`
+          )
+          if (unaddressed) return
+          const token = await this.readToken()
+          if (token) {
+            await this.safeSendTelegram(token, msg.chat.id, this.i18n.fileTooLarge, msg.message_id)
+          }
+          return
+        }
         if (voice) {
           await this.processVoiceMessage(msg, voice, text, signal, update.update_id, unaddressed)
           return
         }
-        await this.processAuthorizedMessage(msg, text, image, signal, update.update_id, false, unaddressed)
+        await this.processAuthorizedMessage(msg, text, image, file, signal, update.update_id, false, unaddressed)
       } catch (err) {
         // Everything after the Orca bot got the message is answered inside processAuthorizedMessage,
         // so what lands here never reached it and may be sent again.
-        const rerun = unsupportedImage
+        const rerun = unsupportedImage || fileTooLarge
           ? undefined
           : voice
           ? (s: AbortSignal | undefined) => this.processVoiceMessage(msg, voice, text, s, update.update_id)
-          : (s: AbortSignal | undefined) => this.processAuthorizedMessage(msg, text, image, s, update.update_id)
+          : (s: AbortSignal | undefined) => this.processAuthorizedMessage(msg, text, image, file, s, update.update_id)
         await this.messageFailed(err, msg, update.update_id, unaddressed, rerun)
       }
     })
@@ -1735,11 +1769,11 @@ export class BridgeRuntime {
   // messages. In 'all' mode it also reads every other line, but only while the allowlist is
   // restricted: in an open bridge every stranger's line would start an Orca run. Returns the text to
   // process (mention removed) and whether it was addressed to the bot, or null to ignore it.
-  private groupMessageText(msg: TelegramMessage, hasImage: boolean): { text: string; addressed: boolean } | null {
+  private groupMessageText(msg: TelegramMessage, hasMedia: boolean): { text: string; addressed: boolean } | null {
     const username = this.botUsername
     if (!username) return null
     const raw = (msg.text ?? msg.caption ?? '').trim()
-    if (!hasImage && raw.startsWith('/')) {
+    if (!hasMedia && raw.startsWith('/')) {
       const rawCmd = raw.split(/\s+/)[0]
       const at = rawCmd.indexOf('@')
       // '/cmd@other_bot' is for another bot in the same group.
@@ -1759,14 +1793,17 @@ export class BridgeRuntime {
     msg: TelegramMessage,
     text: string,
     image: IncomingTelegramImage | null,
+    // Any other document, passed on as a file.
+    file: TelegramDocument | null,
     signal: AbortSignal | undefined,
     updateId: number,
     // A transcript is sent as is, even when it starts with '/'.
     fromVoice = false,
     // A group message not addressed to the bot (groupMode 'all'): quiet, and the reply policy applies.
     unaddressed = false,
-    // Images saved by an earlier try of this message, so [Try again] does not download them again.
-    savedImagePaths: string[] = []
+    // Images and files saved by an earlier try of this message, so [Try again] does not download them again.
+    savedImagePaths: string[] = [],
+    savedFiles: { path: string; name: string }[] = []
   ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
@@ -1775,7 +1812,7 @@ export class BridgeRuntime {
     const fromId = msg.from ? String(msg.from.id) : tgChatId
     const senderLabel = formatSenderLabel(msg)
 
-    if (!image && !fromVoice && text.startsWith('/')) {
+    if (!image && !file && !fromVoice && text.startsWith('/')) {
       const handled = await this.handleSlashCommand(token, msg, text)
       if (handled) return
     }
@@ -1793,10 +1830,11 @@ export class BridgeRuntime {
       )
       return
     }
-    // Only the length of what the user wrote is logged, never the text.
+    // Only the length of what the user wrote is logged, never the text; a file only by extension and size.
     const content = [
       text ? `${fromVoice ? 'transcript' : 'text'} ${text.length} chars` : '',
-      image ? 'image' : ''
+      image ? 'image' : '',
+      file ? describeDocument(file) : ''
     ].filter(Boolean).join(' + ')
     await this.appendLog('info', 'dispatch', `[TG ${senderLabel} -> ${binding.botName}] ${content}`)
     this.emitState()
@@ -1809,6 +1847,7 @@ export class BridgeRuntime {
     let boundOrcaChatId = binding.orcaChatId
     const stats: DispatchStats = { startedAt: Date.now(), polls: 0 }
     const imagePaths = [...savedImagePaths]
+    const files = [...savedFiles]
     // Never for an unaddressed group line: those stay quiet.
     const working = unaddressed ? null : this.startWorkingLine(token, msg)
     try {
@@ -1816,6 +1855,10 @@ export class BridgeRuntime {
         if (!unaddressed) await this.sendTypingAction(token, msg.chat.id)
         const savedPath = await this.downloadTelegramImage(token, image, msg.message_id, signal)
         imagePaths.push(savedPath)
+      }
+      if (file && files.length === 0) {
+        if (!unaddressed) await this.sendTypingAction(token, msg.chat.id)
+        files.push(await this.downloadTelegramDocument(token, file, msg.message_id, signal))
       }
 
       const result = await this.dispatchTraced(stats, {
@@ -1825,6 +1868,7 @@ export class BridgeRuntime {
         senderLabel,
         userText: text,
         imagePaths,
+        files,
         unaddressedGroupReply: unaddressed ? this.config.groupReply : undefined,
         rolePrompt: this.roleOf(fromId, msg.chat).prompt,
         answerLanguage:
@@ -1926,7 +1970,7 @@ export class BridgeRuntime {
           err,
           stats.sent
             ? undefined
-            : (s) => this.processAuthorizedMessage(msg, text, image, s, updateId, fromVoice, false, imagePaths)
+            : (s) => this.processAuthorizedMessage(msg, text, image, file, s, updateId, fromVoice, false, imagePaths, files)
         )
       }
     } finally {
@@ -2053,7 +2097,7 @@ export class BridgeRuntime {
       `Transcribed voice message ${msg.message_id} in chat ${tgChatId}: ${voice.duration} s, ${bytes} bytes, ${provider} ${model}, ${Date.now() - startedAt} ms.`
     )
     const text = `${caption ? `${caption}\n` : ''}${VOICE_PREFIX} ${transcript}`
-    await this.processAuthorizedMessage(msg, text, null, signal, updateId, true, unaddressed)
+    await this.processAuthorizedMessage(msg, text, null, null, signal, updateId, true, unaddressed)
   }
 
   private async sendTypingAction(token: string, chatId: number): Promise<void> {
@@ -2191,7 +2235,7 @@ export class BridgeRuntime {
       'dispatch',
       `Dispatch start: bot ${params.botName}, tg chat ${params.tgChatId}, ${
         params.boundChatId ? `bound Orca chat ${params.boundChatId}` : 'new Orca chat'
-      }, body ${params.userText.length} chars, ${params.imagePaths?.length ?? 0} image(s)`
+      }, body ${params.userText.length} chars, ${params.imagePaths?.length ?? 0} image(s), ${params.files?.length ?? 0} file(s)`
     )
     const result = await dispatchToOrcaBotAndWait(runner, params)
     await this.appendLog(
@@ -2226,7 +2270,7 @@ export class BridgeRuntime {
 
     const dir = this.deps.downloadDir ?? path.join(os.tmpdir(), 'orca-telegram-bridge', 'images')
     await fs.mkdir(dir, { recursive: true, mode: 0o700 })
-    await this.cleanupOldDownloadedImages(dir)
+    await this.cleanupOldDownloads(dir)
 
     const ext = resolveSafeImageExt(fileMeta.file_path, image.ext)
     const filename = `tg-${Date.now()}-${messageId}-${Math.random().toString(36).slice(2, 6)}${ext}`
@@ -2235,7 +2279,40 @@ export class BridgeRuntime {
     return targetPath
   }
 
-  private async cleanupOldDownloadedImages(dir: string): Promise<void> {
+  // Saved under the sanitized name so the Orca bot's tools see the right extension; its own folder,
+  // apart from the images.
+  private async downloadTelegramDocument(
+    token: string,
+    doc: TelegramDocument,
+    messageId: number,
+    signal: AbortSignal | undefined
+  ): Promise<{ path: string; name: string }> {
+    const fileMeta = await this.deps.telegram.getFile(token, doc.file_id, {
+      proxyUrl: this.config.proxyUrl,
+      timeoutMs: 15_000,
+      signal
+    })
+    if (!fileMeta.file_path) {
+      throw new Error('Telegram did not return a downloadable file_path for this file.')
+    }
+    const bytes = await this.deps.telegram.downloadFile(token, fileMeta.file_path, {
+      proxyUrl: this.config.proxyUrl,
+      timeoutMs: 30_000,
+      signal
+    })
+
+    const dir = path.join(this.deps.downloadDir ?? os.tmpdir(), 'orca-telegram-bridge', 'files')
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+    await this.cleanupOldDownloads(dir)
+
+    const safeName = safeDocumentName(doc.file_name, fileMeta.file_path)
+    const filename = `tg-${Date.now()}-${messageId}-${Math.random().toString(36).slice(2, 6)}-${safeName}`
+    const targetPath = path.join(dir, filename)
+    await fs.writeFile(targetPath, bytes)
+    return { path: targetPath, name: doc.file_name || safeName }
+  }
+
+  private async cleanupOldDownloads(dir: string): Promise<void> {
     try {
       const cutoffMs = Date.now() - 24 * 60 * 60 * 1000
       const entries = await fs.readdir(dir, { withFileTypes: true })
@@ -2249,12 +2326,12 @@ export class BridgeRuntime {
           }
         } catch (err) {
           // Best-effort cleanup.
-          await this.appendLog('debug', 'bridge', 'Removing an old downloaded image failed', describeError(err))
+          await this.appendLog('debug', 'bridge', 'Removing an old downloaded file failed', describeError(err))
         }
       }
     } catch (err) {
       // Best-effort cleanup.
-      await this.appendLog('debug', 'bridge', 'Listing downloaded images for cleanup failed', describeError(err))
+      await this.appendLog('debug', 'bridge', 'Listing downloaded files for cleanup failed', describeError(err))
     }
   }
 

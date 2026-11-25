@@ -26,6 +26,7 @@ import {
   TelegramApiError,
   type TelegramBotCommand,
   type TelegramClient,
+  type TelegramDocument,
   type TelegramInlineKeyboardMarkup,
   type TelegramMessage,
   type TelegramUpdate
@@ -516,8 +517,19 @@ test('a bridged Orca chat under its automatic title is named telegram@<name>, on
     await within(controller.handleIncomingUpdate(withUsername(3, 'third')), 'chosen title')
     assert.equal(deps.renamedChats.at(-1)?.name, 'Project X')
 
+    // a chosen title that only contains "Telegram: " stays too
+    await deps.orcaCli.renameChat(chatId, 'Project: Telegram: roadmap')
+    const renamesBefore = deps.renamedChats.length
+    await within(controller.handleIncomingUpdate(withUsername(4, 'fourth')), 'chosen title with Telegram:')
+    assert.equal(deps.renamedChats.length, renamesBefore)
+
+    // Orca's automatic title behind the sender is replaced
+    await deps.orcaCli.renameChat(chatId, "your owner's agent: Telegram: hi")
+    await within(controller.handleIncomingUpdate(withUsername(5, 'fifth')), "owner's agent title")
+    assert.equal(deps.renamedChats.at(-1)?.name, 'telegram@ana_dev')
+
     // without a username: first name
-    await within(controller.handleIncomingUpdate(textUpdate(4, 555000222, 'hi')), 'no username')
+    await within(controller.handleIncomingUpdate(textUpdate(6, 555000222, 'hi')), 'no username')
     assert.equal(deps.renamedChats.at(-1)?.name, 'telegram@User')
   } finally {
     await within(controller.dispose(), 'dispose')
@@ -3468,6 +3480,285 @@ test("'all' with an open allowlist acts as 'addressed': a plain group line start
     await controller.handleIncomingUpdate(groupUpdate(2, 555, '@demo_orca_bot hello'))
     assert.equal(deps.sentToBots.length, 1)
   })
+})
+
+function documentUpdate(updateId: number, document: TelegramDocument, caption?: string): TelegramUpdate {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: 50 + updateId,
+      from: { id: 777888, is_bot: false, first_name: 'Demo' },
+      chat: { id: 777888, type: 'private' },
+      date: 1000,
+      ...(caption ? { caption } : {}),
+      document
+    }
+  }
+}
+
+const FILES_HEADER =
+  'Attached Telegram file(s) saved locally (open them with your tools; the original name is in parentheses):'
+
+// The first "- <path> (<name>)" line of the last body the Orca bot received.
+function lastFileLine(deps: ReturnType<typeof makeMockDeps>): { savedPath: string; name: string } {
+  const lines = deps.sentToBots.at(-1)?.body.split('\n') ?? []
+  const header = lines.indexOf(FILES_HEADER)
+  assert.ok(header >= 0, 'the body lists the file')
+  const match = /^- (.+) \((.+)\)$/.exec(lines[header + 1] ?? '')
+  assert.ok(match, 'the file line has a path and a name')
+  return { savedPath: match[1], name: match[2] }
+}
+
+// A spreadsheet without a caption used to be dropped, and with one only the caption arrived.
+test('a non-image document reaches the Orca bot as a file saved under a safe name, with its original name', async () => {
+  const downloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-tg-bridge-test-'))
+  const filesDir = path.join(downloadDir, 'orca-telegram-bridge', 'files')
+  const telegramPaths: Record<string, string> = {
+    'doc-xlsx': 'documents/file_5.xlsx',
+    'doc-evil': 'documents/file_6.xlsx',
+    'doc-noname': 'documents/file_7.pdf',
+    'doc-long': 'documents/file_8.csv',
+    'doc-pdf': 'documents/file_9.pdf',
+    'doc-docx': 'documents/file_10.docx'
+  }
+  const deps = makeMockDeps({
+    telegram: {
+      async getFile(_token, fileId) {
+        return { file_id: fileId, file_unique_id: `u_${fileId}`, file_path: telegramPaths[fileId] }
+      },
+      async downloadFile(_token, filePath) {
+        return Buffer.from(`bytes-for-${filePath}`)
+      }
+    }
+  })
+  const { manager, controller, worker } = await mountBridge(loggingHost(), deps, { downloadDir })
+  try {
+    // A download from two days ago is cleaned up by the next one.
+    await fs.mkdir(filesDir, { recursive: true })
+    const oldFile = path.join(filesDir, 'tg-1-1-old-old.xlsx')
+    await fs.writeFile(oldFile, 'old')
+    const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000)
+    await fs.utimes(oldFile, twoDaysAgo, twoDaysAgo)
+
+    // 1. No caption: the saved path, the original name and the default request.
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(1, {
+          file_id: 'doc-xlsx',
+          file_unique_id: 'x1',
+          file_name: 'Q3 report.xlsx',
+          mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          file_size: 2048
+        })
+      ),
+      'xlsx without caption'
+    )
+    assert.equal(deps.sentToBots.length, 1)
+    assert.match(deps.sentToBots[0].subject, /\[File\]/)
+    const first = lastFileLine(deps)
+    assert.equal(first.name, 'Q3 report.xlsx')
+    assert.equal(path.dirname(first.savedPath), filesDir)
+    assert.match(path.basename(first.savedPath), /^tg-\d+-51-[a-z0-9]*-Q3_report\.xlsx$/)
+    assert.equal(await fs.readFile(first.savedPath, 'utf8'), 'bytes-for-documents/file_5.xlsx')
+    assert.equal(lastBodyLine(deps), 'Please open the attached file(s) above and respond.')
+    assert.equal((await fs.readdir(filesDir)).includes('tg-1-1-old-old.xlsx'), false)
+    // The log has the extension and the size, never the name.
+    assert.ok(manager.getState().logs.some((e) => e.message.endsWith('] document .xlsx 2048 bytes')))
+
+    // 2. With a caption the caption is the text; a "../" name cannot leave the files folder.
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(
+          2,
+          { file_id: 'doc-evil', file_unique_id: 'x2', file_name: '../evil.xlsx', mime_type: 'application/vnd.ms-excel' },
+          'Sum column B'
+        )
+      ),
+      'xlsx with caption'
+    )
+    assert.equal(deps.sentToBots.length, 2)
+    assert.equal(lastBodyLine(deps), 'Sum column B')
+    const second = lastFileLine(deps)
+    assert.equal(second.name, '../evil.xlsx')
+    assert.equal(path.dirname(second.savedPath), filesDir)
+    assert.match(path.basename(second.savedPath), /^tg-\d+-52-[a-z0-9]*-\.\._evil\.xlsx$/)
+    // An unknown size is tried.
+    assert.ok(manager.getState().logs.some((e) => e.message.endsWith('] text 12 chars + document .xlsx unknown bytes')))
+
+    // 3. No name: "file" and the extension of Telegram's path.
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(3, { file_id: 'doc-noname', file_unique_id: 'x3', mime_type: 'application/pdf', file_size: 100 })
+      ),
+      'no file name'
+    )
+    const third = lastFileLine(deps)
+    assert.equal(third.name, 'file.pdf')
+    assert.match(path.basename(third.savedPath), /^tg-\d+-53-[a-z0-9]*-file\.pdf$/)
+
+    // 4. A long name is cut to 80 chars, keeping the extension.
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(4, { file_id: 'doc-long', file_unique_id: 'x4', file_name: `${'ç'.repeat(100)}.csv`, mime_type: 'text/csv' })
+      ),
+      'long name'
+    )
+    const savedName = path.basename(lastFileLine(deps).savedPath).replace(/^tg-\d+-54-[a-z0-9]*-/, '')
+    assert.equal(savedName, `${'_'.repeat(76)}.csv`)
+
+    // 5. A PDF and a Word document reach the bot the same way.
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(5, {
+          file_id: 'doc-pdf',
+          file_unique_id: 'x5',
+          file_name: 'Invoice 2026.pdf',
+          mime_type: 'application/pdf',
+          file_size: 4096
+        })
+      ),
+      'pdf'
+    )
+    const pdf = lastFileLine(deps)
+    assert.equal(pdf.name, 'Invoice 2026.pdf')
+    assert.equal(path.dirname(pdf.savedPath), filesDir)
+    assert.match(path.basename(pdf.savedPath), /^tg-\d+-55-[a-z0-9]*-Invoice_2026\.pdf$/)
+    assert.equal(await fs.readFile(pdf.savedPath, 'utf8'), 'bytes-for-documents/file_9.pdf')
+    assert.equal(lastBodyLine(deps), 'Please open the attached file(s) above and respond.')
+    assert.ok(manager.getState().logs.some((e) => e.message.endsWith('] document .pdf 4096 bytes')))
+
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(
+          6,
+          {
+            file_id: 'doc-docx',
+            file_unique_id: 'x6',
+            file_name: 'Contract draft.docx',
+            mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            file_size: 8192
+          },
+          'Review clause 4'
+        )
+      ),
+      'docx'
+    )
+    const docx = lastFileLine(deps)
+    assert.equal(docx.name, 'Contract draft.docx')
+    assert.equal(path.dirname(docx.savedPath), filesDir)
+    assert.match(path.basename(docx.savedPath), /^tg-\d+-56-[a-z0-9]*-Contract_draft\.docx$/)
+    assert.equal(await fs.readFile(docx.savedPath, 'utf8'), 'bytes-for-documents/file_10.docx')
+    assert.equal(lastBodyLine(deps), 'Review clause 4')
+    assert.ok(manager.getState().logs.some((e) => e.message.endsWith('] text 15 chars + document .docx 8192 bytes')))
+
+    assert.equal(deps.sentToBots.length, 6)
+    assert.equal((await fs.readdir(filesDir)).length, 6)
+    assert.equal((await fs.readdir(downloadDir)).join(','), 'orca-telegram-bridge')
+    assert.equal((await fs.readdir(path.join(downloadDir, 'orca-telegram-bridge'))).join(','), 'files')
+    const logs = JSON.stringify(manager.getState().logs)
+    assert.equal(/Q3|evil|ç|Invoice|Contract/.test(logs), false)
+    assert.equal(worker.refusals.length, 0)
+  } finally {
+    await worker.deactivate()
+    await fs.rm(downloadDir, { recursive: true, force: true })
+  }
+})
+
+test('a document over 20 MB gets one plain line and is neither downloaded nor sent to the Orca bot', async () => {
+  const deps = makeMockDeps({
+    telegram: {
+      async getFile() {
+        throw new Error('getFile must not be called for a file over 20 MB')
+      }
+    }
+  })
+  const { manager, controller, worker } = await mountBridge(loggingHost(), deps)
+  const bytes = 25 * 1024 * 1024
+  try {
+    await within(
+      controller.handleIncomingUpdate(
+        documentUpdate(1, {
+          file_id: 'doc-big',
+          file_unique_id: 'b1',
+          file_name: 'backup.zip',
+          mime_type: 'application/zip',
+          file_size: bytes
+        })
+      ),
+      'large file'
+    )
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.length, 1)
+    assert.equal(deps.sentMessages[0].text, t('en').fileTooLarge)
+    const log = manager.getState().logs.find((e) => e.message.startsWith('Refused document'))
+    assert.equal(
+      log?.message,
+      `Refused document .zip ${bytes} bytes in message 51, chat 777888: over the 20 MB a Telegram bot can download.`
+    )
+    assert.equal(JSON.stringify(manager.getState().logs).includes('backup'), false)
+    assert.equal(worker.refusals.length, 0)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('in a group a file follows the same addressing rules as an image', async () => {
+  const downloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-tg-bridge-test-'))
+  const host = bridgesHost([
+    {
+      id: 'b-group001',
+      token: '123456:TEST_TOKEN',
+      config: { allowGroups: true, groupMode: 'addressed', allowedUserIds: `777888, ${GROUP_ID}` }
+    }
+  ])
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountBridge(host, deps, { downloadDir })
+  const sheet: TelegramDocument = {
+    file_id: 'doc-sheet',
+    file_unique_id: 's1',
+    file_name: 'plan.xlsx',
+    mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    file_size: 300
+  }
+  try {
+    await controller.testConnection()
+    // Not addressed to the bot: ignored, not even downloaded.
+    await within(
+      controller.handleIncomingUpdate(groupUpdate(1, 777888, '', { text: undefined, document: sheet })),
+      'unaddressed file'
+    )
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.length, 0)
+
+    // A mention in the caption: the caption without the mention is the text.
+    await within(
+      controller.handleIncomingUpdate(
+        groupUpdate(2, 777888, '', { text: undefined, caption: '@demo_orca_bot check the totals', document: sheet })
+      ),
+      'mentioned file'
+    )
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(lastBodyLine(deps), 'check the totals')
+    assert.equal(lastFileLine(deps).name, 'plan.xlsx')
+
+    // A reply to the bot without a caption: the default request.
+    await within(
+      controller.handleIncomingUpdate(
+        groupUpdate(3, 777888, '', {
+          text: undefined,
+          document: sheet,
+          reply_to_message: { message_id: 90, from: BOT_USER, chat: { id: GROUP_ID, type: 'supergroup', title: 'Team' }, date: 999 }
+        })
+      ),
+      'file replying to the bot'
+    )
+    assert.equal(deps.sentToBots.length, 2)
+    assert.equal(lastBodyLine(deps), 'Please open the attached file(s) above and respond.')
+    assert.equal(worker.refusals.length, 0)
+  } finally {
+    await worker.deactivate()
+    await fs.rm(downloadDir, { recursive: true, force: true })
+  }
 })
 
 const SILENT_LINE =

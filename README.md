@@ -16,7 +16,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **Know who did what.** An Audit tab records who ran an automation, changed sync or chats, and who was refused, plus every access, role or token change made in the panel. Never message text.
 - **Private chats and groups**: in a group the bot answers when called, or follows the conversation and joins in when it can help.
 - **Voice messages**, transcribed with OpenRouter or OpenAI and answered as text.
-- **Images and files both ways**: photos reach the Orca bot as files, and the Orca bot can send back charts, screenshots and documents; Markdown and tables come back formatted.
+- **Images and files both ways**: photos, spreadsheets, PDFs and other files reach the Orca bot as local files, and the Orca bot can send back charts, screenshots and documents; Markdown and tables come back formatted.
 - **Calm long answers.** A long run shows "⏳ Working…" instead of silence, and a failure is one plain line, with **Details** for the owner and **Try again** only when it is safe.
 - **Replies in the user's language**: English, Português, Español, 中文, or Auto per chat.
 - **No server to run**: the plugin long-polls Telegram from inside Orca. No public IP, webhook or extra daemon.
@@ -32,7 +32,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **Encrypted Bot Token storage** via `orca.secrets` (OS keyring)
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`. The Orca chat is named after the Telegram chat, such as `telegram@drecchia` (a person's `@username`, else their name; a group's title), replacing Orca's automatic "Telegram: …" title after the first answer; a title set with `/rename` or in Orca is kept
-- **Telegram → Orca image forwarding** — downloads compressed photos and uncompressed image documents locally and passes their file path(s) to the Orca bot (with optional caption)
+- **Telegram → Orca images and files** — downloads compressed photos, image documents and any other file (spreadsheets, PDF, CSV, Office, text…, up to Telegram's 20 MB bot limit) locally and passes their path(s) and original names to the Orca bot (with optional caption); a larger file gets a plain reply instead of silence
 - **Orca → Telegram images and documents** — the Orca bot attaches a file by writing `![caption](path or https URL)`; the plugin sends it as a photo or document
 - **Voice messages**: per bridge, voice messages and audio files are transcribed with OpenRouter or OpenAI and reach the Orca bot as text
 - **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram. Orca's own automation prompts (reminders, deadlines, events, and scheduled runs of an automation that ran in that chat in the last 24 hours) stay in Orca; only the bot's answer goes. Like Orca, a bot answer ending in `NO_REPLY` sends nothing
