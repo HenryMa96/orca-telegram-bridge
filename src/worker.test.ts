@@ -784,6 +784,7 @@ test('sync skips Orca automation prompts, scheduled runs and NO_REPLY answers bu
     ]
   }
   const sent: string[] = []
+  let runReads = 0
   const host = mockHost({
     capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
     secrets: { botToken: '123456:TEST_TOKEN' },
@@ -835,6 +836,7 @@ test('sync skips Orca automation prompts, scheduled runs and NO_REPLY answers bu
         ]
       },
       async listAutomationRuns() {
+        runReads++
         return [
           { automationId: 'auto-daily', chatSessionId: boundChatId, startedAt: Date.now() },
           { automationId: 'auto-other', chatSessionId: 'another-chat', startedAt: Date.now() }
@@ -882,6 +884,8 @@ test('sync skips Orca automation prompts, scheduled runs and NO_REPLY answers bu
     session.entries.push({ kind: 'message', role: 'assistant', text: 'Balance: 10.' })
     await controller.syncOrcaBoundChatsOnce()
     assert.equal(sent.length, 2)
+    // Orca's runs are read only once a message may be a scheduled run, once per sync cycle.
+    assert.equal(runReads, 1)
     assert.match(sent[1], /Balance: 10\./)
 
     // What the owner types in Orca still reaches Telegram, even when an automation elsewhere has
@@ -891,6 +895,7 @@ test('sync skips Orca automation prompts, scheduled runs and NO_REPLY answers bu
     session.entries.push({ kind: 'message', role: 'assistant', text: 'Done.' })
     await controller.syncOrcaBoundChatsOnce()
     assert.equal(sent.length, 4)
+    assert.equal(runReads, 2)
     assert.match(sent[2], /Typed in Orca/)
     assert.match(sent[3], /Done\./)
   } finally {

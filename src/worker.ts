@@ -14,6 +14,8 @@ import {
   isTelegramOriginatedUserMessage,
   OrcaCliError,
   pickPluginKey,
+  type OrcaAutomationRun,
+  type OrcaAutomationSummary,
   type OrcaCliRunner,
   type OrcaMessageItem,
   withoutQuietMarker
@@ -258,6 +260,7 @@ type ErrorContext = Record<string, string | number | boolean | null | undefined>
 type DispatchParams = Parameters<typeof dispatchToOrcaBotAndWait>[1]
 type DispatchResult = Awaited<ReturnType<typeof dispatchToOrcaBotAndWait>>
 type DispatchStats = { startedAt: number; polls: number; lastState?: string }
+type AutomationSnapshot = { runs: OrcaAutomationRun[]; automations: OrcaAutomationSummary[] }
 
 function indentLines(text: string): string {
   return text
@@ -606,6 +609,7 @@ export class BridgeRuntime {
   private readonly chatQueues = new Map<string, Promise<void>>()
   private readonly activeTelegramTgChats = new Set<string>()
   private readonly activeTelegramOrcaChats = new Set<string>()
+  private automationSnapshot: Promise<AutomationSnapshot | null> | null = null
   private readonly blockedLoggedAt = new Map<string, number>()
   // Groups this run already left because groups are off; a message there does not leave again.
   private readonly leftGroups = new Set<string>()
@@ -2487,6 +2491,8 @@ export class BridgeRuntime {
     if (boundList.length === 0) return
 
     this.outboundSyncRunning = true
+    // Automation runs are read at most once per sync cycle, shared by every bound chat.
+    this.automationSnapshot = null
     try {
       await this.manager.refreshBots()
       const byBot = new Map<string, ChatBinding[]>()
@@ -2549,23 +2555,33 @@ export class BridgeRuntime {
    * is that prompt and that automation ran in this very chat. Empty when Orca cannot be read.
    */
   private async scheduledRunPrompts(orcaChatId: string): Promise<Set<string>> {
+    this.automationSnapshot ??= this.readAutomationSnapshot()
+    const snapshot = await this.automationSnapshot
+    if (!snapshot) return new Set()
+    const since = Date.now() - AUTOMATION_RUN_WINDOW_MS
+    const ranHere = new Set(
+      snapshot.runs
+        .filter((run) => run.chatSessionId === orcaChatId && run.startedAt !== null && run.startedAt >= since)
+        .map((run) => run.automationId)
+    )
+    return new Set(
+      snapshot.automations.flatMap((a) =>
+        ranHere.has(a.id) && a.prompt?.trim() ? [normalizePrompt(a.prompt)] : []
+      )
+    )
+  }
+
+  /** Orca's recent automation runs and automations, or null (logged) when they cannot be read. */
+  private async readAutomationSnapshot(): Promise<AutomationSnapshot | null> {
     try {
       const [runs, automations] = await Promise.all([
         this.deps.orcaCli.listAutomationRuns(AUTOMATION_RUNS_LIMIT),
         this.deps.orcaCli.listAutomations()
       ])
-      const since = Date.now() - AUTOMATION_RUN_WINDOW_MS
-      const ranHere = new Set(
-        runs
-          .filter((run) => run.chatSessionId === orcaChatId && run.startedAt !== null && run.startedAt >= since)
-          .map((run) => run.automationId)
-      )
-      return new Set(
-        automations.flatMap((a) => (ranHere.has(a.id) && a.prompt?.trim() ? [normalizePrompt(a.prompt)] : []))
-      )
+      return { runs, automations }
     } catch (err) {
       await this.appendLog('warn', 'sync', 'Could not read Orca automation runs', describeError(err))
-      return new Set()
+      return null
     }
   }
 
@@ -2657,7 +2673,7 @@ export class BridgeRuntime {
 
     let forwardedUserCount = 0
     let forwardedAssistantCount = 0
-    // Read once per tick, and only when a message may be a scheduled run.
+    // Built once per chat, only when a message may be a scheduled run.
     let scheduledPrompts: Set<string> | undefined
 
     // Group consecutive assistant messages so multi-step tool turns arrive as one clean reply.
