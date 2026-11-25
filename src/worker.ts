@@ -10,11 +10,13 @@ import {
   extractMessageItems,
   findUnsyncedTail,
   getOrcaBinary,
+  isOrcaAutomationRunMessage,
   isTelegramOriginatedUserMessage,
   OrcaCliError,
   pickPluginKey,
   type OrcaCliRunner,
-  type OrcaMessageItem
+  type OrcaMessageItem,
+  withoutQuietMarker
 } from './orca-bridge'
 import {
   extractAttachments,
@@ -1283,12 +1285,17 @@ export class BridgeRuntime {
         updatedAt: Date.now()
       })
 
-      const delivery = await this.sendFormattedReplyToTelegram(
-        token,
-        msg.chat.id,
-        result.shortened ? `${result.replyText}\n\n${this.i18n.shortenedNote}` : result.replyText,
-        msg.message_id
-      )
+      // Orca's NO_REPLY: the bot has nothing to report, so Telegram gets nothing either.
+      const replyWords = withoutQuietMarker(result.replyText)
+      const delivery =
+        replyWords === null
+          ? { messageCount: 0, imageCount: 0, attachmentCount: 0 }
+          : await this.sendFormattedReplyToTelegram(
+              token,
+              msg.chat.id,
+              result.shortened ? `${replyWords}\n\n${this.i18n.shortenedNote}` : replyWords,
+              msg.message_id
+            )
 
       const existingCursor = this.syncCursors[result.chatId]
       this.syncCursors[result.chatId] = {
@@ -1303,9 +1310,11 @@ export class BridgeRuntime {
       await this.appendLog(
         'info',
         'dispatch',
-        `[${binding.botName} -> TG ${tgChatId}] Sent ${delivery.messageCount} message(s)${
-          delivery.imageCount > 0 ? ` + ${delivery.imageCount} table image(s)` : ''
-        }${delivery.attachmentCount > 0 ? ` + ${delivery.attachmentCount} attachment(s)` : ''}.`
+        replyWords === null
+          ? `[${binding.botName} -> TG ${tgChatId}] Answered NO_REPLY: nothing sent.`
+          : `[${binding.botName} -> TG ${tgChatId}] Sent ${delivery.messageCount} message(s)${
+              delivery.imageCount > 0 ? ` + ${delivery.imageCount} table image(s)` : ''
+            }${delivery.attachmentCount > 0 ? ` + ${delivery.attachmentCount} attachment(s)` : ''}.`
       )
       this.emitState()
     } catch (err) {
@@ -2615,7 +2624,8 @@ export class BridgeRuntime {
     for (let i = 0; i < readyItems.length; i++) {
       const item = readyItems[i]
       if (item.role === 'user') {
-        if (!isTelegramOriginatedUserMessage(item.text)) {
+        // Orca's own automation runs (reminders, deadlines, events) are not something the owner typed.
+        if (!isTelegramOriginatedUserMessage(item.text) && !isOrcaAutomationRunMessage(item.text)) {
           const userPayload = `${this.i18n.orcaUserMessageHeader(binding.botName)}\n\n${item.text}`
           const chunks = splitTelegramMessage(userPayload, 3500)
           for (const chunk of chunks) {
@@ -2631,11 +2641,12 @@ export class BridgeRuntime {
         i++
         assistantParts.push(readyItems[i].text)
       }
-      await this.sendFormattedReplyToTelegram(
-        token,
-        binding.tgChatId,
-        assistantParts.join('\n\n')
-      )
+      // NO_REPLY parts say nothing, as in Orca's own chat.
+      const shown = assistantParts
+        .map((part) => withoutQuietMarker(part))
+        .filter((part): part is string => part !== null)
+      if (shown.length === 0) continue
+      await this.sendFormattedReplyToTelegram(token, binding.tgChatId, shown.join('\n\n'))
       forwardedAssistantCount++
     }
 

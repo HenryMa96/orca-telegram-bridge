@@ -569,6 +569,43 @@ export function isTelegramOriginatedUserMessage(text: string): boolean {
   return /^Telegram message from (?:user|owner) \(.*, chat [^)]*\) \[tg:[^:\]]+:\d+\]\./.test(text.trim())
 }
 
+// Orca injects an automation run (a reminder, a wait's deadline, an event) into the bot's chat as
+// a user message carrying one of these lines; nobody typed it. Upstream:
+// src/main/automations/automation-event-prompt.ts (automationDeadlinePrompt, automationRunPrompt).
+const AUTOMATION_RUN_LINE = new RegExp(
+  [
+    String.raw`^\[Orca: it is \S+, the time you were asked to act at\. This is the only run\.\]$`,
+    String.raw`^\[Orca: the deadline \S+ came before the event you were waiting for\. This is the wait's only run\.\]$`,
+    String.raw`^\[Orca event: [^\]\n]*\]$`
+  ].join('|'),
+  'm'
+)
+
+export function isOrcaAutomationRunMessage(text: string): boolean {
+  return AUTOMATION_RUN_LINE.test(text)
+}
+
+// A bot message ending in NO_REPLY has nothing to report, and Orca tells nobody. Mirrors upstream
+// src/shared/bot-quiet-result.ts (addressedBotWords): the marker may be dressed (`NO_REPLY`,
+// **NO_REPLY.**), every trailing marker goes, but a quoted mention after words on its line stays.
+const QUIET_ENDING = /(?:^|\s)[`*_]*NO_REPLY[`*_.!]*\s*$/
+const TRAILING_QUIET_MARKER = /([`*_]*)NO_REPLY[`*_.!]*\s*$/
+const HAS_WORD = /[\p{L}\p{N}]/u
+
+/** What a bot's message says once Orca's NO_REPLY marker is taken off, or null when nothing is left. */
+export function withoutQuietMarker(message: string): string | null {
+  let words = message.trimEnd()
+  while (QUIET_ENDING.test(words)) {
+    const match = TRAILING_QUIET_MARKER.exec(words)
+    const rest = match ? words.slice(0, match.index) : ''
+    if (match?.[1]?.includes('`') && HAS_WORD.test(rest.slice(rest.lastIndexOf('\n') + 1))) {
+      break
+    }
+    words = rest.trimEnd()
+  }
+  return HAS_WORD.test(words) ? words : null
+}
+
 /**
  * Aligns saved `tailHashes` against the current `items` window and returns any
  * messages appended after the aligned anchor.

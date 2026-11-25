@@ -729,6 +729,110 @@ test('syncOrcaBoundChatsOnce forwards Orca-side user messages and bot replies wi
   await capturedWorker.deactivate()
 })
 
+test('sync skips Orca automation prompts and NO_REPLY answers but forwards the reminder itself', async () => {
+  const boundChatId = 'orca-bound-auto'
+  let chatActivityAt = 1000
+  const session: OrcaSessionRead = {
+    orcaSessionId: boundChatId,
+    state: 'done',
+    entries: [
+      { kind: 'message', role: 'user', text: 'Old question' },
+      { kind: 'message', role: 'assistant', text: 'Old reply' }
+    ]
+  }
+  const sent: string[] = []
+  const host = mockHost({
+    capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
+    },
+    storage: {
+      'tg.bindings': [
+        { tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: boundChatId, updatedAt: 1000 }
+      ]
+    }
+  })
+  const deps = makeMockDeps({
+    telegram: {
+      async sendMessage(_token, params) {
+        sent.push(params.text)
+        return { message_id: 100 + sent.length, chat: { id: Number(params.chatId), type: 'private' }, date: 1000 }
+      }
+    },
+    orcaCli: {
+      async listBotChats() {
+        return [
+          {
+            id: boundChatId,
+            title: 'Bound Chat',
+            lastActivityAt: chatActivityAt,
+            lastAsked: null,
+            lastSaid: null,
+            home: false,
+            self: false,
+            closed: false
+          }
+        ]
+      },
+      async readSession() {
+        return { ...session, entries: [...session.entries] }
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 10
+  })
+  try {
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(sent.length, 0)
+
+    // A reminder fires: Orca writes the run prompt as a user message, then the bot answers.
+    chatActivityAt = 2000
+    session.entries.push({
+      kind: 'message',
+      role: 'user',
+      text: 'Reminder set by the Telegram user. Reply with exactly: "⏰ Check the balance."\n\n[Orca: it is 2026-11-25T16:27:59.000Z, the time you were asked to act at. This is the only run.]'
+    })
+    session.entries.push({ kind: 'message', role: 'assistant', text: '⏰ Check the balance.' })
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(sent.length, 1)
+    assert.match(sent[0], /Check the balance/)
+    assert.equal(/time you were asked to act at|Reminder set by/.test(sent[0]), false)
+
+    // A run that ends quiet sends nothing, on this tick or the next.
+    chatActivityAt = 3000
+    session.entries.push({
+      kind: 'message',
+      role: 'user',
+      text: 'Look up the balance and report it.\n\n[Orca: it is 2026-11-25T16:45:00.000Z, the time you were asked to act at. This is the only run.]'
+    })
+    session.entries.push({ kind: 'message', role: 'assistant', text: 'NO_REPLY' })
+    await controller.syncOrcaBoundChatsOnce()
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(sent.length, 1)
+
+    // What the owner types in Orca still reaches Telegram.
+    chatActivityAt = 4000
+    session.entries.push({ kind: 'message', role: 'user', text: 'Typed in Orca' })
+    session.entries.push({ kind: 'message', role: 'assistant', text: 'Done.' })
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(sent.length, 3)
+    assert.match(sent[1], /Typed in Orca/)
+    assert.match(sent[2], /Done\./)
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
 test('controller blocks unauthorized users, auto-picks bot, runs slash commands, and bridges multi-turn chat', async () => {
   const host = mockHost({
     capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],

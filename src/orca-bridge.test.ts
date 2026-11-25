@@ -5,6 +5,7 @@ import { assert, test } from 'orca/testing'
 import {
   dispatchToOrcaBotAndWait,
   getOrcaBinary,
+  isOrcaAutomationRunMessage,
   isTelegramOriginatedUserMessage,
   listBotsLocalFirst,
   listLocalBots,
@@ -15,7 +16,8 @@ import {
   type OrcaChatSummary,
   type OrcaCliRunner,
   type OrcaSessionEntry,
-  type OrcaSessionRead
+  type OrcaSessionRead,
+  withoutQuietMarker
 } from './orca-bridge'
 import type { BotSummary } from './protocol'
 
@@ -422,4 +424,38 @@ test('the plugin key prefers the dev copy, then a running one, and ignores other
   assert.equal(pickPluginKey([devStopped, installed, devRunning], 'telegram-bridge'), 'work.telegram-bridge')
   assert.equal(pickPluginKey([other], 'telegram-bridge'), null)
   assert.equal(pickPluginKey([], 'telegram-bridge'), null)
+})
+
+test('Orca automation runs are recognised by the line Orca adds, typed messages are not', () => {
+  // The shapes Orca writes (automation-event-prompt.ts), as seen in a real bound chat.
+  assert.equal(
+    isOrcaAutomationRunMessage(
+      'Reminder for the Telegram user. Reply with exactly this text.\n\n[Orca: it is 2026-11-25T16:27:59.000Z, the time you were asked to act at. This is the only run.]'
+    ),
+    true
+  )
+  assert.equal(
+    isOrcaAutomationRunMessage(
+      'Check the build.\n\n[Orca: the deadline 2026-11-25T18:00:00.000Z came before the event you were waiting for. This is the wait\'s only run.]'
+    ),
+    true
+  )
+  assert.equal(
+    isOrcaAutomationRunMessage('Summarize it.\n\n[Orca event: Slack · message · 2026-11-25T10:00:00.000Z]\n[Orca: this came from your owner.]'),
+    true
+  )
+  assert.equal(isOrcaAutomationRunMessage('Check today tasks in Orca'), false)
+  // Quoting the line inside a sentence is not a run.
+  assert.equal(isOrcaAutomationRunMessage('Why did it say [Orca: it is X, the time you were asked to act at. This is the only run.] ?'), false)
+})
+
+test('NO_REPLY answers say nothing; words before the marker stay; a quoted mention stays', () => {
+  assert.equal(withoutQuietMarker('NO_REPLY'), null)
+  assert.equal(withoutQuietMarker('**NO_REPLY.**\n'), null)
+  assert.equal(withoutQuietMarker('`NO_REPLY`'), null)
+  assert.equal(withoutQuietMarker('Nothing changed. NO_REPLY'), 'Nothing changed.')
+  assert.equal(withoutQuietMarker('Answer NO_REPLY NO_REPLY'), 'Answer')
+  assert.equal(withoutQuietMarker('To stay silent, end with `NO_REPLY`'), 'To stay silent, end with `NO_REPLY`')
+  assert.equal(withoutQuietMarker('XNO_REPLY'), 'XNO_REPLY')
+  assert.equal(withoutQuietMarker('⏰ Lembrete: conferir o saldo.'), '⏰ Lembrete: conferir o saldo.')
 })
