@@ -30,6 +30,7 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
     lastBlockedUserId: null,
     lastPollAt: Date.now(),
     bindings: [binding('123456', 'Assistant', 'chat-abc')],
+    telegramCaps: { canJoinGroups: true, canReadAllGroupMessages: true },
     ...rest,
     config: {
       id,
@@ -42,6 +43,8 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
       replyTimeoutSec: 300,
       syncOrcaOutbound: false,
       replyLanguage: 'en',
+      allowGroups: false,
+      groupMode: 'addressed',
       ...config
     }
   }
@@ -269,7 +272,9 @@ test('Save sends the edited bridge id and never the on/off state', async () => {
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
       syncOrcaOutbound: false,
-      replyLanguage: 'en'
+      replyLanguage: 'en',
+      allowGroups: false,
+      groupMode: 'addressed'
     }
   ])
   assert.deepEqual(view.errors, [])
@@ -768,4 +773,129 @@ test('sync on with an open allowlist says sync is paused, restricted list does n
   const syncOff = await mountWithAllowed('', false)
   assert.equal(syncOff.find({ text: paused }), null)
   await syncOff.unmount()
+})
+
+const ALL_NOTE = /All messages works only with Allowed Telegram IDs/
+const PRIVACY_NOTE = /Privacy mode is on: in groups the bot receives only commands/
+const JOIN_WARNING =
+  'Telegram does not let this bot join groups. In @BotFather: /setjoingroups -> Enable.'
+
+async function mountGroups(
+  config: Partial<BridgeConfig>,
+  telegramCaps: BridgeView['telegramCaps'] = { canJoinGroups: true, canReadAllGroupMessages: true }
+) {
+  const state = makeState({ bridges: [makeBridge('b1', { telegramCaps, config })] })
+  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const view = await mount(panel, { host })
+  await openEditor(view, 'b1')
+  return view
+}
+
+function joinWarnings(view: TestPanel) {
+  return view.findAll({ type: 'Callout' }).filter((c) => c.props.title === JOIN_WARNING)
+}
+
+test('In groups, read shows only while Allow groups is on, and Save sends both', async () => {
+  const state = makeState()
+  const saved: SaveConfigInput[] = []
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': (input: SaveConfigInput) => {
+        saved.push(input)
+        // Answer like the worker: the state after the save, so the editor keeps the saved values.
+        const bridge = state.bridges.find((b) => b.id === input.bridgeId)!
+        bridge.config = { ...bridge.config, allowGroups: input.allowGroups!, groupMode: input.groupMode! }
+        return state
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await openEditor(view, 'b1')
+  assert.equal(view.valueOf({ label: 'Allow groups' }), false)
+  assert.equal(view.find({ label: 'In groups, read' }), null)
+
+  await view.toggle({ label: 'Allow groups' })
+  assert.equal(view.valueOf({ label: 'In groups, read' }), 'addressed')
+  await view.select({ label: 'In groups, read' }, 'all')
+  await view.press({ text: 'Save Settings' })
+  assert.equal(saved[0].allowGroups, true)
+  assert.equal(saved[0].groupMode, 'all')
+
+  await view.toggle({ label: 'Allow groups' })
+  assert.equal(view.find({ label: 'In groups, read' }), null)
+  await view.press({ text: 'Save Settings' })
+  assert.equal(saved[1].allowGroups, false)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('each bridge card says how it reads groups', async () => {
+  const state = makeState({
+    bridges: [
+      makeBridge('off', { name: 'Off' }),
+      makeBridge('addr', { name: 'Addressed', config: { allowGroups: true } }),
+      makeBridge('all', { name: 'All', config: { allowGroups: true, groupMode: 'all' } }),
+      makeBridge('open', {
+        name: 'Open',
+        config: { allowGroups: true, groupMode: 'all', allowedUserIds: '' }
+      })
+    ]
+  })
+  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ text: 'Groups: off' }))
+  assert.ok(view.find({ text: 'Groups: messages for the bot' }))
+  assert.ok(view.find({ text: 'Groups: all messages' }))
+  assert.ok(view.find({ text: 'Groups: all messages (open: messages for the bot)' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('All messages with an open list says it reads only messages for the bot', async () => {
+  const open = await mountGroups({ allowGroups: true, groupMode: 'all', allowedUserIds: '' })
+  assert.ok(open.find({ text: ALL_NOTE }))
+  await open.unmount()
+
+  const restricted = await mountGroups({ allowGroups: true, groupMode: 'all', allowedUserIds: '42' })
+  assert.equal(restricted.find({ text: ALL_NOTE }), null)
+  await restricted.unmount()
+})
+
+test('privacy mode on shows the BotFather privacy note', async () => {
+  const view = await mountGroups(
+    { allowGroups: true },
+    { canJoinGroups: true, canReadAllGroupMessages: false }
+  )
+  assert.ok(view.find({ text: PRIVACY_NOTE }))
+  assert.equal(joinWarnings(view).length, 0)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('a bot Telegram keeps out of groups shows the join warning', async () => {
+  const view = await mountGroups(
+    { allowGroups: true },
+    { canJoinGroups: false, canReadAllGroupMessages: true }
+  )
+  assert.equal(joinWarnings(view).length, 1)
+  assert.equal(view.find({ text: PRIVACY_NOTE }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('no BotFather notes without Telegram caps or with groups off', async () => {
+  const unknown = await mountGroups({ allowGroups: true }, null)
+  assert.equal(joinWarnings(unknown).length, 0)
+  assert.equal(unknown.find({ text: PRIVACY_NOTE }), null)
+  await unknown.unmount()
+
+  const groupsOff = await mountGroups(
+    { allowGroups: false },
+    { canJoinGroups: false, canReadAllGroupMessages: false }
+  )
+  assert.equal(joinWarnings(groupsOff).length, 0)
+  assert.equal(groupsOff.find({ text: PRIVACY_NOTE }), null)
+  await groupsOff.unmount()
 })

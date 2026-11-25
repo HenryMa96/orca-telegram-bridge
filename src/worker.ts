@@ -41,11 +41,14 @@ import {
   TelegramApiError,
   type TelegramBotCommand,
   type TelegramCallbackQuery,
+  type TelegramChat,
+  type TelegramChatMemberUpdated,
   type TelegramClient,
   type TelegramInlineKeyboardButton,
   type TelegramInlineKeyboardMarkup,
   type TelegramMessage,
-  type TelegramUpdate
+  type TelegramUpdate,
+  type TelegramUser
 } from './telegram-api'
 
 // Each bridge's token is the secret `botToken.<id>`; its runtime state lives under `tg.<id>.*`.
@@ -364,6 +367,7 @@ function clampTimeout(value: unknown): number {
 }
 
 // Reads one stored bridge, or a 0.4.0 settings object; a missing or wrong-typed field takes its default.
+// Groups default to on: 0.4.0 answered in groups, and so did bridges stored before group options.
 function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName: string): StoredBridge {
   const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
   return {
@@ -375,8 +379,14 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
     proxyUrl: text(raw.proxyUrl),
     replyTimeoutSec: clampTimeout(raw.replyTimeoutSec),
     syncOrcaOutbound: typeof raw.syncOrcaOutbound === 'boolean' ? raw.syncOrcaOutbound : false,
-    replyLanguage: normalizeLanguage(raw.replyLanguage)
+    replyLanguage: normalizeLanguage(raw.replyLanguage),
+    allowGroups: typeof raw.allowGroups === 'boolean' ? raw.allowGroups : true,
+    groupMode: raw.groupMode === 'all' ? 'all' : 'addressed'
   }
+}
+
+function isGroupChat(chat: TelegramChat): boolean {
+  return chat.type === 'group' || chat.type === 'supergroup'
 }
 
 type LogFn = (
@@ -465,7 +475,9 @@ function traceTelegram(client: TelegramClient, tracer: Tracer): TelegramClient {
         'downloadFile',
         () => client.downloadFile(token, filePath, options),
         (bytes) => `${bytes.length} bytes`
-      )
+      ),
+    leaveChat: (token, chatId, options) =>
+      trace(`leaveChat chat=${chatId}`, () => client.leaveChat(token, chatId, options))
   }
 }
 
@@ -522,6 +534,8 @@ export class BridgeRuntime {
   private botUsername: string | null = null
   private botUserId: number | null = null
   private botDisplayName: string | null = null
+  // What @BotFather allows this bot, from its last getMe.
+  private telegramCaps: BridgeView['telegramCaps'] = null
   private lastError: string | null = null
   private lastBlockedUserId: string | null = null
   private lastPollAt: number | null = null
@@ -544,6 +558,8 @@ export class BridgeRuntime {
   private readonly activeTelegramTgChats = new Set<string>()
   private readonly activeTelegramOrcaChats = new Set<string>()
   private readonly blockedLoggedAt = new Map<string, number>()
+  // Groups this run already left because groups are off; a message there does not leave again.
+  private readonly leftGroups = new Set<string>()
   private outboundSyncRunning = false
   private disposed = false
   private configOp: Promise<unknown> = Promise.resolve()
@@ -621,7 +637,8 @@ export class BridgeRuntime {
       lastBlockedUserId: this.lastBlockedUserId,
       lastPollAt: this.lastPollAt,
       config: { ...this.config },
-      bindings: [...this.bindings].sort((a, b) => b.updatedAt - a.updatedAt)
+      bindings: [...this.bindings].sort((a, b) => b.updatedAt - a.updatedAt),
+      telegramCaps: this.telegramCaps
     }
   }
 
@@ -686,7 +703,9 @@ export class BridgeRuntime {
       proxyUrl: input.proxyUrl.trim(),
       replyTimeoutSec: clampTimeout(input.replyTimeoutSec || 300),
       syncOrcaOutbound: Boolean(input.syncOrcaOutbound),
-      replyLanguage
+      replyLanguage,
+      allowGroups: input.allowGroups ?? prev.allowGroups,
+      groupMode: input.groupMode === undefined ? prev.groupMode : input.groupMode === 'all' ? 'all' : 'addressed'
     }
     await this.manager.saveBridges()
     if (prev.orcaBot !== this.config.orcaBot) {
@@ -718,6 +737,7 @@ export class BridgeRuntime {
       this.botUsername = null
       this.botUserId = null
       this.botDisplayName = null
+      this.telegramCaps = null
     } else if (!this.config.enabled) {
       this.status = 'stopped'
     } else if (!this.pollAbort) {
@@ -742,9 +762,7 @@ export class BridgeRuntime {
         proxyUrl: this.config.proxyUrl,
         timeoutMs: 12_000
       })
-      this.botUsername = me.username || null
-      this.botUserId = me.id
-      this.botDisplayName = me.first_name
+      this.rememberBot(me)
       this.lastError = null
       await this.ensureCommandsRegistered(token)
       if (this.status === 'error' || this.status === 'needs_token') {
@@ -859,15 +877,24 @@ export class BridgeRuntime {
       return this.acceptCallbackQuery(update.callback_query)
     }
 
+    if (update.my_chat_member) {
+      await this.handleMembership(update.my_chat_member)
+      return null
+    }
+
     const msg = update.message
     if (!msg) return null
+    const tgChatId = String(msg.chat.id)
+    const inGroup = isGroupChat(msg.chat)
+    if (inGroup && !this.config.allowGroups) {
+      if (!this.leftGroups.has(tgChatId)) await this.leaveGroup(msg.chat, 'debug')
+      return null
+    }
     const image = extractIncomingImage(msg)
     const unsupportedImage =
       !image && Boolean(msg.document?.mime_type?.toLowerCase().startsWith('image/'))
-    const tgChatId = String(msg.chat.id)
-    const text = msg.chat.type === 'group' || msg.chat.type === 'supergroup'
-      ? this.groupMessageText(msg, Boolean(image))
-      : (msg.text ?? msg.caption ?? '').trim()
+    const group = inGroup ? this.groupMessageText(msg, Boolean(image)) : null
+    const text = inGroup ? (group?.text ?? null) : (msg.text ?? msg.caption ?? '').trim()
     if (text === null) {
       await this.appendLog(
         'debug',
@@ -882,6 +909,16 @@ export class BridgeRuntime {
     const allowed = parseAllowedIds(this.config.allowedUserIds)
 
     if (!isAllowed(allowed, fromId, tgChatId)) {
+      // In 'all' mode a group's other members talk among themselves; only what they address to the
+      // bot earns them the access-denied answer.
+      if (group && !group.addressed) {
+        await this.appendLog(
+          'debug',
+          'bridge',
+          `Ignored message ${msg.message_id} in group ${tgChatId}: sender ${fromId} is not on the allowlist.`
+        )
+        return null
+      }
       const firstInWindow = await this.recordBlockedUser(
         fromId,
         tgChatId,
@@ -944,6 +981,11 @@ export class BridgeRuntime {
   ): Promise<{ done: Promise<void> } | null> {
     const fromId = String(cq.from.id)
     const tgChatId = cq.message ? String(cq.message.chat.id) : fromId
+    // A button on an old group message must not act while groups are off.
+    if (cq.message && isGroupChat(cq.message.chat) && !this.config.allowGroups) {
+      if (!this.leftGroups.has(tgChatId)) await this.leaveGroup(cq.message.chat, 'debug')
+      return null
+    }
     const allowed = parseAllowedIds(this.config.allowedUserIds)
     const token = await this.readToken()
 
@@ -1022,9 +1064,39 @@ export class BridgeRuntime {
     return true
   }
 
-  // In groups the bot answers only commands for it, mentions of @botUsername and replies to its
-  // own messages. Returns the text to process (mention removed), or null to ignore the message.
-  private groupMessageText(msg: TelegramMessage, hasImage: boolean): string | null {
+  // Telegram reports the bot's own membership changes. With groups off, the bot leaves any group it
+  // is added to.
+  private async handleMembership(change: TelegramChatMemberUpdated): Promise<void> {
+    const status = change.new_chat_member.status
+    if (this.config.allowGroups || !isGroupChat(change.chat)) return
+    if (status !== 'member' && status !== 'administrator') return
+    await this.leaveGroup(change.chat, 'info')
+  }
+
+  private async leaveGroup(chat: TelegramChat, level: 'info' | 'debug'): Promise<void> {
+    const tgChatId = String(chat.id)
+    this.leftGroups.add(tgChatId)
+    const token = await this.readToken()
+    if (!token) return
+    try {
+      await this.deps.telegram.leaveChat(token, chat.id, { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000 })
+      await this.appendLog(
+        level,
+        'bridge',
+        `Left group ${tgChatId}${chat.title ? ` (${chat.title})` : ''}: groups are off for this bridge`
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await this.appendLog('warn', 'telegram', `Leaving group ${tgChatId} failed: ${message}`, describeError(err, { tgChatId }))
+    }
+    if (level === 'info') this.emitState()
+  }
+
+  // In groups the bot answers commands for it, mentions of @botUsername and replies to its own
+  // messages. In 'all' mode it also reads every other line, but only while the allowlist is
+  // restricted: in an open bridge every stranger's line would start an Orca run. Returns the text to
+  // process (mention removed) and whether it was addressed to the bot, or null to ignore it.
+  private groupMessageText(msg: TelegramMessage, hasImage: boolean): { text: string; addressed: boolean } | null {
     const username = this.botUsername
     if (!username) return null
     const raw = (msg.text ?? msg.caption ?? '').trim()
@@ -1032,12 +1104,16 @@ export class BridgeRuntime {
       const rawCmd = raw.split(/\s+/)[0]
       const at = rawCmd.indexOf('@')
       // '/cmd@other_bot' is for another bot in the same group.
-      return at === -1 || rawCmd.slice(at + 1).toLowerCase() === username.toLowerCase() ? raw : null
+      return at === -1 || rawCmd.slice(at + 1).toLowerCase() === username.toLowerCase()
+        ? { text: raw, addressed: true }
+        : null
     }
     const { mentioned, text } = stripBotMention(msg, username)
     const replyToBot =
       this.botUserId !== null && msg.reply_to_message?.from?.id === this.botUserId
-    return mentioned || replyToBot ? text : null
+    if (mentioned || replyToBot) return { text, addressed: true }
+    const readsAll = this.config.groupMode === 'all' && parseAllowedIds(this.config.allowedUserIds).size > 0
+    return readsAll ? { text, addressed: false } : null
   }
 
   private async processAuthorizedMessage(
@@ -2043,10 +2119,12 @@ export class BridgeRuntime {
     // Open mode lets anyone /bind an Orca chat; syncing would push the owner's Orca messages to them.
     if (allowed.size === 0) return
 
-    // Sync only to chats whose Telegram user (or group) is still on the allowlist.
+    // Sync only to chats whose Telegram user (or group) is still on the allowlist, and to groups
+    // only while groups are on.
     const boundList = this.bindings.filter(
       (b) =>
         Boolean(b.orcaChatId) &&
+        (this.config.allowGroups || !b.tgChatId.startsWith('-')) &&
         (allowed.has(b.tgChatId) || (b.ownerUserId !== undefined && allowed.has(b.ownerUserId)))
     )
     if (boundList.length === 0) return
@@ -2312,14 +2390,13 @@ export class BridgeRuntime {
 
       try {
         if (!this.botUsername) {
-          const me = await this.deps.telegram.getMe(token, {
-            proxyUrl: this.config.proxyUrl,
-            timeoutMs: 12_000,
-            signal: abort.signal
-          })
-          this.botUsername = me.username || null
-          this.botUserId = me.id
-          this.botDisplayName = me.first_name
+          this.rememberBot(
+            await this.deps.telegram.getMe(token, {
+              proxyUrl: this.config.proxyUrl,
+              timeoutMs: 12_000,
+              signal: abort.signal
+            })
+          )
         }
 
         await this.ensureCommandsRegistered(token, abort.signal)
@@ -2427,8 +2504,19 @@ export class BridgeRuntime {
     this.botUsername = null
     this.botUserId = null
     this.botDisplayName = null
+    this.telegramCaps = null
     this.commandsRegistered = false
     await this.orca.storage.set(this.key('offset'), 0)
+  }
+
+  private rememberBot(me: TelegramUser): void {
+    this.botUsername = me.username || null
+    this.botUserId = me.id
+    this.botDisplayName = me.first_name
+    this.telegramCaps = {
+      canJoinGroups: me.can_join_groups === true,
+      canReadAllGroupMessages: me.can_read_all_group_messages === true
+    }
   }
 
   // The Orca bot this bridge talks to: the chosen one, or the first bot when none is chosen. A bot
@@ -2739,7 +2827,8 @@ export class BridgeManager {
     const names = new Set(this.runtimes.map((r) => r.name))
     let n = this.runtimes.length + 1
     while (names.has(`Bridge ${n}`)) n++
-    const runtime = new BridgeRuntime(this, readStoredBridge({ name }, id, `Bridge ${n}`))
+    // A new bridge stays out of groups until the owner allows them.
+    const runtime = new BridgeRuntime(this, readStoredBridge({ name, allowGroups: false }, id, `Bridge ${n}`))
     this.runtimes.push(runtime)
     await this.saveBridges()
     await runtime.init()

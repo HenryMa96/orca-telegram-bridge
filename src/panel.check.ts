@@ -21,7 +21,9 @@ export default defineCheck({
           proxyUrl: 'http://127.0.0.1:7890',
           replyTimeoutSec: 300,
           syncOrcaOutbound: true,
-          replyLanguage: 'pt-BR'
+          replyLanguage: 'pt-BR',
+          allowGroups: true,
+          groupMode: 'all'
         },
         {
           id: 'b2',
@@ -32,7 +34,9 @@ export default defineCheck({
           proxyUrl: '',
           replyTimeoutSec: 300,
           syncOrcaOutbound: false,
-          replyLanguage: 'en'
+          replyLanguage: 'en',
+          allowGroups: false,
+          groupMode: 'addressed'
         }
       ],
       'tg.b1.bindings': [

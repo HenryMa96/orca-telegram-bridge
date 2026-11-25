@@ -8,6 +8,9 @@ export type TelegramUser = {
   is_bot: boolean
   first_name: string
   username?: string
+  // Only in getMe: what @BotFather allows this bot (`/setjoingroups`, `/setprivacy`).
+  can_join_groups?: boolean
+  can_read_all_group_messages?: boolean
 }
 
 export type TelegramChat = {
@@ -77,10 +80,20 @@ export type TelegramCallbackQuery = {
   data?: string
 }
 
+// The bot's own membership changed in a chat (added to or removed from a group, promoted, ...).
+export type TelegramChatMemberUpdated = {
+  chat: TelegramChat
+  from: TelegramUser
+  date: number
+  old_chat_member: { status: string; user: TelegramUser }
+  new_chat_member: { status: string; user: TelegramUser }
+}
+
 export type TelegramUpdate = {
   update_id: number
   message?: TelegramMessage
   callback_query?: TelegramCallbackQuery
+  my_chat_member?: TelegramChatMemberUpdated
 }
 
 export type TelegramRequestOptions = {
@@ -178,6 +191,7 @@ export interface TelegramClient {
     filePath: string,
     options?: TelegramRequestOptions
   ): Promise<Buffer>
+  leaveChat(token: string, chatId: number | string, options?: TelegramRequestOptions): Promise<boolean>
 }
 
 export function resolveProxyUrl(explicitProxy?: string): string | undefined {
@@ -600,7 +614,7 @@ export function createTelegramClient(): TelegramClient {
         {
           offset: params.offset,
           timeout: timeoutSec,
-          allowed_updates: ['message', 'callback_query']
+          allowed_updates: ['message', 'callback_query', 'my_chat_member']
         },
         {
           ...options,
@@ -690,6 +704,9 @@ export function createTelegramClient(): TelegramClient {
     },
     downloadFile(token, filePath, options) {
       return withMethod('downloadFile', downloadTelegramFileBytes(token, filePath, options))
+    },
+    leaveChat(token, chatId, options) {
+      return callTelegramApi<boolean>(token, 'leaveChat', { chat_id: chatId }, options)
     }
   }
 }

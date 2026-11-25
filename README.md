@@ -166,7 +166,7 @@ Groups are off for a new bridge. Turn them on per bridge in the Setup tab → th
 
 A bridge updated from 0.4.0 or older starts with **Allow groups** on and **Only messages for the bot**, the behavior it had before.
 
-Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; the bridge's card warns when one of them blocks the option you chose:
+Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; after the bot has connected once, the bridge's editor warns under **Allow groups** when one of them blocks the option you chose:
 
 - **Allow Groups?** (`/setjoingroups`): must be enabled, or Telegram refuses to add the bot to a group.
 - **Privacy mode** (`/setprivacy`; [Telegram: privacy mode](https://core.telegram.org/bots/features#privacy-mode)): on by default. While it is on, the bot receives only commands addressed to it and replies to its own messages: `@yourbot` mentions and **All messages** do not work. Choose **Disable**, then remove the bot from the group and add it again; Telegram applies the change only then. A bot that is a group admin receives every message either way.

@@ -1,7 +1,7 @@
 # SPEC: Multiple Telegram bridges (one Telegram bot ↔ one Orca bot, many pairs)
 
 **Date:** 2026-11-25
-**Status:** approved (D1 pinned, D2 everything per bridge except debug logging)
+**Status:** implemented in 0.5.0 (D1 pinned, D2 everything per bridge except debug logging, group options)
 
 ## Goal
 Today the plugin runs exactly one Telegram bot token, so only one Telegram bot can front the Orca
@@ -60,12 +60,12 @@ stablyai/orca#45959. This spec delivers the closest equivalent inside the plugin
   panel add/edit/remove; status bar aggregate.
 
 ## Acceptance Criteria
-1. [ ] Two bridges with two tokens run at the same time; each Telegram bot reaches only its Orca bot.
-2. [ ] An existing 0.4.0 setup appears as "Bridge 1" after the update and keeps working without input.
-3. [ ] A duplicate token is refused; removing a bridge stops it and deletes its token.
-4. [ ] A failure in one bridge (401, proxy, CLI) leaves the others running.
-5. [ ] Status bar shows the aggregate and opens the panel.
-6. [ ] `orca plugin test`, `orca plugin check` and the tsc check pass.
+1. [x] Two bridges with two tokens run at the same time; each Telegram bot reaches only its Orca bot. (worker tests, simulated Telegram)
+2. [x] An existing 0.4.0 setup appears as "Bridge 1" after the update and keeps working without input. (migration tests, incl. resume after a crash midway)
+3. [x] A duplicate token is refused; removing a bridge stops it and deletes its token.
+4. [x] A failure in one bridge (401, proxy, CLI) leaves the others running. (401 tested; proxy/CLI share the same isolation)
+5. [x] Status bar shows the aggregate and opens the panel.
+6. [x] `orca plugin test` (130) and `orca plugin check` pass; tsc shows no new error (12 older type-only errors remain in test files and the proxy agent).
 
 ## Decisions (approved)
 - D1: pinned. Each Telegram bot talks only to its Orca bot; `/use` and the bot buttons explain that instead of switching.

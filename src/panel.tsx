@@ -15,6 +15,7 @@ import {
   List,
   ListItem,
   plugin,
+  RadioGroup,
   read,
   RelativeTime,
   Row,
@@ -35,6 +36,7 @@ import type {
   BridgeLogEntry,
   BridgeState,
   BridgeView,
+  GroupMode,
   SaveConfigInput
 } from './protocol'
 import type { ReplyLanguage } from './i18n'
@@ -63,6 +65,8 @@ const proxyUrlDraft = atom('')
 const timeoutDraft = atom('300')
 const syncOrcaOutboundDraft = atom(false)
 const replyLanguageDraft = atom<ReplyLanguage>('en')
+const allowGroupsDraft = atom(false)
+const groupModeDraft = atom<GroupMode>('addressed')
 const busy = atom(false)
 const feedback = atom<{ tone: 'success' | 'danger' | 'accent'; text: string } | null>(null)
 // The bridge the drafts were filled from.
@@ -85,6 +89,10 @@ const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguage; label: string }> = [
   { value: 'en', label: 'English' },
   { value: 'pt-BR', label: 'Português (Brasil)' },
   { value: 'zh-CN', label: '中文' }
+]
+const GROUP_MODE_OPTIONS: Array<{ value: GroupMode; label: string }> = [
+  { value: 'addressed', label: 'Only messages for the bot' },
+  { value: 'all', label: 'All messages' }
 ]
 const EXPORT_UNAVAILABLE = 'Export needs the Orca desktop app'
 
@@ -119,6 +127,8 @@ function hydrateForm(state: BridgeState, force = false): void {
   set(timeoutDraft, String(bridge.config.replyTimeoutSec))
   set(syncOrcaOutboundDraft, bridge.config.syncOrcaOutbound)
   set(replyLanguageDraft, bridge.config.replyLanguage)
+  set(allowGroupsDraft, bridge.config.allowGroups)
+  set(groupModeDraft, bridge.config.groupMode)
   set(hydratedFor, id)
   set(formDirty, false)
 }
@@ -215,6 +225,8 @@ async function saveConfig(bridge: BridgeView): Promise<void> {
       replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
       syncOrcaOutbound: read(syncOrcaOutboundDraft),
       replyLanguage: read(replyLanguageDraft),
+      allowGroups: read(allowGroupsDraft),
+      groupMode: read(groupModeDraft),
       ...(cleanToken ? { botToken: cleanToken } : {})
     }
     const next = await plugin.request('bridge.saveConfig', payload)
@@ -433,6 +445,13 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean, confirming: boolean) {
             Save a bot token first.
           </Text>
         )}
+        <Text muted size="xs">
+          {!bridge.config.allowGroups
+            ? 'Groups: off'
+            : bridge.config.groupMode === 'addressed'
+              ? 'Groups: messages for the bot'
+              : `Groups: all messages${openToEveryone ? ' (open: messages for the bot)' : ''}`}
+        </Text>
         {bridge.lastError && (
           <Callout tone="danger" title="Connection Error" icon="error">
             <Text size="xs">{clip(bridge.lastError)}</Text>
@@ -596,6 +615,37 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean) {
         {openToEveryone && bridge.config.syncOrcaOutbound && (
           <Text muted size="xs">
             Sync is paused while the bot is open to everyone. Add Telegram IDs to use it.
+          </Text>
+        )}
+        <Switch
+          label="Allow groups"
+          checked={read(allowGroupsDraft)}
+          onChange={(v) => edit(allowGroupsDraft, v)}
+        />
+        {read(allowGroupsDraft) && (
+          <RadioGroup
+            label="In groups, read"
+            value={read(groupModeDraft)}
+            options={GROUP_MODE_OPTIONS}
+            onChange={(v) => edit(groupModeDraft, v as GroupMode)}
+          />
+        )}
+        {bridge.config.allowGroups && bridge.config.groupMode === 'all' && openToEveryone && (
+          <Text muted size="xs">
+            All messages works only with Allowed Telegram IDs. While the bot is open to everyone it
+            reads only messages for it.
+          </Text>
+        )}
+        {bridge.config.allowGroups && bridge.telegramCaps?.canJoinGroups === false && (
+          <Callout
+            tone="warning"
+            icon="warning"
+            title="Telegram does not let this bot join groups. In @BotFather: /setjoingroups -> Enable."
+          />
+        )}
+        {bridge.config.allowGroups && bridge.telegramCaps?.canReadAllGroupMessages === false && (
+          <Text muted size="xs">
+            {'Privacy mode is on: in groups the bot receives only commands and replies to its messages; @mentions and All messages need /setprivacy -> Disable in @BotFather, then add the bot to the group again.'}
           </Text>
         )}
         <Row gap="xs" wrap>

@@ -134,6 +134,26 @@ test('sendMessage does not block on a long flood wait', { timeout: 5000 }, async
   assert.equal(calls, 1)
 })
 
+test('getUpdates asks for membership changes and leaveChat posts the chat id', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: true, result: req.path.endsWith('/getUpdates') ? [] : true }))
+    },
+    async (proxyUrl) => {
+      await client.getUpdates(TOKEN, { offset: 3, timeoutSec: 0 }, { proxyUrl })
+      assert.equal(await client.leaveChat(TOKEN, -100500, { proxyUrl }), true)
+    }
+  )
+  const [poll, leave] = requests
+  const pollBody = JSON.parse(poll.body) as Record<string, unknown>
+  assert.deepEqual(pollBody.allowed_updates, ['message', 'callback_query', 'my_chat_member'])
+  assert.match(leave.path, /\/bot123456:TEST_TOKEN\/leaveChat$/)
+  assert.deepEqual(JSON.parse(leave.body), { chat_id: -100500 })
+})
+
 test('an https:// proxy URL fails with a clear message', async () => {
   await assert.rejects(
     client.getMe(TOKEN, { proxyUrl: 'https://127.0.0.1:1', timeoutMs: 1000 }),

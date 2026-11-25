@@ -43,6 +43,9 @@ export type BotSummary = {
   agent: string
 }
 
+// In a group: only messages for the bot (commands for it, replies to it, @mentions), or every message.
+export type GroupMode = 'addressed' | 'all'
+
 // One bridge: one Telegram bot token and the one Orca bot it talks to. Everything here is per bridge.
 export type BridgeConfig = {
   id: string
@@ -56,6 +59,10 @@ export type BridgeConfig = {
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
   replyLanguage: ReplyLanguage
+  // Off: group messages are ignored and the bot leaves any group it is added to.
+  allowGroups: boolean
+  // 'all' takes effect only with a restricted allowedUserIds; while open it acts as 'addressed'.
+  groupMode: GroupMode
 }
 
 export type BridgeView = {
@@ -70,6 +77,8 @@ export type BridgeView = {
   lastPollAt: number | null
   config: BridgeConfig
   bindings: ChatBinding[]
+  // What @BotFather allows for this bot, from getMe; null until the bot has connected once.
+  telegramCaps: { canJoinGroups: boolean; canReadAllGroupMessages: boolean } | null
 }
 
 export type GlobalConfig = {
@@ -100,6 +109,9 @@ export type SaveConfigInput = {
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
   replyLanguage?: ReplyLanguage
+  // Absent keeps the current value.
+  allowGroups?: boolean
+  groupMode?: GroupMode
 }
 
 export type TestConnectionResult = {

@@ -47,6 +47,7 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
   const renamedChats: { sessionId: string; name: string }[] = []
   const triggeredAutomations: string[] = []
   const openedPanels: { pluginKey: string; panelId: string }[] = []
+  const leftChats: (number | string)[] = []
 
   let chats: OrcaChatSummary[] = [
     {
@@ -125,6 +126,10 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     },
     async downloadFile() {
       return Buffer.from('fake-image-bytes')
+    },
+    async leaveChat(_token, chatId) {
+      leftChats.push(chatId)
+      return true
     },
     ...overrides.telegram
   }
@@ -222,7 +227,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     sentToBots,
     renamedChats,
     triggeredAutomations,
-    openedPanels
+    openedPanels,
+    leftChats
   }
 }
 
@@ -2287,7 +2293,10 @@ test('a 0.4.0 setup becomes "Bridge 1" with its token, settings, chats and offse
       proxyUrl: '',
       replyTimeoutSec: 240,
       syncOrcaOutbound: true,
-      replyLanguage: 'pt-BR'
+      replyLanguage: 'pt-BR',
+      // 0.4.0 answered in groups; the update keeps that.
+      allowGroups: true,
+      groupMode: 'addressed'
     })
     assert.equal(view.lastBlockedUserId, '999')
     assert.deepEqual(view.bindings, [legacyBinding])
@@ -2498,6 +2507,9 @@ test('adding a bridge creates one switched off, without a token, named by its pl
     assert.equal(bridge?.status, 'needs_token')
     assert.equal(bridge?.config.enabled, false)
     assert.equal(bridge?.config.hasToken, false)
+    // A new bridge stays out of groups until the owner allows them.
+    assert.equal(bridge?.config.allowGroups, false)
+    assert.equal(bridge?.config.groupMode, 'addressed')
 
     const named = (await worker.request('bridge.add', { name: 'Dev bot' })) as { bridgeId: string; state: BridgeState }
     assert.deepEqual(
@@ -2674,4 +2686,158 @@ test('the open-panel command uses the dev copy key when Orca lists two copies, e
       }
     }
   )
+})
+
+// One bridge with these config fields; testConnection runs getMe, so the bot knows its @username.
+async function withGroupBridge(
+  config: Record<string, JsonValue>,
+  run: (controller: BridgeRuntime, deps: ReturnType<typeof makeMockDeps>, manager: BridgeManager) => Promise<void>
+): Promise<void> {
+  const host = bridgesHost([{ id: 'b-group001', token: '123456:TEST_TOKEN', config }])
+  const deps = makeMockDeps()
+  const { manager, controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1,
+    logFlushMs: 0
+  })
+  try {
+    await controller.testConnection()
+    await run(controller, deps, manager)
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await worker.deactivate()
+  }
+}
+
+// Telegram's update when someone adds the bot to the group.
+function botJoinedGroup(updateId: number): TelegramUpdate {
+  return {
+    update_id: updateId,
+    my_chat_member: {
+      chat: { id: GROUP_ID, type: 'supergroup', title: 'Team' },
+      from: { id: 555, is_bot: false, first_name: 'Member' },
+      date: 1000,
+      old_chat_member: { status: 'left', user: BOT_USER },
+      new_chat_member: { status: 'member', user: BOT_USER }
+    }
+  }
+}
+
+test('with groups off a group message gets no answer and the bot leaves that group once', async () => {
+  await withGroupBridge({ allowGroups: false, allowedUserIds: `777888, ${GROUP_ID}` }, async (controller, deps) => {
+    await controller.handleIncomingUpdate(groupUpdate(1, 777888, '@demo_orca_bot status?'))
+    await controller.handleIncomingUpdate(groupUpdate(2, 777888, '/help'))
+    await controller.handleIncomingUpdate(groupUpdate(3, 555, 'hello'))
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.length, 0)
+    assert.deepEqual(deps.leftChats, [GROUP_ID])
+    assert.deepEqual(controller.view().bindings, [])
+  })
+})
+
+test('with groups off the bot leaves a group it is added to, every time; with groups on it stays', async () => {
+  await withGroupBridge({ allowGroups: false }, async (controller, deps, manager) => {
+    await controller.handleIncomingUpdate(botJoinedGroup(1))
+    assert.deepEqual(deps.leftChats, [GROUP_ID])
+    const entry = manager.getState().logs.find((e) => e.message.startsWith('Left group'))
+    assert.equal(entry?.message, `Left group ${GROUP_ID} (Team): groups are off for this bridge`)
+    assert.equal(entry?.level, 'info')
+    assert.equal(entry?.bridgeId, 'b-group001')
+    // Added again later: the bot leaves again.
+    await controller.handleIncomingUpdate(botJoinedGroup(2))
+    assert.deepEqual(deps.leftChats, [GROUP_ID, GROUP_ID])
+  })
+  await withGroupBridge({ allowGroups: true }, async (controller, deps) => {
+    await controller.handleIncomingUpdate(botJoinedGroup(1))
+    assert.deepEqual(deps.leftChats, [])
+  })
+})
+
+test("'addressed' answers mentions in an allowed group and ignores the rest of the talk", async () => {
+  await withGroupBridge(
+    { allowGroups: true, groupMode: 'addressed', allowedUserIds: `777888, ${GROUP_ID}` },
+    async (controller, deps) => {
+      await controller.handleIncomingUpdate(groupUpdate(1, 777888, 'lunch at noon?'))
+      assert.equal(deps.sentToBots.length, 0)
+      await controller.handleIncomingUpdate(groupUpdate(2, 777888, '@demo_orca_bot what is due today?'))
+      assert.equal(deps.sentToBots.length, 1)
+      assert.equal(lastBodyLine(deps), 'what is due today?')
+      assert.deepEqual(deps.leftChats, [])
+    }
+  )
+})
+
+test("'all' with a restricted allowlist sends every line of an allowed member, and only theirs", async () => {
+  await withGroupBridge({ allowGroups: true, groupMode: 'all', allowedUserIds: '777888' }, async (controller, deps) => {
+    await controller.handleIncomingUpdate(groupUpdate(1, 777888, 'the deploy failed again'))
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(lastBodyLine(deps), 'the deploy failed again')
+
+    // Another member chatting in the group is neither sent on nor told off.
+    await controller.handleIncomingUpdate(groupUpdate(2, 555, 'I will look at it'))
+    assert.equal(deps.sentToBots.length, 1)
+    assert.ok(!deps.sentMessages.some((m) => m.text === t('en').unauthorized('555')))
+    assert.equal(controller.view().lastBlockedUserId, null)
+
+    // Commands still work.
+    const before = deps.sentMessages.length
+    await controller.handleIncomingUpdate(groupUpdate(3, 777888, '/status'))
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(deps.sentMessages.length, before + 1)
+  })
+})
+
+test("'all' with an open allowlist acts as 'addressed': a plain group line starts no Orca run", async () => {
+  await withGroupBridge({ allowGroups: true, groupMode: 'all', allowedUserIds: '' }, async (controller, deps) => {
+    await controller.handleIncomingUpdate(groupUpdate(1, 555, 'anyone up for lunch?'))
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.length, 0)
+    await controller.handleIncomingUpdate(groupUpdate(2, 555, '@demo_orca_bot hello'))
+    assert.equal(deps.sentToBots.length, 1)
+  })
+})
+
+test('Telegram caps come from getMe, are null before it, and reset with a new token', async () => {
+  const host = bridgesHost([{ id: 'b-caps0001', token: '123456:TEST_TOKEN' }])
+  const deps = makeMockDeps({
+    telegram: {
+      async getMe() {
+        return { ...BOT_USER, can_join_groups: true, can_read_all_group_messages: false }
+      }
+    }
+  })
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    assert.equal(controller.view().telegramCaps, null)
+    await controller.testConnection()
+    assert.deepEqual(controller.view().telegramCaps, { canJoinGroups: true, canReadAllGroupMessages: false })
+    const state = (await worker.request('bridge.getState')) as BridgeState
+    assert.deepEqual(state.bridges[0].telegramCaps, { canJoinGroups: true, canReadAllGroupMessages: false })
+
+    await manager.saveConfig(saveInput(controller, { botToken: '654321:OTHER_TOKEN' }))
+    assert.equal(controller.view().telegramCaps, null)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a bridge stored without group options keeps groups on, and a save without them keeps them', async () => {
+  // Stored by a 0.5.0 build from before group options: no allowGroups or groupMode.
+  const host = bridgesHost([{ id: 'b-older001', token: '123456:TEST_TOKEN' }])
+  const deps = makeMockDeps()
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    assert.equal(controller.view().config.allowGroups, true)
+    assert.equal(controller.view().config.groupMode, 'addressed')
+
+    await manager.saveConfig(saveInput(controller, { groupMode: 'all' }))
+    await manager.saveConfig(saveInput(controller, { allowedUserIds: '777888, 42' }))
+    assert.equal(controller.view().config.allowGroups, true)
+    assert.equal(controller.view().config.groupMode, 'all')
+    const stored = (host.data().storage.bridges as { allowGroups: boolean; groupMode: string }[])[0]
+    assert.deepEqual([stored.allowGroups, stored.groupMode], [true, 'all'])
+  } finally {
+    await worker.deactivate()
+  }
 })
