@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { setImmediate as nextTurn, setTimeout as pause } from 'node:timers/promises'
-import { assert, hostError, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
+import { assert, hostError, mockHost, mountWorker, test, type MockHost, type TestWorker } from 'orca/testing'
 import type { JsonValue } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { t } from './i18n'
@@ -17,7 +17,7 @@ import {
   type OrcaCliRunner,
   type OrcaSessionRead
 } from './orca-bridge'
-import type { BridgeLogEntry, BridgeState, ExportLogsResult, SaveConfigInput } from './protocol'
+import type { AuditEntry, BridgeLogEntry, BridgeState, ExportLogsResult, SaveConfigInput } from './protocol'
 import { defaultRoles, type BridgeRole } from './roles'
 import { extractTablesFromMarkdown } from './table-render'
 import {
@@ -2752,6 +2752,7 @@ test('a 0.4.0 setup becomes "Bridge 1" with its token, settings, chats and offse
       roles: defaultRoles(),
       roleAssignments: { '777888': 'full' },
       rolesReviewed: false,
+      groupAuditNotice: false,
       proxyUrl: '',
       replyTimeoutSec: 240,
       syncOrcaOutbound: true,
@@ -4714,4 +4715,339 @@ test('/help and /status show the bound chat id only with bind and the sync state
     const fullStatus = deps.sentMessages.at(-1)?.text ?? ''
     assert.ok(fullStatus.includes('Bound chat ID') && fullStatus.includes('Two-way sync (Orca -> TG): off'), fullStatus)
   })
+})
+
+// A bridge stored after roles existed, whose audit entries are written at once; `now` is the
+// audit clock and `storage` seeds the host (e.g. stored audit entries).
+async function withAudit(
+  config: Record<string, JsonValue>,
+  run: (ctx: {
+    controller: BridgeRuntime
+    deps: ReturnType<typeof makeMockDeps>
+    manager: BridgeManager
+    host: MockHost
+    worker: TestWorker
+  }) => Promise<void>,
+  options: {
+    now?: () => number
+    storage?: Record<string, JsonValue>
+    setup?: (deps: ReturnType<typeof makeMockDeps>) => void
+  } = {}
+): Promise<void> {
+  const host = bridgesHost(
+    [{ id: 'b-audit001', token: '123456:TEST_TOKEN', config: { roles: asJson(defaultRoles()), ...config } }],
+    { storage: options.storage }
+  )
+  const deps = makeMockDeps()
+  options.setup?.(deps)
+  const { manager, controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1,
+    logFlushMs: 0,
+    ...(options.now ? { now: options.now } : {})
+  })
+  try {
+    await controller.testConnection()
+    await run({ controller, deps, manager, host, worker })
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+}
+
+function storedAudit(host: MockHost): AuditEntry[] {
+  return (host.data().storage['tg.audit'] ?? []) as AuditEntry[]
+}
+
+function seededAudit(i: number, at: number, fields: Partial<AuditEntry> = {}): AuditEntry {
+  return {
+    id: `s${i}`,
+    at,
+    bridgeId: 'b-audit001',
+    source: 'telegram',
+    userId: '42',
+    userLabel: '@joao',
+    chatId: '42',
+    roleName: 'Full access',
+    action: 'run',
+    target: 'Daily backup',
+    result: 'done',
+    ...fields
+  }
+}
+
+test('the audit records done commands and buttons with role and target, and never the title or message text', async () => {
+  await withAudit({ allowedUserIds: '42', roleAssignments: { '42': 'full' } }, async ({ controller, host }) => {
+    const steps: TelegramUpdate[] = [
+      textUpdate(1, 42, '/run auto-1'),
+      textUpdate(2, 42, '/sync on'),
+      textUpdate(3, 42, '/new'),
+      textUpdate(4, 42, '/home'),
+      textUpdate(5, 42, '/bind home-chat-1'),
+      textUpdate(6, 42, '/rename Secret plans'),
+      textUpdate(7, 42, 'my private words'),
+      buttonUpdate(8, 42, 42, 'r:auto-1'),
+      buttonUpdate(9, 42, 42, 's:off'),
+      buttonUpdate(10, 42, 42, 'c:new'),
+      buttonUpdate(11, 42, 42, 'c:home'),
+      buttonUpdate(12, 42, 42, 'b:home-chat-1')
+    ]
+    for (const update of steps) await within(controller.handleIncomingUpdate(update), `update ${update.update_id}`)
+
+    const entries = [...storedAudit(host)].reverse()
+    assert.deepEqual(
+      entries.map((e) => [e.action, e.target ?? '', e.result]),
+      [
+        ['run', 'Daily backup', 'done'],
+        ['sync', 'on', 'done'],
+        ['new', '', 'done'],
+        ['home', 'home-chat-1', 'done'],
+        ['bind', 'home-chat-1', 'done'],
+        ['rename', '', 'done'],
+        ['run', 'Daily backup', 'done'],
+        ['sync', 'off', 'done'],
+        ['new', '', 'done'],
+        ['home', 'home-chat-1', 'done'],
+        ['bind', 'home-chat-1', 'done']
+      ]
+    )
+    for (const e of entries) {
+      assert.deepEqual([e.bridgeId, e.source, e.userId, e.userLabel, e.chatId, e.roleName], ['b-audit001', 'telegram', '42', 'User (42)', '42', 'Full access'])
+    }
+    const stored = JSON.stringify(storedAudit(host))
+    assert.ok(!stored.includes('Secret plans') && !stored.includes('my private words'), stored)
+  })
+})
+
+test('a role refusal is recorded as refused with the command, the button kind, or chat for a message', async () => {
+  const muted: BridgeRole = { id: 'muted', name: 'Muted', permissions: [], prompt: '', runAutomationIds: null }
+  await withAudit(
+    { allowedUserIds: '42, 43', roles: asJson([...defaultRoles(), muted]), roleAssignments: { '42': 'member', '43': 'muted' } },
+    async ({ controller, host }) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 42, '/run auto-1')), '/run')
+      await within(controller.handleIncomingUpdate(buttonUpdate(2, 42, 42, 's:on')), 's:on')
+      await within(controller.handleIncomingUpdate(textUpdate(3, 43, 'my private words')), 'message')
+      assert.deepEqual(
+        [...storedAudit(host)].reverse().map((e) => [e.action, e.target, e.result, e.roleName, e.userId]),
+        [
+          ['refused', '/run', 'refused', 'Member', '42'],
+          ['refused', 's:', 'refused', 'Member', '42'],
+          ['refused', 'chat', 'refused', 'Muted', '43']
+        ]
+      )
+      assert.ok(!JSON.stringify(storedAudit(host)).includes('my private words'))
+    }
+  )
+})
+
+test('Try again and Details taps are recorded as done', async () => {
+  await withAudit(
+    { allowedUserIds: '42', roleAssignments: { '42': 'full' } },
+    async ({ controller, deps, host }) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 42, 'first try')), 'failed message')
+      const buttons = buttonsOf(deps.sentMessages.at(-1))
+      const details = buttons.find((b) => b.callback_data?.startsWith('d:'))?.callback_data ?? ''
+      const retry = buttons.find((b) => b.callback_data?.startsWith('x:'))?.callback_data ?? ''
+      assert.ok(details && retry, JSON.stringify(buttons))
+      await within(controller.handleIncomingUpdate(buttonUpdate(2, 42, 42, details)), 'details tap')
+      await within(controller.handleIncomingUpdate(buttonUpdate(3, 42, 42, retry)), 'retry tap')
+      assert.deepEqual(
+        [...storedAudit(host)].reverse().map((e) => [e.action, e.result]),
+        [
+          ['details', 'done'],
+          ['retry', 'done']
+        ]
+      )
+    },
+    { setup: (deps) => failFirstSend(deps) }
+  )
+})
+
+test('panel saves record access, roles and token changes without the token; Allow and bridges too; a no-op save nothing', async () => {
+  await withAudit({ allowedUserIds: '42', roleAssignments: { '42': 'member' } }, async ({ controller, manager, host }) => {
+    await manager.saveConfig(saveInput(controller, {}))
+    assert.equal(manager.listAudit({}).total, 0)
+
+    await manager.saveConfig(saveInput(controller, { allowedUserIds: '42, 43' }))
+    await manager.saveConfig(saveInput(controller, { allowedUserIds: '' }))
+    await manager.saveConfig(saveInput(controller, { roleAssignments: { '42': 'full' } }))
+    await manager.saveConfig(
+      saveInput(controller, { roles: defaultRoles().map((r) => (r.id === 'member' ? { ...r, name: 'Helper' } : r)) })
+    )
+    await manager.saveConfig(saveInput(controller, { botToken: '654321:NEW_SECRET_TOKEN' }))
+    await manager.saveConfig(saveInput(controller, { clearToken: true }))
+    // Turning the group notice on is a setting, not an audited change.
+    await manager.saveConfig(saveInput(controller, { groupAuditNotice: true }))
+    assert.equal(controller.view().config.groupAuditNotice, true)
+    assert.equal((host.data().storage.bridges as { groupAuditNotice: boolean }[])[0].groupAuditNotice, true)
+    await controller.allowUserId('77')
+
+    const added = await manager.addBridge('Second')
+    await manager.removeBridge(added)
+
+    assert.deepEqual(
+      [...storedAudit(host)].reverse().map((e) => [e.action, e.target, e.source, e.bridgeId]),
+      [
+        ['access', 'added 43', 'panel', 'b-audit001'],
+        ['access', 'open; removed 42, 43', 'panel', 'b-audit001'],
+        ['roles', 'assignments', 'panel', 'b-audit001'],
+        ['roles', 'name: Helper', 'panel', 'b-audit001'],
+        ['token', 'changed', 'panel', 'b-audit001'],
+        ['token', 'cleared', 'panel', 'b-audit001'],
+        ['allow', '77', 'panel', 'b-audit001'],
+        ['bridgeAdded', 'Second', 'panel', added],
+        ['bridgeRemoved', 'Second', 'panel', added]
+      ]
+    )
+    // The removed bridge's entries stay.
+    assert.equal(manager.listAudit({ bridgeId: added }).total, 2)
+    assert.ok(!JSON.stringify(storedAudit(host)).includes('NEW_SECRET_TOKEN'))
+    assert.ok(storedAudit(host).every((e) => e.userId === undefined && e.result === 'done'))
+  })
+})
+
+test('a roles save names each changed role and what changed, never the prompt text', async () => {
+  await withAudit({ allowedUserIds: '42', roleAssignments: { '42': 'member' } }, async ({ controller, manager, host }) => {
+    const roles = () => controller.view().config.roles
+    const prompt = 'Always answer about project Falcon in pirate speak'
+    await manager.saveConfig(saveInput(controller, { roles: roles().map((r) => (r.id === 'member' ? { ...r, prompt } : r)) }))
+    assert.deepEqual(storedAudit(host).map((e) => [e.action, e.target]), [['roles', 'prompt: Member']])
+    assert.ok(!JSON.stringify(storedAudit(host)).includes('Falcon'))
+
+    await manager.saveConfig(
+      saveInput(controller, {
+        roles: roles().map((r) =>
+          r.id === 'member' ? { ...r, permissions: [...r.permissions, 'run' as const], runAutomationIds: ['auto-1'] } : r
+        )
+      })
+    )
+    const qa: BridgeRole = { id: 'qa', name: 'QA', permissions: ['chat'], prompt: '', runAutomationIds: null }
+    await manager.saveConfig(saveInput(controller, { roles: [...roles(), qa] }))
+    await manager.saveConfig(saveInput(controller, { roles: roles().filter((r) => r.id !== 'qa') }))
+    assert.deepEqual(
+      [...storedAudit(host)].reverse().map((e) => [e.action, e.target]),
+      [
+        ['roles', 'prompt: Member'],
+        ['roles', 'permissions: Member'],
+        ['roles', 'added: QA'],
+        ['roles', 'removed: QA']
+      ]
+    )
+  })
+})
+
+test('the audit keeps 90 days and at most 2000 entries, newest first', async () => {
+  const start = Date.UTC(2026, 10, 1)
+  let clock = start
+  const day = 24 * 60 * 60 * 1000
+  const seeded = [
+    ...Array.from({ length: 2100 }, (_, i) => seededAudit(i, start - i * 1000)),
+    seededAudit(9999, start - 91 * day, { target: 'too old' })
+  ]
+  await withAudit(
+    { allowedUserIds: '42' },
+    async ({ controller, manager, host }) => {
+      const loaded = manager.listAudit({})
+      assert.equal(loaded.total, 2000)
+      assert.equal(loaded.entries.length, 500)
+
+      clock = start + 1000
+      await controller.allowUserId('77')
+      const stored = storedAudit(host)
+      assert.equal(stored.length, 2000)
+      assert.deepEqual([stored[0].action, stored[0].at], ['allow', start + 1000])
+      assert.equal(stored.at(-1)?.id, 's1998')
+      assert.ok(!stored.some((e) => e.target === 'too old'))
+
+      clock = start + 91 * day
+      assert.equal(manager.listAudit({}).total, 0)
+      await controller.allowUserId('78')
+      assert.deepEqual(storedAudit(host).map((e) => e.target), ['78'])
+    },
+    { now: () => clock, storage: { 'tg.audit': asJson(seeded) } }
+  )
+})
+
+test('the group notice goes only to groups, only when on, only for done shared-state actions, in the chat language', async () => {
+  await withAudit(
+    {
+      allowedUserIds: `${GROUP_ID}, 42`,
+      roleAssignments: { [String(GROUP_ID)]: 'member', '42': 'full' },
+      replyLanguage: 'es'
+    },
+    async ({ controller, deps, manager }) => {
+      const notice = t('es').groupNotice
+      const member = 'Member (42)'
+      const notices = () => deps.sentMessages.filter((m) => /^(Member|User) \(\d+\) /.test(m.text))
+
+      await within(controller.handleIncomingUpdate(groupUpdate(1, 42, '/new')), 'group /new while off')
+      assert.equal(notices().length, 0)
+
+      await manager.saveConfig(saveInput(controller, { groupAuditNotice: true }))
+      await within(controller.handleIncomingUpdate(groupUpdate(2, 42, '/new')), 'group /new')
+      await within(controller.handleIncomingUpdate(groupUpdate(3, 42, '/sync off')), 'group /sync off')
+      await within(controller.handleIncomingUpdate(groupUpdate(4, 42, '/run auto-1')), 'group /run')
+      await within(controller.handleIncomingUpdate(buttonUpdate(5, 42, GROUP_ID, 'c:home')), 'group c:home')
+      await within(controller.handleIncomingUpdate(groupUpdate(6, 42, '/rename Team plans')), 'group /rename')
+      assert.deepEqual(notices().map((m) => [m.chatId, m.text]), [
+        [GROUP_ID, notice.new(member)],
+        [GROUP_ID, notice.sync(member, false)],
+        [GROUP_ID, notice.run(member, 'Daily backup')],
+        [GROUP_ID, notice.home('User (42)')],
+        [GROUP_ID, notice.rename(member)]
+      ])
+      assert.ok(!notices().some((m) => m.text.includes('Team plans')))
+
+      // No notice in a private chat, for a refusal, or for what changes nothing shared.
+      await within(controller.handleIncomingUpdate(textUpdate(7, 42, '/new')), 'private /new')
+      await within(controller.handleIncomingUpdate(groupUpdate(8, 555, '/sync on')), 'refused group /sync')
+      assert.equal(deps.sentMessages.at(-1)?.text, t('es').notAllowedForRole)
+      await within(controller.handleIncomingUpdate(groupUpdate(9, 555, '/status')), 'group /status')
+      assert.equal(notices().length, 5)
+    }
+  )
+})
+
+test('listAudit filters by bridge, action and result, newest first, at most 500 with the total; exportAudit is quoted CSV', async () => {
+  const now = Date.UTC(2026, 10, 1)
+  const seeded = Array.from({ length: 600 }, (_, i) =>
+    seededAudit(i, now - (600 - i) * 1000, {
+      bridgeId: i % 2 === 0 ? 'b-audit001' : 'b-gone0001',
+      ...(i % 3 === 0 ? { action: 'refused', target: '/run', result: 'refused' } : {})
+    })
+  )
+  seeded.push(seededAudit(600, now - 100, { bridgeId: 'b-quote001', target: 'say "hi", ok' }))
+  await withAudit(
+    { allowedUserIds: '42' },
+    async ({ manager, worker }) => {
+      const all = await worker.request('bridge.listAudit', {})
+      assert.equal(all.total, 601)
+      assert.equal(all.entries.length, 500)
+      assert.equal(all.entries[0].id, 's600')
+      assert.ok(all.entries.every((e, i) => i === 0 || all.entries[i - 1].at >= e.at))
+
+      const one = manager.listAudit({ bridgeId: 'b-audit001' })
+      assert.equal(one.total, 300)
+      assert.ok(one.entries.every((e) => e.bridgeId === 'b-audit001'))
+      assert.equal(manager.listAudit({ result: 'refused' }).total, 200)
+      assert.equal(manager.listAudit({ action: 'run' }).total, 401)
+      const both = await worker.request('bridge.listAudit', { bridgeId: 'b-gone0001', result: 'refused' })
+      assert.equal(both.total, 100)
+
+      const csv = await worker.request('bridge.exportAudit', { bridgeId: 'b-quote001' })
+      assert.match(csv.fileName, /^telegram-bridge-audit-\d{8}-\d{6}\.csv$/)
+      const lines = csv.text.trimEnd().split('\n')
+      assert.equal(lines[0], '"time","bridge","source","user id","user","chat","role","action","target","result"')
+      assert.equal(
+        lines[1],
+        `"${new Date(now - 100).toISOString()}","b-quote001","telegram","42","@joao","42","Full access","run","say ""hi"", ok","done"`
+      )
+      assert.equal(lines.length, 2)
+      const named = await worker.request('bridge.exportAudit', { bridgeId: 'b-audit001' })
+      assert.ok(named.text.split('\n')[1].includes('"Bridge 1"'), named.text.slice(0, 300))
+    },
+    { now: () => now, storage: { 'tg.audit': asJson(seeded) } }
+  )
 })

@@ -8,6 +8,8 @@ import {
 } from 'orca/testing'
 import * as panel from './panel'
 import type {
+  AuditEntry,
+  AuditQuery,
   BridgeConfig,
   BridgeState,
   BridgeView,
@@ -82,6 +84,7 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
       allowGroups: false,
       groupMode: 'addressed',
       groupReply: 'mentioned',
+      groupAuditNotice: false,
       voiceEnabled: false,
       voiceProvider: 'openrouter',
       voiceModel: '',
@@ -538,6 +541,7 @@ test('Save sends the edited bridge id and never the on/off state or a name; it p
       allowGroups: false,
       groupMode: 'addressed',
       groupReply: 'mentioned',
+      groupAuditNotice: false,
       voiceEnabled: false,
       voiceProvider: 'openrouter',
       voiceModel: ''
@@ -1756,6 +1760,171 @@ test('each bridge card says who can talk and with which role', async () => {
   const open = makeState({ bridges: [makeBridge('b1', { config: { allowedUserIds: '' } })] })
   view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => open } }) })
   assert.ok(view.find({ text: 'Anyone on Telegram (Stranger)' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+function auditEntry(id: string, patch: Partial<AuditEntry> = {}): AuditEntry {
+  return {
+    id,
+    at: Date.now(),
+    bridgeId: 'ci',
+    source: 'telegram',
+    userId: '111',
+    userLabel: '@joao',
+    chatId: '-100123',
+    roleName: 'Member',
+    action: 'run',
+    target: 'Daily backup',
+    result: 'done',
+    ...patch
+  }
+}
+
+function auditHost(queries: AuditQuery[], entries: AuditEntry[], focus: FocusedBot, options: MockHostOptions = {}) {
+  return panelHost(
+    {
+      ...options,
+      requests: {
+        'bridge.getState': () => makeState({ bridges: twoBridges() }),
+        'bridge.listAudit': (input: AuditQuery) => {
+          queries.push(input)
+          return { entries, total: entries.length === 0 ? 0 : 7 }
+        },
+        ...options.requests
+      }
+    },
+    focus
+  )
+}
+
+test("the Audit tab asks for the selected bot's bridge with its filters and marks refusals", async () => {
+  const queries: AuditQuery[] = []
+  const entries = [auditEntry('a2', { action: 'refused', target: '/run', result: 'refused' }), auditEntry('a1')]
+  const view = await mount(panel, { host: auditHost(queries, entries, botFocus('CIWatcher')) })
+  // nothing is asked until the tab opens
+  assert.equal(queries.length, 0)
+
+  await view.select(TABS, 'audit')
+  assert.equal(queries.length, 1)
+  assert.deepEqual(queries[0], { bridgeId: 'ci' })
+  assert.ok(view.find({ text: 'Showing 2 of 7' }))
+  const done = view.find({ label: '@joao · Ran automation Daily backup' })
+  assert.ok(done)
+  assert.match(String(done!.props.description), / · Member · chat -100123$/)
+  assert.ok(view.find({ label: '@joao · Refused /run' }))
+  const badges = view.findAll({ type: 'Badge' })
+  assert.equal(badges.length, 1)
+  assert.equal(badges[0].text, 'Refused')
+  assert.equal(badges[0].props.tone, 'danger')
+
+  await view.select({ label: 'Action' }, 'run')
+  assert.deepEqual(queries[queries.length - 1], { bridgeId: 'ci', action: 'run' })
+  await view.select({ label: 'Result' }, 'refused')
+  assert.deepEqual(queries[queries.length - 1], { bridgeId: 'ci', action: 'run', result: 'refused' })
+
+  // Refresh asks again with the same filters
+  const before = queries.length
+  await view.press({ text: 'Refresh' })
+  assert.ok(queries.length > before)
+  assert.deepEqual(queries[queries.length - 1], { bridgeId: 'ci', action: 'run', result: 'refused' })
+
+  // another bot: its own bridge (the one stored with '' follows the first Orca bot)
+  await selectInSidebar(view, botFocus('Assistant'))
+  assert.deepEqual(queries[queries.length - 1], { bridgeId: 'dev', action: 'run', result: 'refused' })
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('the Audit tab says when nothing is recorded, and asks nothing for a bot without a bridge', async () => {
+  const queries: AuditQuery[] = []
+  const view = await mount(panel, { host: auditHost(queries, [], botFocus('CIWatcher')) })
+  await view.select(TABS, 'audit')
+  assert.equal(queries.length, 1)
+  assert.ok(view.find({ text: 'Nothing recorded yet.' }))
+  assert.equal(view.find({ type: 'List', label: 'Audit entries' }), null)
+
+  await selectInSidebar(view, botFocus('DevHelper'))
+  assert.equal(queries.length, 1)
+  assert.ok(view.find({ text: 'Nothing recorded yet.' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('when Orca cannot say which bot is selected the Audit tab asks for every bridge', async () => {
+  const queries: AuditQuery[] = []
+  const removed: AuditEntry = { id: 'a2', at: Date.now(), bridgeId: 'gone', source: 'panel', action: 'bridgeRemoved', result: 'done' }
+  const entries = [auditEntry('a1'), removed]
+  const view = await mount(panel, {
+    host: auditHost(queries, entries, { kind: 'unknown', reason: 'This Orca does not name the focused workspace.' })
+  })
+  await view.select(TABS, 'audit')
+  assert.equal(queries.length, 1)
+  assert.equal(Object.keys(queries[0]).length, 0)
+  // with every bridge shown, each entry names its bridge
+  assert.match(String(view.find({ label: '@joao · Ran automation Daily backup' })!.props.description), / · @ci_bot$/)
+  assert.match(String(view.find({ label: 'Orca panel · Removed bridge' })!.props.description), / · removed bridge$/)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Export saves the worker CSV for the shown bridge and filters', async () => {
+  const queries: AuditQuery[] = []
+  const exportQueries: AuditQuery[] = []
+  const exported = { fileName: 'telegram-bridge-audit-2026-11-25.csv', text: '"time","bridge"\n"2026-11-25T10:00:00.000Z","ci"' }
+  const host = auditHost(queries, [auditEntry('a1')], botFocus('CIWatcher'), {
+    results: { 'files.saveAs': { status: 'saved' } },
+    requests: {
+      'bridge.exportAudit': (input: AuditQuery) => {
+        exportQueries.push(input)
+        return exported
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select(TABS, 'audit')
+  await view.select({ label: 'Result' }, 'done')
+  await view.press({ text: 'Export' })
+  assert.equal(exportQueries.length, 1)
+  assert.deepEqual(exportQueries[0], { bridgeId: 'ci', result: 'done' })
+  assert.deepEqual(
+    host.calls.filter((c) => c.method === 'files.saveAs').map((c) => c.params),
+    [{ suggestedName: exported.fileName, mimeType: 'text/csv', data: exported.text }]
+  )
+  assert.ok(view.find({ text: 'Audit exported.' }))
+  assert.deepEqual(view.refusals, [])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+const AUDIT_NOTICE = { label: 'Post a line in the group when someone changes its shared chat, sync or runs an automation' }
+
+test('the Groups switch for audit lines starts from the saved value and is saved as groupAuditNotice', async () => {
+  const saved: SaveConfigInput[] = []
+  const state = makeState()
+  const host = panelHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': (input: SaveConfigInput) => {
+        saved.push(input)
+        return state
+      }
+    }
+  })
+  let view = await mount(panel, { host })
+  await openEditor(view, 'b1')
+  assert.equal(view.find(AUDIT_NOTICE)!.props.checked, false)
+  await view.toggle(AUDIT_NOTICE)
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].groupAuditNotice, true)
+  await view.unmount()
+
+  const on = makeState({ bridges: [makeBridge('b1', { config: { groupAuditNotice: true } })] })
+  view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => on } }) })
+  await openEditor(view, 'b1')
+  assert.equal(view.find(AUDIT_NOTICE)!.props.checked, true)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

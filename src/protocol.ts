@@ -71,6 +71,9 @@ export type BridgeConfig = {
   roleAssignments: Record<string, string>
   // False after an update gave everyone already allowed Full access, until the owner saves roles.
   rolesReviewed: boolean
+  // Off by default: when on, a group gets one line when someone changes its shared state
+  // ("@joao started a new chat").
+  groupAuditNotice: boolean
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
@@ -132,6 +135,8 @@ export type SaveConfigInput = {
   // Absent keeps the saved roles and assignments; saving either marks the roles as reviewed.
   roles?: BridgeRole[]
   roleAssignments?: Record<string, string>
+  // Absent keeps the current value.
+  groupAuditNotice?: boolean
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
@@ -161,6 +166,52 @@ export type ExportLogsResult = {
   text: string
 }
 
+// What the audit trail records. Telegram side: commands and buttons that change or run something,
+// failure buttons, and every refusal by role. Panel side: access, roles and token changes.
+export type AuditAction =
+  | 'run'
+  | 'sync'
+  | 'new'
+  | 'home'
+  | 'bind'
+  | 'rename'
+  | 'retry'
+  | 'details'
+  | 'refused'
+  | 'access'
+  | 'roles'
+  | 'token'
+  | 'allow'
+  | 'bridgeAdded'
+  | 'bridgeRemoved'
+
+// One audit entry: who did what, where, with which role, and whether it was done. Never message
+// text, tokens or keys. Kept 90 days, at most 2000 entries across bridges, also after a bridge is
+// removed.
+export type AuditEntry = {
+  id: string
+  at: number
+  bridgeId: string
+  // 'telegram': a person on Telegram; 'panel': the owner in Orca's panel.
+  source: 'telegram' | 'panel'
+  // Telegram user id and label ("@joao" or "Ann (123)"); absent for the panel.
+  userId?: string
+  userLabel?: string
+  chatId?: string
+  roleName?: string
+  action: AuditAction
+  // What it acted on: the automation name, the command, "on"/"off", or the changed field names.
+  target?: string
+  result: 'done' | 'refused'
+}
+
+export type AuditQuery = {
+  // Absent: every bridge.
+  bridgeId?: string
+  action?: AuditAction
+  result?: 'done' | 'refused'
+}
+
 // The Orca bot selected in Orca's sidebar. `none`: Orca answered and the focus is not a bot (no
 // workspace, a worktree, a folder without bot.json). `unknown`: the worker could not find out.
 export type FocusedBot =
@@ -188,6 +239,10 @@ declare module 'orca' {
     'bridge.focusedBot': { output: FocusedBot }
     // Orca's automations, for a role's "may run only these" list.
     'bridge.listAutomations': { output: { id: string; name: string }[] }
+    // Newest first, at most 500 per answer.
+    'bridge.listAudit': { input: AuditQuery; output: { entries: AuditEntry[]; total: number } }
+    // CSV of the matching entries, for files.saveAs.
+    'bridge.exportAudit': { input: AuditQuery; output: ExportLogsResult }
   }
   interface PluginPanelEvents {
     'bridge.stateChanged': BridgeState

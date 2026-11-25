@@ -71,7 +71,8 @@ export default defineCheck({
           voiceEnabled: true,
           voiceProvider: 'openai',
           voiceModel: '',
-          groupMode: 'all'
+          groupMode: 'all',
+          groupAuditNotice: false
         },
         {
           id: 'b2',
@@ -90,7 +91,8 @@ export default defineCheck({
           voiceEnabled: false,
           voiceProvider: 'openrouter',
           voiceModel: '',
-          groupMode: 'addressed'
+          groupMode: 'addressed',
+          groupAuditNotice: false
         }
       ],
       'tg.b1.bindings': [

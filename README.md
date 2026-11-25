@@ -275,6 +275,16 @@ Each command needs its permission in the sender's [role](#roles); `/help` always
 | `/run <id>` | Run an Orca automation now | `/run` (all, or only the role's chosen automations) |
 | `/status` | Show the Telegram bot, Orca bot, chat, sync and polling status | `/status` |
 
+## Audit trail
+
+The **Audit** tab (next to Logs) answers "who did what, and when": it follows the selected bot like Chats and Logs.
+
+- **From Telegram**: `/run` and Run buttons (with the automation's name), `/sync`, `/new`, `/home`, `/bind`, `/chats` bindings and `/rename`, the [Try again] and [Details] buttons, and every command, button or message a role refused. Each entry has the time, the person (Telegram ID and @username), the chat, their role and the result (done or refused).
+- **From the panel**: changes to who can talk, roles and assignments, the bot token (only that it changed, never its value), **Allow**, and bridges added or removed.
+- **Never recorded**: message text, chat titles, tokens, keys or role prompts.
+- Filter by action and result, and **Export** a CSV file. Entries are kept 90 days, at most 2,000 across bridges, and stay after a bridge is removed.
+- **Group notice** (Edit → Groups, off by default): a group gets one line when someone changes its shared chat or sync, or runs an automation, for example "@joao started a new chat".
+
 ## Debugging
 
 - The **Logs** tab lists the newest 40 of up to 200 stored entries. Filter by level (all, errors, warnings and errors, debug only). Entries with details expand to show the error context: Orca CLI args, exit code and stderr; Telegram method, HTTP status and description; chat ids, timings and the top of the stack.

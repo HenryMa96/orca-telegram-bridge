@@ -37,6 +37,9 @@ import {
   type PanelContext
 } from 'orca'
 import type {
+  AuditAction,
+  AuditEntry,
+  AuditQuery,
   BridgeConfig,
   BridgeConnectionStatus,
   BridgeLogEntry,
@@ -70,13 +73,28 @@ const ALL_BRIDGES = 'all'
 const PLUGIN_LOGS = '__plugin__'
 
 const bridgeState = atom<BridgeState | null>(null)
-const activeTab = atom<'setup' | 'bindings' | 'logs'>('setup', 'setup', { persist: 'plugin' })
+type PanelTab = 'setup' | 'bindings' | 'logs' | 'audit'
+const activeTab = atom<PanelTab>('setup', 'setup', { persist: 'plugin' })
 const logFilter = atom<LogFilter>('logFilter', 'all', { persist: 'plugin' })
 const logBridgeFilter = atom<string>('logBridgeFilter', ALL_BRIDGES, { persist: 'plugin' })
 // The bot selected in Orca's sidebar, as the worker found it; null until its first answer.
 const focus = atom<FocusedBot | null>(null)
 // Rises with each focus request; an answer to an older request is dropped.
 let focusRequest = 0
+
+type AuditActionFilter = AuditAction | 'all'
+type AuditResultFilter = 'all' | 'done' | 'refused'
+const auditActionFilter = atom<AuditActionFilter>('auditActionFilter', 'all', { persist: 'plugin' })
+const auditResultFilter = atom<AuditResultFilter>('auditResultFilter', 'all', { persist: 'plugin' })
+// The audit lives in the worker; the tab asks for it when opened, on Refresh and on filter changes.
+type AuditLoad =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; entries: AuditEntry[]; total: number }
+  | { status: 'failed'; reason: string }
+const audit = atom<AuditLoad>({ status: 'idle' })
+// Rises with each audit request; an answer to an older request (other bot or filters) is dropped.
+let auditRequest = 0
 
 // The bridge whose editor is open; one at a time.
 const editingBridgeId = atom<string | null>(null)
@@ -116,6 +134,7 @@ const replyLanguageDraft = atom<ReplyLanguageSetting>('en')
 const allowGroupsDraft = atom(false)
 const groupModeDraft = atom<GroupMode>('addressed')
 const groupReplyDraft = atom<GroupReply>('mentioned')
+const groupAuditNoticeDraft = atom(false)
 const voiceEnabledDraft = atom(false)
 const voiceProviderDraft = atom<VoiceProvider>('openrouter')
 const voiceModelDraft = atom('')
@@ -140,6 +159,32 @@ const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
   { value: 'errors', label: 'Errors' },
   { value: 'warnings', label: 'Warnings and errors' },
   { value: 'debug', label: 'Debug only' }
+]
+const AUDIT_ACTION_LABEL: Record<AuditAction, string> = {
+  run: 'Ran automation',
+  sync: 'Changed sync',
+  new: 'Started a new chat',
+  home: 'Bound Home Chat',
+  bind: 'Bound a chat',
+  rename: 'Renamed chat',
+  retry: 'Tried again',
+  details: 'Opened details',
+  refused: 'Refused',
+  access: 'Changed who can talk',
+  roles: 'Changed roles',
+  token: 'Changed token',
+  allow: 'Allowed a person',
+  bridgeAdded: 'Added bridge',
+  bridgeRemoved: 'Removed bridge'
+}
+const AUDIT_ACTION_OPTIONS: Array<{ value: AuditActionFilter; label: string }> = [
+  { value: 'all', label: 'All actions' },
+  ...(Object.keys(AUDIT_ACTION_LABEL) as AuditAction[]).map((value) => ({ value, label: AUDIT_ACTION_LABEL[value] }))
+]
+const AUDIT_RESULT_OPTIONS: Array<{ value: AuditResultFilter; label: string }> = [
+  { value: 'all', label: 'All' },
+  { value: 'done', label: 'Done' },
+  { value: 'refused', label: 'Refused' }
 ]
 const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguageSetting; label: string }> = [
   { value: 'auto', label: 'Auto (language of each message)' },
@@ -344,6 +389,7 @@ function hydrateForm(state: BridgeState, force = false): void {
   set(allowGroupsDraft, bridge.config.allowGroups)
   set(groupModeDraft, bridge.config.groupMode)
   set(groupReplyDraft, bridge.config.groupReply)
+  set(groupAuditNoticeDraft, bridge.config.groupAuditNotice)
   set(voiceEnabledDraft, bridge.config.voiceEnabled)
   set(voiceProviderDraft, bridge.config.voiceProvider)
   set(voiceModelDraft, bridge.config.voiceModel)
@@ -431,6 +477,8 @@ async function refreshFocus(): Promise<void> {
     if (read(bridgeState)) set(feedback, null)
   }
   set(focus, next)
+  // The audit shown belongs to the bot that was shown.
+  if (before && focusKey(before) !== focusKey(next)) reloadAuditIfShown()
 }
 
 // `orcaBot` pins the new bridge to the bot it was added for.
@@ -506,6 +554,7 @@ async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
       allowGroups: read(allowGroupsDraft),
       groupMode: read(groupModeDraft),
       groupReply: read(groupReplyDraft),
+      groupAuditNotice: read(groupAuditNoticeDraft),
       voiceEnabled: read(voiceEnabledDraft),
       voiceProvider: read(voiceProviderDraft),
       voiceModel: read(voiceModelDraft).trim(),
@@ -632,6 +681,58 @@ async function exportLogs(): Promise<void> {
   }
 }
 
+// The audit follows the shown bot like Chats and Logs: its bridge, or every bridge when Orca did
+// not say which bot is selected. null: nothing to ask (no bot shown, or the bot has no bridge).
+function auditQuery(): AuditQuery | null {
+  const state = read(bridgeState)
+  const focused = read(focus)
+  if (!state || !focused || focused.kind === 'none') return null
+  let scope: AuditQuery = {}
+  if (focused.kind === 'bot') {
+    const bridge = bridgeOfBot(state, focused.bot.name)
+    if (!bridge) return null
+    scope = { bridgeId: bridge.id }
+  }
+  const action = read(auditActionFilter)
+  const result = read(auditResultFilter)
+  return { ...scope, ...(action !== 'all' ? { action } : {}), ...(result !== 'all' ? { result } : {}) }
+}
+
+async function loadAudit(): Promise<void> {
+  const request = ++auditRequest
+  const query = auditQuery()
+  if (!query) {
+    set(audit, { status: 'ready', entries: [], total: 0 })
+    return
+  }
+  set(audit, { status: 'loading' })
+  try {
+    const res = await plugin.request('bridge.listAudit', query)
+    if (request !== auditRequest) return
+    set(audit, { status: 'ready', entries: res.entries, total: res.total })
+  } catch (err) {
+    if (request !== auditRequest) return
+    set(audit, { status: 'failed', reason: errorText(err) })
+  }
+}
+
+function reloadAuditIfShown(): void {
+  if (read(activeTab) === 'audit') void loadAudit()
+}
+
+// Same gesture rule as exportLogs: only the worker's answer is awaited before the save dialog.
+async function exportAudit(): Promise<void> {
+  const query = auditQuery()
+  if (!query) return
+  try {
+    const { fileName, text } = await plugin.request('bridge.exportAudit', query)
+    const res = await files.saveAs({ suggestedName: fileName, mimeType: 'text/csv', data: text })
+    if (res.status === 'saved') set(feedback, { tone: 'success', text: 'Audit exported.' })
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
+  }
+}
+
 function matchesFilter(entry: BridgeLogEntry, filter: LogFilter): boolean {
   switch (filter) {
     case 'errors':
@@ -702,8 +803,8 @@ export function setup(ctx: PanelContext): void {
     }),
     on('workspace.changed', () => void refreshFocus())
   )
-  void refresh()
-  void refreshFocus()
+  // The audit needs both the bridges and the focus to know which bridge to ask for.
+  void Promise.all([refresh(), refreshFocus()]).then(reloadAuditIfShown)
 }
 
 function hasAllowedIds(raw: string): boolean {
@@ -1223,6 +1324,11 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
               </Stack>
             </Callout>
           )}
+          <Switch
+            label="Post a line in the group when someone changes its shared chat, sync or runs an automation"
+            checked={read(groupAuditNoticeDraft)}
+            onChange={(v) => edit(groupAuditNoticeDraft, v)}
+          />
         </Stack>
 
         <Stack gap="sm">
@@ -1407,8 +1513,7 @@ function bridgeCards(bridges: BridgeView[], botNameOf: (bridge: BridgeView) => s
 }
 
 function refreshAll(): void {
-  void refresh()
-  void refreshFocus()
+  void Promise.all([refresh(), refreshFocus()]).then(reloadAuditIfShown)
 }
 
 function panelHeader(lines: string[], isBusy: boolean) {
@@ -1607,6 +1712,106 @@ function logsTab(state: BridgeState, scoped: BridgeLogEntry[] | null) {
   )
 }
 
+function auditWho(entry: AuditEntry): string {
+  if (entry.userLabel) return entry.userLabel
+  if (entry.source === 'panel') return 'Orca panel'
+  return entry.userId ?? 'Someone'
+}
+
+// "<time> · <role> · <chat>", skipping what the entry lacks; with every bridge shown, the bridge too.
+function auditMeta(entry: AuditEntry, bridgeNames: Map<string, string> | null): string {
+  const parts = [formatTime(entry.at)]
+  if (entry.roleName) parts.push(entry.roleName)
+  if (entry.chatId) parts.push(`chat ${entry.chatId}`)
+  if (bridgeNames) parts.push(bridgeNames.get(entry.bridgeId) ?? 'removed bridge')
+  return clip(parts.join(' · '))
+}
+
+function setAuditFilter<T>(filter: Atom<T>, value: T): void {
+  set(filter, value)
+  void loadAudit()
+}
+
+// `allBridges`: Orca did not say which bot is selected, so the audit covers every bridge.
+function auditTab(state: BridgeState, allBridges: boolean) {
+  const load = read(audit)
+  const action = read(auditActionFilter)
+  const result = read(auditResultFilter)
+  const filtered = action !== 'all' || result !== 'all'
+  const bridgeNames = allBridges ? new Map(state.bridges.map((b) => [b.id, bridgeLabel(b, b.name)])) : null
+
+  let body
+  if (load.status === 'failed') {
+    body = (
+      <Callout tone="danger" title="Could not load the audit">
+        <Text size="xs">{clip(load.reason)}</Text>
+      </Callout>
+    )
+  } else if (load.status !== 'ready') {
+    body = (
+      <Row gap="sm" align="center">
+        <Spinner label="Loading the audit" />
+        <Text muted>Loading the audit...</Text>
+      </Row>
+    )
+  } else if (load.entries.length === 0) {
+    body = filtered ? (
+      <EmptyState icon="filter" title="No entries match these filters" description="Pick another action or result." />
+    ) : (
+      <EmptyState icon="info" title="Nothing recorded yet." />
+    )
+  } else {
+    body = (
+      <Stack gap="xs">
+        <Text muted size="xs">
+          {`Showing ${load.entries.length} of ${load.total}`}
+        </Text>
+        <List label="Audit entries">
+          {load.entries.map((entry) => (
+            <ListItem
+              key={entry.id}
+              icon={entry.source === 'panel' ? 'settings' : 'bot'}
+              title={clip(`${auditWho(entry)} · ${AUDIT_ACTION_LABEL[entry.action]}${entry.target ? ` ${entry.target}` : ''}`)}
+              description={auditMeta(entry, bridgeNames)}
+            >
+              {entry.result === 'refused' && <Badge tone="danger">Refused</Badge>}
+            </ListItem>
+          ))}
+        </List>
+      </Stack>
+    )
+  }
+
+  return (
+    <Tab value="audit" label="Audit">
+      <Stack gap="xs">
+        <Row gap="sm" align="end" justify="between" wrap>
+          <Row gap="sm" align="end" wrap>
+            <Select
+              label="Action"
+              value={action}
+              options={AUDIT_ACTION_OPTIONS}
+              onChange={(v) => setAuditFilter(auditActionFilter, v as AuditActionFilter)}
+            />
+            <Select
+              label="Result"
+              value={result}
+              options={AUDIT_RESULT_OPTIONS}
+              onChange={(v) => setAuditFilter(auditResultFilter, v as AuditResultFilter)}
+            />
+          </Row>
+          {host.has('files.saveAs') && (
+            <Button size="xs" variant="outline" icon="download" onPress={exportAudit}>
+              Export
+            </Button>
+          )}
+        </Row>
+        {body}
+      </Stack>
+    </Tab>
+  )
+}
+
 const SELECT_BOT_HINT = 'Select a bot in the left sidebar to see its Telegram bridge.'
 const ALL_BRIDGES_NOTE = 'Showing all bridges: Orca did not say which bot is selected.'
 
@@ -1635,7 +1840,10 @@ export default function Panel() {
   }
 
   const noticeCallout = notice && <Callout tone={notice.tone} title={clip(notice.text)} />
-  const selectTab = (v: string) => set(activeTab, v as 'setup' | 'bindings' | 'logs')
+  const selectTab = (v: string) => {
+    set(activeTab, v as PanelTab)
+    if (v === 'audit') void loadAudit()
+  }
 
   if (focused.kind === 'none') {
     const orphans = state.bridges.filter((b) => isOrphan(b, state))
@@ -1686,6 +1894,7 @@ export default function Panel() {
           </Tab>
           {chatsTab(state.bridges, true)}
           {logsTab(state, null)}
+          {auditTab(state, true)}
         </Tabs>
       </Stack>
     )
@@ -1726,6 +1935,7 @@ export default function Panel() {
         </Tab>
         {chatsTab(bridges, false)}
         {logsTab(state, bridge ? state.logs.filter((entry) => entry.bridgeId === bridge.id) : [])}
+        {auditTab(state, false)}
       </Tabs>
     </Stack>
   )

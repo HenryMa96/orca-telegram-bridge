@@ -40,6 +40,9 @@ import {
   type OutboundAttachment
 } from './outbound-media'
 import type {
+  AuditAction,
+  AuditEntry,
+  AuditQuery,
   BotSummary,
   BridgeConfig,
   BridgeConnectionStatus,
@@ -101,6 +104,8 @@ import {
 // state lives under `tg.<id>.*`.
 const STORAGE_BRIDGES = 'bridges'
 const STORAGE_LOGS = 'tg.logs'
+// One key for every bridge, not per bridge, so a removed bridge's entries stay.
+const STORAGE_AUDIT = 'tg.audit'
 // commandScopes: the user/group ids that got a command menu of their own, so a removed id's menu is deleted.
 const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages', 'commandScopes'] as const
 // What 0.4.0 and earlier stored for their single bridge; moved into "Bridge 1" on the first start.
@@ -117,6 +122,9 @@ const PANEL_ID = 'telegram-bridge'
 // Stored ring of log entries; the state posted to the panel carries only the newest STATE_LOGS.
 const MAX_LOGS = 200
 const STATE_LOGS = 40
+const AUDIT_KEEP_MS = 90 * 24 * 60 * 60 * 1000
+const MAX_AUDIT = 2000
+const AUDIT_PAGE = 500
 const MAX_DETAIL_CHARS = 500
 const MAX_LOG_DETAILS_CHARS = 3000
 const MAX_STDERR_DETAIL_CHARS = 1500
@@ -179,6 +187,8 @@ export type BridgeDeps = {
   workingLineAfterMs?: number
   workingLineEveryMs?: number
   failedAnswerTtlMs?: number
+  // The clock for audit entries and their 90-day pruning (tests).
+  now?: () => number
 }
 
 type IncomingTelegramImage = {
@@ -288,7 +298,7 @@ function stripBotMention(
   return { mentioned: starts.length > 0, text: text.trim() }
 }
 
-function formatSenderLabel(msg: TelegramMessage): string {
+function formatSenderLabel(msg: Pick<TelegramMessage, 'from' | 'chat'>): string {
   const from = msg.from
   if (!from) return `chat:${msg.chat.id}`
   if (from.username) return `@${from.username}`
@@ -423,6 +433,46 @@ function changedConfigFields(prev: BridgeConfig, next: BridgeConfig): string[] {
   )
 }
 
+// "restricted; added 42, 43; removed 7": the access mode when it changed, then the ids. Telegram ids
+// are not secrets. Null when the save left access as it was.
+function accessChange(prevIds: string, nextIds: string): string | null {
+  const before = parseAllowedIds(prevIds)
+  const after = parseAllowedIds(nextIds)
+  const added = [...after].filter((id) => !before.has(id))
+  const removed = [...before].filter((id) => !after.has(id))
+  const parts: string[] = []
+  if ((before.size === 0) !== (after.size === 0)) parts.push(after.size === 0 ? 'open' : 'restricted')
+  if (added.length > 0) parts.push(`added ${added.join(', ')}`)
+  if (removed.length > 0) parts.push(`removed ${removed.join(', ')}`)
+  return parts.length > 0 ? parts.join('; ') : null
+}
+
+// What a save changed in the roles, by role name ("prompt: Member", "permissions: Ops", "added: QA",
+// "removed: QA", "name: Helper"), then "assignments" when who has which role changed. Never the
+// prompt text. Null when the save left roles as they were.
+function roleChanges(prev: BridgeConfig, next: BridgeConfig): string | null {
+  const before = new Map(prev.roles.map((role) => [role.id, role]))
+  const after = new Set(next.roles.map((role) => role.id))
+  const parts: string[] = []
+  for (const role of next.roles) {
+    const old = before.get(role.id)
+    if (!old) {
+      parts.push(`added: ${role.name}`)
+      continue
+    }
+    if (old.name !== role.name) parts.push(`name: ${role.name}`)
+    if (old.prompt !== role.prompt) parts.push(`prompt: ${role.name}`)
+    // The automation list is part of what the role may do.
+    const may = (r: BridgeRole) => JSON.stringify([r.permissions, r.runAutomationIds])
+    if (may(old) !== may(role)) parts.push(`permissions: ${role.name}`)
+  }
+  for (const role of prev.roles) if (!after.has(role.id)) parts.push(`removed: ${role.name}`)
+  // Compared without key order, which a save may not keep.
+  const assignments = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort())
+  if (assignments(prev.roleAssignments) !== assignments(next.roleAssignments)) parts.push('assignments')
+  return parts.length > 0 ? parts.join(', ') : null
+}
+
 function maskProxyCredentials(proxyUrl: string): string {
   return proxyUrl.replace(/\/\/[^/@]*@/, '//<redacted>@')
 }
@@ -511,6 +561,7 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
       ? Object.fromEntries([...parseAllowedIds(allowedUserIds)].map((userId) => [userId, FULL_ROLE_ID]))
       : normalizeRoleAssignments(raw.roleAssignments, roles),
     rolesReviewed: beforeRoles ? false : typeof raw.rolesReviewed === 'boolean' ? raw.rolesReviewed : true,
+    groupAuditNotice: typeof raw.groupAuditNotice === 'boolean' ? raw.groupAuditNotice : false,
     proxyUrl: text(raw.proxyUrl),
     replyTimeoutSec: clampTimeout(raw.replyTimeoutSec),
     syncOrcaOutbound: typeof raw.syncOrcaOutbound === 'boolean' ? raw.syncOrcaOutbound : false,
@@ -924,6 +975,7 @@ export class BridgeRuntime {
       // Assignments to a role that no longer exists are dropped.
       roleAssignments: normalizeRoleAssignments(input.roleAssignments ?? prev.roleAssignments, roles),
       rolesReviewed: input.roles !== undefined || input.roleAssignments !== undefined ? true : prev.rolesReviewed,
+      groupAuditNotice: input.groupAuditNotice ?? prev.groupAuditNotice,
       proxyUrl: input.proxyUrl.trim(),
       replyTimeoutSec: clampTimeout(input.replyTimeoutSec || 300),
       syncOrcaOutbound: Boolean(input.syncOrcaOutbound),
@@ -939,6 +991,7 @@ export class BridgeRuntime {
       hasVoiceKey: Boolean(this.cachedVoiceKey)
     }
     await this.manager.saveBridges()
+    await this.auditPanelSave(prev, prevToken)
     if (prev.orcaBot !== this.config.orcaBot) {
       this.pinnedBotId = null
     }
@@ -1064,6 +1117,7 @@ export class BridgeRuntime {
       await this.orca.storage.set(this.key('lastBlocked'), null)
     }
     await this.appendLog('info', 'config', `Added Telegram user ${clean} to allowlist.`)
+    await this.auditPanel('allow', clean)
     this.emitState()
   }
 
@@ -1281,6 +1335,7 @@ export class BridgeRuntime {
         'bridge',
         `Refused button ${callbackDataKind(data)} from ${fromId} in chat ${tgChatId}: role "${role.name}" does not allow it.`
       )
+      await this.auditTelegram(cq.from, cq.message.chat, 'refused', 'refused', callbackDataKind(data))
       await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.notAllowedForRole, true)
       return null
     }
@@ -1329,15 +1384,18 @@ export class BridgeRuntime {
     if (!retry) {
       if (isGroupChat(chat)) {
         await this.appendLog('info', 'bridge', `Refused button d: from ${fromId} in group ${tgChatId}: details are for private chats only.`)
+        await this.auditTelegram(cq.from, chat, 'refused', 'refused', 'd:')
         await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.notAllowedForRole, true)
         return null
       }
       await this.safeAnswerCallbackQuery(token, cq.id)
       await this.safeSendTelegram(token, chat.id, failure.detail, failure.msg.message_id)
+      await this.auditTelegram(cq.from, chat, 'details', 'done')
       return null
     }
     if (failure.senderId !== fromId) {
       await this.appendLog('info', 'bridge', `Refused button x: from ${fromId} in chat ${tgChatId}: only the sender may retry.`)
+      await this.auditTelegram(cq.from, chat, 'refused', 'refused', 'x:')
       await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.retryOnlySender, true)
       return null
     }
@@ -1346,6 +1404,7 @@ export class BridgeRuntime {
     failure.rerun = undefined
     await this.safeAnswerCallbackQuery(token, cq.id)
     await this.appendLog('info', 'bridge', `Retrying message ${failure.msg.message_id} in chat ${tgChatId} for ${fromId}.`)
+    await this.auditTelegram(cq.from, chat, 'retry', 'done')
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
         await rerun(this.pollAbort?.signal)
@@ -1441,14 +1500,21 @@ export class BridgeRuntime {
   }
 
   // One plain line for what the sender's role does not allow; the log names the role and what was
-  // refused, never the message text.
-  private async refuseForRole(token: string, msg: TelegramMessage, role: BridgeRole, what: string): Promise<void> {
+  // refused, the audit the command or `chat`, never the message text.
+  private async refuseForRole(
+    token: string,
+    msg: TelegramMessage,
+    role: BridgeRole,
+    what: string,
+    target: string
+  ): Promise<void> {
     const fromId = msg.from ? String(msg.from.id) : String(msg.chat.id)
     await this.appendLog(
       'info',
       'bridge',
       `Refused ${what} from ${fromId} in chat ${msg.chat.id}: role "${role.name}" does not allow it.`
     )
+    await this.auditTelegram(msg.from, msg.chat, 'refused', 'refused', target)
     await this.safeSendTelegram(token, msg.chat.id, this.i18n.notAllowedForRole, msg.message_id)
   }
 
@@ -1466,8 +1532,84 @@ export class BridgeRuntime {
       return false
     }
     const token = await this.readToken()
-    if (token) await this.refuseForRole(token, msg, role, 'a message')
+    if (token) await this.refuseForRole(token, msg, role, 'a message', 'chat')
     return false
+  }
+
+  // One audit entry for what a Telegram user did here or was refused, with their role in this chat.
+  // A done change to a group's shared chat, sync or automations also tells the group, when the
+  // bridge's groupAuditNotice is on.
+  private async auditTelegram(
+    from: TelegramUser | undefined,
+    chat: TelegramChat,
+    action: AuditAction,
+    result: AuditEntry['result'],
+    target?: string
+  ): Promise<void> {
+    const userId = from ? String(from.id) : String(chat.id)
+    const who = formatSenderLabel(from ? { from, chat } : { chat })
+    await this.manager.recordAudit({
+      bridgeId: this.id,
+      source: 'telegram',
+      userId,
+      userLabel: who,
+      chatId: String(chat.id),
+      roleName: this.roleOf(userId, chat).name,
+      action,
+      ...(target ? { target } : {}),
+      result
+    })
+    if (result === 'done' && this.config.groupAuditNotice && isGroupChat(chat)) {
+      await this.sendGroupNotice(chat, action, who, target)
+    }
+  }
+
+  // One plain line in the language this bridge answers in; only for actions that change what the
+  // whole group shares.
+  private async sendGroupNotice(chat: TelegramChat, action: AuditAction, who: string, target?: string): Promise<void> {
+    const notices = this.i18n.groupNotice
+    let line: string
+    switch (action) {
+      case 'new':
+      case 'home':
+      case 'bind':
+      case 'rename':
+        line = notices[action](who)
+        break
+      case 'sync':
+        line = notices.sync(who, target === 'on')
+        break
+      case 'run':
+        line = notices.run(who, target ?? '')
+        break
+      default:
+        return
+    }
+    const token = await this.readToken()
+    if (token) await this.safeSendTelegram(token, chat.id, line)
+  }
+
+  // Panel entries for what a save changed: access, roles and the token, never the token itself.
+  private async auditPanelSave(prev: BridgeConfig, prevToken: string | null): Promise<void> {
+    const access = accessChange(prev.allowedUserIds, this.config.allowedUserIds)
+    if (access) await this.auditPanel('access', access)
+    const roles = roleChanges(prev, this.config)
+    if (roles) await this.auditPanel('roles', roles)
+    if (prevToken !== this.cachedToken) await this.auditPanel('token', this.cachedToken ? 'changed' : 'cleared')
+  }
+
+  private auditPanel(action: AuditAction, target: string): Promise<void> {
+    return this.manager.recordAudit({ bridgeId: this.id, source: 'panel', action, target, result: 'done' })
+  }
+
+  // An automation's name for the audit and the group line; its id when Orca cannot list them.
+  private async automationName(id: string): Promise<string> {
+    try {
+      return (await this.deps.orcaCli.listAutomations()).find((a) => a.id === id)?.name || id
+    } catch (err) {
+      await this.appendLog('debug', 'orca-cli', `Reading the name of automation ${id} failed`, describeError(err))
+      return id
+    }
   }
 
   private enqueueChatWork(tgChatId: string, work: () => Promise<void>): Promise<void> {
@@ -2276,7 +2418,8 @@ export class BridgeRuntime {
     // Checked before anything else, so a refused command has no side effect (not even a binding).
     // Unknown commands need 'chat', as they go to the Orca bot as a message.
     if (!roleAllows(role, permissionForCommand(cmd, isGroup))) {
-      await this.refuseForRole(token, msg, role, /^\/\w+$/.test(cmd) ? cmd : 'a command')
+      const command = /^\/\w+$/.test(cmd) ? cmd : 'a command'
+      await this.refuseForRole(token, msg, role, command, command)
       return true
     }
     const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId, fromId))
@@ -2319,6 +2462,7 @@ export class BridgeRuntime {
         this.i18n.contextReset(binding.botName),
         msg.message_id
       )
+      await this.auditTelegram(msg.from, msg.chat, 'new', 'done')
       return true
     }
 
@@ -2341,6 +2485,7 @@ export class BridgeRuntime {
         this.i18n.boundHomeChat(binding.botName, homeChat.id),
         msg.message_id
       )
+      await this.auditTelegram(msg.from, msg.chat, 'home', 'done', homeChat.id)
       return true
     }
 
@@ -2400,6 +2545,7 @@ export class BridgeRuntime {
         this.i18n.boundChat(binding.botName, target.title || target.id),
         msg.message_id
       )
+      await this.auditTelegram(msg.from, msg.chat, 'bind', 'done', target.id)
       return true
     }
 
@@ -2427,6 +2573,8 @@ export class BridgeRuntime {
         await this.appendLog('info', 'orca-cli', `Renamed Orca chat ${binding.orcaChatId} (${arg.length} chars).`)
         this.emitState()
         await this.safeSendTelegram(token, msg.chat.id, this.i18n.renamed(arg), msg.message_id)
+        // No target: the title is the user's own text.
+        await this.auditTelegram(msg.from, msg.chat, 'rename', 'done')
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         await this.appendLog(
@@ -2475,11 +2623,13 @@ export class BridgeRuntime {
       if (['on', 'true', '1', 'enable'].includes(normalized)) {
         await this.setSyncOrcaOutbound(true)
         await this.safeSendTelegram(token, msg.chat.id, this.i18n.syncEnabled, msg.message_id)
+        await this.auditTelegram(msg.from, msg.chat, 'sync', 'done', 'on')
         return true
       }
       if (['off', 'false', '0', 'disable'].includes(normalized)) {
         await this.setSyncOrcaOutbound(false)
         await this.safeSendTelegram(token, msg.chat.id, this.i18n.syncDisabled, msg.message_id)
+        await this.auditTelegram(msg.from, msg.chat, 'sync', 'done', 'off')
         return true
       }
       await this.safeSendTelegram(token, msg.chat.id, this.i18n.syncUsage, msg.message_id)
@@ -2544,7 +2694,7 @@ export class BridgeRuntime {
         return true
       }
       if (!roleMayRun(role, arg)) {
-        await this.refuseForRole(token, msg, role, '/run of an automation not on its list')
+        await this.refuseForRole(token, msg, role, '/run of an automation not on its list', '/run')
         return true
       }
       try {
@@ -2552,6 +2702,7 @@ export class BridgeRuntime {
         await this.appendLog('info', 'orca-cli', `Triggered Orca automation ${arg} from Telegram.`)
         this.emitState()
         await this.safeSendTelegram(token, msg.chat.id, this.i18n.automationTriggered(arg), msg.message_id)
+        await this.auditTelegram(msg.from, msg.chat, 'run', 'done', await this.automationName(arg))
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         await this.appendLog(
@@ -2617,6 +2768,7 @@ export class BridgeRuntime {
         msg.chat.id,
         this.i18n.boundChat(binding.botName, target.title || target.id)
       )
+      await this.auditTelegram(cq.from, msg.chat, 'bind', 'done', target.id)
       return
     }
 
@@ -2628,6 +2780,7 @@ export class BridgeRuntime {
         msg.chat.id,
         this.i18n.contextReset(binding.botName)
       )
+      await this.auditTelegram(cq.from, msg.chat, 'new', 'done')
       return
     }
 
@@ -2645,6 +2798,7 @@ export class BridgeRuntime {
         msg.chat.id,
         this.i18n.boundHomeChat(binding.botName, homeChat.id)
       )
+      await this.auditTelegram(cq.from, msg.chat, 'home', 'done', homeChat.id)
       return
     }
 
@@ -2661,6 +2815,7 @@ export class BridgeRuntime {
         msg.chat.id,
         enabled ? this.i18n.syncEnabled : this.i18n.syncDisabled
       )
+      await this.auditTelegram(cq.from, msg.chat, 'sync', 'done', enabled ? 'on' : 'off')
       return
     }
 
@@ -2672,6 +2827,7 @@ export class BridgeRuntime {
         this.emitState()
         await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.automationTriggeredToast)
         await this.safeSendTelegram(token, msg.chat.id, this.i18n.automationTriggered(automationId))
+        await this.auditTelegram(cq.from, msg.chat, 'run', 'done', await this.automationName(automationId))
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         await this.appendLog(
@@ -3720,6 +3876,9 @@ export class BridgeManager {
   private bridgesWrite: Promise<void> = Promise.resolve()
   private globalOp: Promise<unknown> = Promise.resolve()
   private logFlushTimer: ReturnType<typeof setTimeout> | null = null
+  // Newest first, across bridges; kept in memory and written in batches like the log.
+  private audit: AuditEntry[] = []
+  private auditFlushTimer: ReturnType<typeof setTimeout> | null = null
   private pluginKey: string | null = null
   // Tokens of removed bridges: an error raised by their last calls must not leak them either.
   private readonly formerTokens: string[] = []
@@ -3756,6 +3915,8 @@ export class BridgeManager {
     // Entries stored by 0.2.0 have no scope or details, and those before 0.5.0 no bridgeId.
     const savedLogs = await this.orca.storage.get(STORAGE_LOGS)
     this.logs = Array.isArray(savedLogs) ? (savedLogs as BridgeLogEntry[]).slice(0, MAX_LOGS) : []
+    const savedAudit = await this.orca.storage.get(STORAGE_AUDIT)
+    this.audit = this.pruneAudit(Array.isArray(savedAudit) ? (savedAudit as AuditEntry[]) : [])
     this.runtimes = (await this.loadBridges()).map((stored) => new BridgeRuntime(this, stored))
     for (const runtime of this.runtimes) await runtime.init()
     this.emitState()
@@ -3766,6 +3927,7 @@ export class BridgeManager {
     this.disposed = true
     await Promise.all(this.runtimes.map((r) => r.dispose()))
     if (this.logFlushTimer) await this.flushLogs()
+    if (this.auditFlushTimer) await this.flushAudit()
   }
 
   getState(): BridgeState {
@@ -3912,6 +4074,7 @@ export class BridgeManager {
     await this.saveBridges()
     await runtime.init()
     await this.appendLog('info', 'config', `Added bridge "${runtime.name}".`, undefined, id)
+    await this.recordAudit({ bridgeId: id, source: 'panel', action: 'bridgeAdded', target: runtime.name, result: 'done' })
     this.emitState()
     return id
   }
@@ -3930,6 +4093,7 @@ export class BridgeManager {
       await this.orca.storage.delete(bridgeStorageKey(bridgeId, name))
     }
     await this.appendLog('info', 'config', `Removed bridge "${runtime.name}".`, undefined, bridgeId)
+    await this.recordAudit({ bridgeId, source: 'panel', action: 'bridgeRemoved', target: runtime.name, result: 'done' })
     this.emitState()
   }
 
@@ -4053,6 +4217,45 @@ export class BridgeManager {
       fileName: `telegram-bridge-logs-${fileTimestamp(now)}.txt`,
       text: this.redact(`${lines.join('\n')}\n`)
     }
+  }
+
+  // Newest first, at most AUDIT_PAGE, with how many match in all.
+  listAudit(query: AuditQuery): { entries: AuditEntry[]; total: number } {
+    const matching = this.auditMatching(query)
+    return toPlainJson({ entries: matching.slice(0, AUDIT_PAGE), total: matching.length })
+  }
+
+  // Every matching entry, newest first, every field quoted; a removed bridge shows by its id.
+  exportAudit(query: AuditQuery): ExportLogsResult {
+    const names = new Map(this.runtimes.map((r) => [r.id, r.name]))
+    const rows = [
+      ['time', 'bridge', 'source', 'user id', 'user', 'chat', 'role', 'action', 'target', 'result'],
+      ...this.auditMatching(query).map((e) => [
+        new Date(e.at).toISOString(),
+        names.get(e.bridgeId) ?? e.bridgeId,
+        e.source,
+        e.userId ?? '',
+        e.userLabel ?? '',
+        e.chatId ?? '',
+        e.roleName ?? '',
+        e.action,
+        e.target ?? '',
+        e.result
+      ])
+    ]
+    return {
+      fileName: `telegram-bridge-audit-${fileTimestamp(new Date(this.now()))}.csv`,
+      text: `${rows.map((row) => row.map((field) => `"${field.replaceAll('"', '""')}"`).join(',')).join('\n')}\n`
+    }
+  }
+
+  private auditMatching(query: AuditQuery): AuditEntry[] {
+    return this.pruneAudit(this.audit).filter(
+      (e) =>
+        (!query.bridgeId || e.bridgeId === query.bridgeId) &&
+        (!query.action || e.action === query.action) &&
+        (!query.result || e.result === query.result)
+    )
   }
 
   // One shared `orca bot list` call for every caller of every bridge: sync ticks, messages, panel loads.
@@ -4217,6 +4420,52 @@ export class BridgeManager {
     }
   }
 
+  // Every audit entry goes through here. Entries are written in batches like the log, and flushed
+  // on dispose.
+  async recordAudit(fields: Omit<AuditEntry, 'id' | 'at'>): Promise<void> {
+    const at = this.now()
+    const entry: AuditEntry = { id: `${at}-${Math.random().toString(36).slice(2, 7)}`, at, ...fields }
+    this.audit = this.pruneAudit([entry, ...this.audit])
+    const flushMs = this.deps.logFlushMs ?? LOG_FLUSH_MS
+    if (flushMs <= 0) {
+      await this.flushAudit()
+    } else if (!this.auditFlushTimer) {
+      const timer = setTimeout(() => {
+        this.auditFlushTimer = null
+        void this.flushAudit()
+      }, flushMs)
+      if (typeof timer === 'object' && 'unref' in timer) timer.unref()
+      this.auditFlushTimer = timer
+    }
+  }
+
+  // Newest first; at most 90 days old and MAX_AUDIT entries.
+  private pruneAudit(entries: AuditEntry[]): AuditEntry[] {
+    const since = this.now() - AUDIT_KEEP_MS
+    return entries
+      .filter((e) => e.at >= since)
+      .sort((a, b) => b.at - a.at)
+      .slice(0, MAX_AUDIT)
+  }
+
+  private async flushAudit(): Promise<void> {
+    if (this.auditFlushTimer) {
+      clearTimeout(this.auditFlushTimer)
+      this.auditFlushTimer = null
+    }
+    try {
+      await this.orca.storage.set(STORAGE_AUDIT, toPlainJson(this.audit))
+    } catch (err) {
+      // Not through appendLog, whose write may fail the same way.
+      const message = err instanceof Error ? err.message : String(err)
+      this.orca.log(`[warn] [bridge] Storing the audit trail failed: ${this.redact(message)}`)
+    }
+  }
+
+  private now(): number {
+    return (this.deps.now ?? Date.now)()
+  }
+
   // No bot token or voice API key of any bridge may reach a log line, a detail, a Telegram reply or
   // an export.
   redact(text: string): string {
@@ -4322,6 +4571,8 @@ export async function activateWithDeps(orca: OrcaWorkerApi, deps: BridgeDeps): P
     return state()
   })
   orca.panels.handle('bridge.exportLogs', () => manager.exportLogs())
+  orca.panels.handle('bridge.listAudit', (query) => manager.listAudit(query ?? {}))
+  orca.panels.handle('bridge.exportAudit', (query) => manager.exportAudit(query ?? {}))
   orca.panels.handle('bridge.focusedBot', () => manager.focusedBot())
   // For a role's "may run only these" list in the panel: ids and names only.
   orca.panels.handle('bridge.listAutomations', async () =>

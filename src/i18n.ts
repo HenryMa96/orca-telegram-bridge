@@ -149,6 +149,18 @@ export type Messages = {
   automationTriggered: (automationId: string) => string
   automationTriggeredToast: string
   runFailed: (detail: string) => string
+  // The line a group gets when a member changes its shared state (groupAuditNotice); `who` is the
+  // member's label ("@joao" or "Ann (123)").
+  groupNotice: GroupNotices
+}
+
+export type GroupNotices = {
+  new: (who: string) => string
+  home: (who: string) => string
+  bind: (who: string) => string
+  rename: (who: string) => string
+  sync: (who: string, on: boolean) => string
+  run: (who: string, automation: string) => string
 }
 
 const enOnOff = (on: boolean) => (on ? 'on' : 'off')
@@ -268,7 +280,15 @@ const en: Messages = {
   runUsage: 'Usage: /run <automationId> (see the IDs with /automations, or tap a button there to run one)',
   automationTriggered: (automationId) => `Automation started: ${automationId}`,
   automationTriggeredToast: 'Automation started',
-  runFailed: (detail) => `Run failed: ${detail}`
+  runFailed: (detail) => `Run failed: ${detail}`,
+  groupNotice: {
+    new: (who) => `${who} started a new chat`,
+    home: (who) => `${who} switched to the Home Chat`,
+    bind: (who) => `${who} switched to another Orca chat`,
+    rename: (who) => `${who} renamed the Orca chat`,
+    sync: (who, on) => `${who} turned Orca sync ${enOnOff(on)}`,
+    run: (who, automation) => `${who} ran ${automation}`
+  }
 }
 
 // Agrees with "sincronização" and "automação", both feminine.
@@ -390,7 +410,15 @@ const ptBR: Messages = {
   runUsage: 'Uso: /run <automationId> (veja os IDs com /automations ou toque em um botão de lá para executar)',
   automationTriggered: (automationId) => `Automação iniciada: ${automationId}`,
   automationTriggeredToast: 'Automação iniciada',
-  runFailed: (detail) => `Falha ao executar: ${detail}`
+  runFailed: (detail) => `Falha ao executar: ${detail}`,
+  groupNotice: {
+    new: (who) => `${who} iniciou uma nova conversa`,
+    home: (who) => `${who} mudou para o Home Chat`,
+    bind: (who) => `${who} mudou para outra conversa do Orca`,
+    rename: (who) => `${who} renomeou a conversa do Orca`,
+    sync: (who, on) => `${who} ${on ? 'ativou' : 'desativou'} a sincronização do Orca`,
+    run: (who, automation) => `${who} executou ${automation}`
+  }
 }
 
 const esOnOff = (on: boolean) => (on ? 'activada' : 'desactivada')
@@ -511,7 +539,15 @@ const es: Messages = {
   runUsage: 'Uso: /run <automationId> (mira los IDs con /automations o toca un botón allí para ejecutarla)',
   automationTriggered: (automationId) => `Automatización iniciada: ${automationId}`,
   automationTriggeredToast: 'Automatización iniciada',
-  runFailed: (detail) => `Error al ejecutar: ${detail}`
+  runFailed: (detail) => `Error al ejecutar: ${detail}`,
+  groupNotice: {
+    new: (who) => `${who} inició una nueva conversación`,
+    home: (who) => `${who} cambió al Home Chat`,
+    bind: (who) => `${who} cambió a otra conversación de Orca`,
+    rename: (who) => `${who} renombró la conversación de Orca`,
+    sync: (who, on) => `${who} ${on ? 'activó' : 'desactivó'} la sincronización de Orca`,
+    run: (who, automation) => `${who} ejecutó ${automation}`
+  }
 }
 
 const zhOnOff = (on: boolean) => (on ? '开启' : '关闭')
@@ -631,7 +667,15 @@ const zhCN: Messages = {
   runUsage: '用法：/run <automationId>（可先用 /automations 查看任务 ID 或直接点击按钮运行）',
   automationTriggered: (automationId) => `已触发自动化任务：${automationId}`,
   automationTriggeredToast: '已触发自动化任务',
-  runFailed: (detail) => `触发失败：${detail}`
+  runFailed: (detail) => `触发失败：${detail}`,
+  groupNotice: {
+    new: (who) => `${who} 开始了新会话`,
+    home: (who) => `${who} 切换到了 Home Chat`,
+    bind: (who) => `${who} 切换到了另一个 Orca 会话`,
+    rename: (who) => `${who} 重命名了 Orca 会话`,
+    sync: (who, on) => `${who} ${on ? '开启' : '关闭'}了 Orca 同步`,
+    run: (who, automation) => `${who} 运行了 ${automation}`
+  }
 }
 
 const CATALOG: Record<ReplyLanguage, Messages> = {
