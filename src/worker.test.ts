@@ -299,6 +299,47 @@ test('worker activates cleanly without token and saves config', async () => {
   await worker.deactivate()
 })
 
+test('worker activates and starts polling while Orca bot discovery hangs', async () => {
+  const host = mockHost({
+    capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: '', allowedUserIds: '', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const polled = Promise.withResolvers<void>()
+  const deps = makeMockDeps({
+    telegram: {
+      async getUpdates(_token, _params, options) {
+        polled.resolve()
+        const aborted = Promise.withResolvers<void>()
+        options?.signal?.addEventListener('abort', () => aborted.resolve(), { once: true })
+        if (!options?.signal?.aborted) await aborted.promise
+        return []
+      }
+    },
+    orcaCli: {
+      // `orca bot list --json` can hang on some hosts; startup must not wait for it.
+      listBots: () => new Promise(() => {})
+    }
+  })
+  // Real timer on purpose: it stands in for the host's ready deadline, so a regression fails instead of hanging.
+  const deadline = Promise.withResolvers<string>()
+  const timer = setTimeout(() => deadline.resolve('timed out'), 1000)
+  const started = mountWorker(
+    {
+      default: (orca: OrcaWorkerApi) => main.activateWithDeps(orca, deps).then(() => undefined),
+      deactivate: main.deactivate
+    },
+    { host }
+  )
+  const outcome = await Promise.race([
+    Promise.all([started, polled.promise]).then(() => 'polling'),
+    deadline.promise
+  ])
+  clearTimeout(timer)
+  assert.equal(outcome, 'polling')
+  await (await started).deactivate()
+})
+
 test('findUnsyncedTail aligns sliding windows and repeated messages accurately', () => {
   const items1 = extractMessageItems([
     { kind: 'message', role: 'user', text: 'first' },

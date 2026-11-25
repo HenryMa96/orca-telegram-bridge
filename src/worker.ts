@@ -196,6 +196,7 @@ export class TelegramBridgeController {
   private readonly activeTelegramOrcaChats = new Set<string>()
   private outboundSyncRunning = false
   private disposed = false
+  private backgroundBotsRefresh: Promise<void> | null = null
 
   constructor(orca: OrcaWorkerApi, deps: BridgeDeps) {
     this.orca = orca
@@ -204,12 +205,12 @@ export class TelegramBridgeController {
 
   async init(): Promise<void> {
     await this.loadPersistedState()
-    await this.refreshBots()
     this.updateInitialStatus()
     this.emitState()
     if (this.config.hasToken && this.config.enabled) {
       this.startPolling()
     }
+    this.refreshBotsInBackground()
   }
 
   async dispose(): Promise<void> {
@@ -236,7 +237,7 @@ export class TelegramBridgeController {
   async reloadFromSettingsAndSecrets(): Promise<void> {
     const prevSync = this.config.syncOrcaOutbound
     await this.loadPersistedState()
-    await this.refreshBots()
+    this.refreshBotsInBackground()
     if (!prevSync && this.config.syncOrcaOutbound) {
       await this.resetSyncCursors()
     }
@@ -1725,6 +1726,17 @@ export class TelegramBridgeController {
       const msg = err instanceof Error ? err.message : String(err)
       this.orca.log(`[warn] Failed to list Orca bots: ${msg}`)
     }
+  }
+
+  // `orca bot list` can hang for the full CLI timeout (30s), longer than the host's 10s
+  // ready deadline. Startup and panel loads must not wait for it; message handling
+  // refreshes bots itself. One shared call so repeated panel opens do not pile up CLI processes.
+  private refreshBotsInBackground(): void {
+    if (this.backgroundBotsRefresh) return
+    this.backgroundBotsRefresh = this.refreshBots().finally(() => {
+      this.backgroundBotsRefresh = null
+      if (!this.disposed) this.emitState()
+    })
   }
 
   private async resolveBindingBot(binding: ChatBinding): Promise<ChatBinding> {
