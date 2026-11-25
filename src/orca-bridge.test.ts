@@ -6,6 +6,7 @@ import {
   dispatchToOrcaBotAndWait,
   getOrcaBinary,
   isOrcaAutomationRunMessage,
+  isOrcaOrchestrationMailMessage,
   isTelegramOriginatedUserMessage,
   listBotsLocalFirst,
   listLocalBots,
@@ -530,6 +531,20 @@ test('Orca automation runs are recognised by the line Orca adds, typed messages 
   assert.equal(isOrcaAutomationRunMessage('Check today tasks in Orca'), false)
   // Quoting the line inside a sentence is not a run.
   assert.equal(isOrcaAutomationRunMessage('Why did it say [Orca: it is X, the time you were asked to act at. This is the only run.] ?'), false)
+})
+
+test('mail from another agent is recognised by Orca\'s banner, typed messages are not', () => {
+  // The shape Orca wrote into a bound chat when its bot's Home Chat sent a handoff.
+  assert.equal(
+    isOrcaOrchestrationMailMessage(
+      '──── From: ORCA_SESSION_ID:9863D830 (orca_session_id:9863d830) (handoff) ────\nSubject: Release note\nSend this to the user.\n[Reply: orca orchestration reply --id msg_074f0a5c23fc --body "..."]\n────────────────────────────────────────────────────────────'
+    ),
+    true
+  )
+  assert.equal(isOrcaOrchestrationMailMessage('──── From: TERM_WORKER (term_worker) [URGENT] (question) ────\nSubject: x'), true)
+  assert.equal(isOrcaOrchestrationMailMessage('Check today tasks in Orca'), false)
+  // Quoting a banner after other words is something the owner typed.
+  assert.equal(isOrcaOrchestrationMailMessage('Why did I get\n──── From: X (x) (handoff) ────'), false)
 })
 
 test('NO_REPLY answers say nothing; words before the marker stay; a quoted mention stays', () => {

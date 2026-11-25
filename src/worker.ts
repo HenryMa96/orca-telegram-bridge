@@ -24,6 +24,7 @@ import {
   findUnsyncedTail,
   getOrcaBinary,
   isOrcaAutomationRunMessage,
+  isOrcaOrchestrationMailMessage,
   isTelegramOriginatedUserMessage,
   OrcaCliError,
   pickPluginKey,
@@ -3539,11 +3540,12 @@ export class BridgeRuntime {
     for (let i = 0; i < readyItems.length; i++) {
       const item = readyItems[i]
       if (item.role === 'user') {
-        // Orca's own automation runs (reminders, deadlines, events, scheduled runs) are not
-        // something the owner typed.
+        // Orca's own automation runs (reminders, deadlines, events, scheduled runs) and mail from
+        // other agents are not something the owner typed.
         const typedInOrca =
           !isTelegramOriginatedUserMessage(item.text) &&
           !isOrcaAutomationRunMessage(item.text) &&
+          !isOrcaOrchestrationMailMessage(item.text) &&
           !(scheduledPrompts ??= await this.scheduledRunPrompts(orcaChatId)).has(normalizePrompt(item.text))
         if (typedInOrca) {
           const userPayload = `${this.i18n.orcaUserMessageHeader(binding.botName)}\n\n${item.text}`

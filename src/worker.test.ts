@@ -1002,6 +1002,20 @@ test('sync skips Orca automation prompts, scheduled runs and NO_REPLY answers bu
     assert.equal(runReads, 2)
     assert.match(sent[2], /Typed in Orca/)
     assert.match(sent[3], /Done\./)
+
+    // Mail from another agent (the bot's Home Chat asking it to message this user): only the bot's
+    // answer goes.
+    chatActivityAt = 5000
+    session.entries.push({
+      kind: 'message',
+      role: 'user',
+      text: '──── From: ORCA_SESSION_ID:9863D830 (orca_session_id:9863d830) (handoff) ────\nSubject: Release note\nSend the user: New version is live.\n[Reply: orca orchestration reply --id msg_1 --body "..."]\n────────────────────────────────────────────────────────────'
+    })
+    session.entries.push({ kind: 'message', role: 'assistant', text: 'New version is live.' })
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(sent.length, 5)
+    assert.match(sent[4], /New version is live\./)
+    assert.equal(/From:|Subject:|orchestration reply/.test(sent[4]), false)
   } finally {
     await controller.dispose()
     await worker.deactivate()

@@ -624,6 +624,15 @@ export function isOrcaAutomationRunMessage(text: string): boolean {
   return AUTOMATION_RUN_LINE.test(text)
 }
 
+// Mail another agent sends to the bot's chat (`orca orchestration send`) lands as a user message
+// framed by Orca's banner; nobody typed it in the chat. Upstream:
+// src/main/runtime/orchestration/mailbox/formatting/message-formatting.ts (formatMessageBanner).
+const ORCHESTRATION_MAIL_HEADER = /^──── From: [^\n]* \([a-z_]+\) ────(?:\n|$)/
+
+export function isOrcaOrchestrationMailMessage(text: string): boolean {
+  return ORCHESTRATION_MAIL_HEADER.test(text.trim())
+}
+
 // A bot message ending in NO_REPLY has nothing to report, and Orca tells nobody. Mirrors upstream
 // src/shared/bot-quiet-result.ts (addressedBotWords): the marker may be dressed (`NO_REPLY`,
 // **NO_REPLY.**), every trailing marker goes, but a quoted mention after words on its line stays.
