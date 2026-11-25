@@ -1,5 +1,6 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
 import type { ReplyLanguageSetting } from './i18n'
+import type { BridgeRole } from './roles'
 
 export {}
 
@@ -61,7 +62,15 @@ export type BridgeConfig = {
   enabled: boolean
   // The Orca bot this Telegram bot is pinned to ('' = the first Orca bot found).
   orcaBot: string
+  // Who may talk: '' = anyone on Telegram (they get the Stranger role); else only these user/group IDs.
   allowedUserIds: string
+  // What each kind of person may do, and the owner's extra prompt for them. See src/roles.ts.
+  roles: BridgeRole[]
+  // Telegram user or group ID -> role id. A listed sender's own role wins, also in groups; group
+  // members not listed get the group's role; others get Member (restricted) or Stranger (open).
+  roleAssignments: Record<string, string>
+  // False after an update gave everyone already allowed Full access, until the owner saves roles.
+  rolesReviewed: boolean
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
@@ -120,6 +129,9 @@ export type SaveConfigInput = {
   enabled?: boolean
   orcaBot: string
   allowedUserIds: string
+  // Absent keeps the saved roles and assignments; saving either marks the roles as reviewed.
+  roles?: BridgeRole[]
+  roleAssignments?: Record<string, string>
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
@@ -174,6 +186,8 @@ declare module 'orca' {
     'bridge.setDebugLogging': { input: { enabled: boolean }; output: BridgeState }
     'bridge.exportLogs': { output: ExportLogsResult }
     'bridge.focusedBot': { output: FocusedBot }
+    // Orca's automations, for a role's "may run only these" list.
+    'bridge.listAutomations': { output: { id: string; name: string }[] }
   }
   interface PluginPanelEvents {
     'bridge.stateChanged': BridgeState

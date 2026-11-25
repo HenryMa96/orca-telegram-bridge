@@ -15,6 +15,7 @@ import type {
   FocusedBot,
   SaveConfigInput
 } from './protocol'
+import { defaultRoles, type BridgeRole } from './roles'
 
 const SELECT_BOT_HINT = 'Select a bot in the left sidebar to see its Telegram bridge.'
 const ALL_BRIDGES_NOTE = 'Showing all bridges: Orca did not say which bot is selected.'
@@ -71,6 +72,9 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
       enabled: true,
       orcaBot: 'Assistant',
       allowedUserIds: '123456',
+      roles: defaultRoles(),
+      roleAssignments: {},
+      rolesReviewed: true,
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
       syncOrcaOutbound: false,
@@ -192,9 +196,14 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   assert.equal(view.find({ text: 'Allow 999000' }), null)
 
   await openEditor(view, 'b1')
+  // the allowed ID is a new row; the worker gives it Member
+  assert.equal(view.valueOf({ label: 'Telegram ID 2' }), '999000')
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 2' }), 'member')
   await view.press({ text: 'Save' })
   assert.equal(saved.length, 1)
   assert.equal(saved[0].bridgeId, 'b1')
+  assert.equal(saved[0].allowedUserIds, '123456, 999000')
+  assert.deepEqual(saved[0].roleAssignments, { '123456': 'member', '999000': 'member' })
   assert.equal('botToken' in saved[0], false)
   // Bot on/off lives only in the bridge card; saving the form must not touch it.
   assert.equal('enabled' in saved[0], false)
@@ -520,6 +529,8 @@ test('Save sends the edited bridge id and never the on/off state or a name; it p
       bridgeId: 'dev',
       orcaBot: 'Assistant',
       allowedUserIds: '',
+      roleAssignments: {},
+      roles: defaultRoles(),
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
       syncOrcaOutbound: false,
@@ -629,8 +640,11 @@ test('the editor names the Orca bot as text: no bot select and no Auto option', 
   await openEditor(view, 'b1')
   assert.equal(view.find({ label: 'Orca bot (this Telegram bot talks only to it)' }), null)
   assert.equal(view.find({ text: /Auto-select/ }), null)
-  // Voice is off and Advanced is closed, so the editor shows no Select at all.
-  assert.equal(view.findAll({ type: 'Select' }).length, 0)
+  // The only Selects are the people rows' role pickers: none offers Orca bots or Auto.
+  const offersBots = view
+    .findAll({ type: 'Select' })
+    .some((s) => (s.props.options as { label: string }[]).some((o) => /Assistant|Auto-select/.test(o.label)))
+  assert.equal(offersBots, false)
   assert.ok(view.find({ text: 'Orca bot: Assistant. This Telegram bot talks only to it.' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
@@ -1165,28 +1179,46 @@ function savedInputs(state: BridgeState, saved: SaveConfigInput[]) {
 
 const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
 
-test('Anyone on Telegram saves an empty allowlist', async () => {
+test('Anyone on Telegram saves an empty allowlist and keeps the rows as roles', async () => {
   const saved: SaveConfigInput[] = []
   const view = await mount(panel, { host: savedInputs(makeState(), saved) })
   await openEditor(view, 'b1')
   assert.equal(view.valueOf({ label: 'Who can talk' }), 'restricted')
-  assert.equal(view.valueOf({ label: 'Telegram user and group IDs' }), '123456')
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '123456')
+  // listed without a role: Member, as the worker reads it
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 1' }), 'member')
 
   await view.select({ label: 'Who can talk' }, 'open')
-  assert.equal(view.find({ label: 'Telegram user and group IDs' }), null)
   assert.equal(calloutsTitled(view, 'Anyone can use this bot').length, 1)
   assert.ok(view.find({ text: /Anyone who finds this bot can chat with Assistant/ }))
-  // going back shows the IDs typed before
+  assert.ok(view.find({ text: 'People with roles (everyone else is a Stranger)' }))
+  // the rows stay: while open they only give roles
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '123456')
   await view.select({ label: 'Who can talk' }, 'restricted')
-  assert.equal(view.valueOf({ label: 'Telegram user and group IDs' }), '123456')
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '123456')
   assert.equal(calloutsTitled(view, 'Anyone can use this bot').length, 0)
 
   await view.select({ label: 'Who can talk' }, 'open')
   await view.press({ text: 'Save' })
   assert.equal(saved.length, 1)
   assert.equal(saved[0].allowedUserIds, '')
+  assert.deepEqual(saved[0].roleAssignments, { '123456': 'member' })
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('open with no rows saves no roles for anyone; rows are optional', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: savedInputs(makeState({ bridges: twoBridges() }), saved) })
+  await openEditor(view, 'dev')
+  assert.equal(view.valueOf({ label: 'Who can talk' }), 'open')
+  assert.equal(view.find({ label: 'Telegram ID 1' }), null)
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].allowedUserIds, '')
+  assert.equal(Object.keys(saved[0].roleAssignments ?? { x: 1 }).length, 0)
+  assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
@@ -1197,23 +1229,64 @@ test('Only these people and groups without a valid ID is refused with a message'
   // an empty list means anyone, so the open bridge starts on Anyone on Telegram
   assert.equal(view.valueOf({ label: 'Who can talk' }), 'open')
 
+  // choosing a list gives one empty row; the first row is Full access so the owner keeps access
   await view.select({ label: 'Who can talk' }, 'restricted')
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '')
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 1' }), 'full')
   await view.press({ text: 'Save' })
   assert.equal(saved.length, 0)
   assert.ok(view.find({ text: NEEDS_ID }))
-  assert.equal(view.find({ label: 'Telegram user and group IDs' })!.props.invalid, true)
+  assert.equal(view.find({ label: 'Telegram ID 1' })!.props.invalid, true)
 
-  await view.type({ label: 'Telegram user and group IDs' }, 'abc')
+  await view.type({ label: 'Telegram ID 1' }, 'abc')
   assert.equal(view.find({ text: NEEDS_ID }), null)
   await view.press({ text: 'Save' })
   assert.equal(saved.length, 0)
+  assert.ok(view.find({ text: /"abc" is not a Telegram ID/ }))
+  assert.equal(view.find({ label: 'Telegram ID 1' })!.props.invalid, true)
+
+  // removing the only row leaves nothing to save
+  await view.press({ label: 'Remove Telegram ID 1' })
+  assert.equal(view.find({ label: 'Telegram ID 1' }), null)
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 0)
   assert.ok(view.find({ text: NEEDS_ID }))
 
-  await view.type({ label: 'Telegram user and group IDs' }, '42', { replace: true })
+  await view.press({ text: 'Add person or group' })
+  await view.type({ label: 'Telegram ID 1' }, '42')
   assert.equal(view.find({ text: NEEDS_ID }), null)
   await view.press({ text: 'Save' })
   assert.equal(saved.length, 1)
   assert.equal(saved[0].allowedUserIds, '42')
+  assert.deepEqual(saved[0].roleAssignments, { '42': 'full' })
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('rows: added rows get Member, each role select is saved, removed rows are gone', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: savedInputs(makeState(), saved) })
+  await openEditor(view, 'b1')
+  await view.press({ text: 'Add person or group' })
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 2' }), 'member')
+  await view.type({ label: 'Telegram ID 2' }, '-1001234567890')
+  await view.press({ text: 'Add person or group' })
+  await view.type({ label: 'Telegram ID 3' }, '777')
+  await view.select({ label: 'Role for Telegram ID 1' }, 'full')
+  await view.select({ label: 'Role for Telegram ID 3' }, 'stranger')
+
+  // the role select offers every role of this bridge
+  const options = view.find({ label: 'Role for Telegram ID 1' })!.props.options as { value: string }[]
+  assert.deepEqual(options.map((o) => o.value), ['full', 'member', 'stranger'])
+
+  await view.press({ label: 'Remove Telegram ID 3' })
+  assert.equal(view.find({ label: 'Telegram ID 3' }), null)
+  // an empty row is skipped, not refused
+  await view.press({ text: 'Add person or group' })
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].allowedUserIds, '123456, -1001234567890')
+  assert.deepEqual(saved[0].roleAssignments, { '123456': 'full', '-1001234567890': 'member' })
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -1403,4 +1476,286 @@ test('no BotFather notes without Telegram caps or with groups off', async () => 
   assert.equal(calloutsTitled(groupsOff, JOIN_TITLE).length, 0)
   assert.equal(calloutsTitled(groupsOff, PRIVACY_TITLE).length, 0)
   await groupsOff.unmount()
+})
+
+const PROMPT_HELPER = 'A hint to the bot, not a lock: only the checkboxes above are enforced. People never see it.'
+const REVIEW_TEXT = 'After the update everyone on the list kept full access. Review their roles.'
+const AUTOMATIONS = [
+  { id: 'a1', name: 'Nightly build' },
+  { id: 'a2', name: 'Backup' }
+]
+
+function customRole(id: string, name: string): BridgeRole {
+  return { id, name, permissions: ['chat', 'sync'], prompt: '', runAutomationIds: null }
+}
+
+// A worker stand-in for the roles tests: saves like the worker (roles given -> reviewed) and
+// answers the automations list, counting the requests.
+function rolesHost(
+  initial: BridgeState,
+  saved: SaveConfigInput[],
+  listAutomations: () => { id: string; name: string }[] = () => AUTOMATIONS
+) {
+  let state = initial
+  const counts = { listAutomations: 0 }
+  const host = panelHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.listAutomations': () => {
+        counts.listAutomations += 1
+        return listAutomations()
+      },
+      'bridge.saveConfig': (input: SaveConfigInput) => {
+        saved.push(input)
+        const bridge = state.bridges.find((b) => b.id === input.bridgeId)!
+        state = withBridge(state, input.bridgeId, {
+          config: {
+            allowedUserIds: input.allowedUserIds,
+            roles: input.roles ?? bridge.config.roles,
+            roleAssignments: input.roleAssignments ?? bridge.config.roleAssignments,
+            rolesReviewed: bridge.config.rolesReviewed || input.roles !== undefined || input.roleAssignments !== undefined
+          }
+        })
+        return state
+      }
+    }
+  })
+  return { host, counts }
+}
+
+async function openRoles(view: TestPanel): Promise<void> {
+  await view.toggle({ type: 'Collapsible', label: 'Roles' })
+}
+
+function savedRole(input: SaveConfigInput, roleId: string): BridgeRole {
+  const role = input.roles?.find((r) => r.id === roleId)
+  assert.ok(role, `role ${roleId} was saved`)
+  return role
+}
+
+test('roles: a ticked permission and the prompt are saved; Full and Stranger lock their boxes', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: rolesHost(makeState(), saved).host })
+  await openEditor(view, 'b1')
+  // Roles starts closed
+  assert.equal(view.find({ type: 'Collapsible', label: 'Member' }), null)
+  await openRoles(view)
+  const member = view.find({ type: 'Collapsible', label: 'Member' })
+  assert.ok(member)
+  assert.equal(member.props.description, 'can: chat, /status, /new in private')
+
+  await view.toggle({ type: 'Collapsible', label: 'Member' })
+  assert.equal(view.find({ testId: 'perm:member:sync' })!.label, '/sync')
+  assert.equal(view.valueOf({ testId: 'perm:member:sync' }), false)
+  await view.toggle({ testId: 'perm:member:sync' })
+  assert.equal(view.valueOf({ testId: 'perm:member:sync' }), true)
+  // built-in roles keep their names
+  assert.equal(view.find({ testId: 'role-name:member' })!.disabled, true)
+  assert.equal(view.find({ testId: 'delete-role:member' }), null)
+  await view.type({ testId: 'prompt:member' }, 'Answer in short sentences.')
+  assert.ok(view.find({ text: PROMPT_HELPER }))
+
+  await view.toggle({ type: 'Collapsible', label: 'Stranger' })
+  for (const p of ['bots', 'newGroup', 'homePrivate', 'homeGroup', 'bindPrivate', 'bindGroup', 'rename', 'sync', 'automations', 'run']) {
+    const box = view.find({ testId: `perm:stranger:${p}` })
+    assert.ok(box, p)
+    assert.equal(box.disabled, true, p)
+    assert.equal(box.props.checked, false, p)
+  }
+  assert.equal(view.find({ testId: 'perm:stranger:chat' })!.disabled, false)
+  assert.equal(view.find({ testId: 'perm:stranger:status' })!.disabled, false)
+
+  // Full access always has everything
+  await view.toggle({ type: 'Collapsible', label: 'Full access' })
+  assert.equal(view.find({ testId: 'perm:full:sync' })!.disabled, true)
+  assert.equal(view.find({ testId: 'perm:full:sync' })!.props.checked, true)
+
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  const role = savedRole(saved[0], 'member')
+  assert.deepEqual(role.permissions, ['chat', 'status', 'newPrivate', 'sync'])
+  assert.equal(role.prompt, 'Answer in short sentences.')
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('roles: with /run, Only these saves the ticked automations from Orca', async () => {
+  const saved: SaveConfigInput[] = []
+  const { host, counts } = rolesHost(makeState(), saved)
+  const view = await mount(panel, { host })
+  await openEditor(view, 'b1')
+  assert.equal(counts.listAutomations, 0)
+  // opening Roles loads the automations
+  await openRoles(view)
+  assert.equal(counts.listAutomations, 1)
+  await view.toggle({ type: 'Collapsible', label: 'Member' })
+  // the picker shows only with /run ticked
+  assert.equal(view.find({ testId: 'run-scope:member' }), null)
+  await view.toggle({ testId: 'perm:member:run' })
+  assert.equal(view.valueOf({ testId: 'run-scope:member' }), 'all')
+  assert.equal(view.find({ label: 'Backup' }), null)
+
+  await view.select({ testId: 'run-scope:member' }, 'only')
+  assert.ok(view.find({ label: 'Nightly build' }))
+  await view.toggle({ label: 'Backup' })
+  assert.equal(view.valueOf({ label: 'Backup' }), true)
+  await view.press({ text: 'Save' })
+  const role = savedRole(saved[0], 'member')
+  assert.ok(role.permissions.includes('run'))
+  assert.deepEqual(role.runAutomationIds, ['a2'])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('roles: when Orca cannot list automations, Only these shows a muted note', async () => {
+  const saved: SaveConfigInput[] = []
+  const { host } = rolesHost(makeState(), saved, () => {
+    throw new Error('orca exited with code 1')
+  })
+  const view = await mount(panel, { host })
+  await openEditor(view, 'b1')
+  await openRoles(view)
+  await view.toggle({ type: 'Collapsible', label: 'Member' })
+  await view.toggle({ testId: 'perm:member:run' })
+  await view.select({ testId: 'run-scope:member' }, 'only')
+  const note = view.find({ text: /Could not load Orca's automations/ })
+  assert.ok(note)
+  assert.equal(note.props.muted, true)
+  // the role still saves, with an empty list (runs none)
+  await view.press({ text: 'Save' })
+  assert.deepEqual(savedRole(saved[0], 'member').runAutomationIds, [])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('roles: Add role makes a custom role rows can pick', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: rolesHost(makeState(), saved).host })
+  await openEditor(view, 'b1')
+  await openRoles(view)
+  await view.press({ text: 'Add role' })
+  assert.ok(view.find({ type: 'Collapsible', label: 'New role' }))
+  const options = view.find({ label: 'Role for Telegram ID 1' })!.props.options as { value: string; label: string }[]
+  const added = options.find((o) => o.label === 'New role')
+  assert.ok(added)
+  assert.match(added.value, /^r-[a-z0-9]+$/)
+  await view.select({ label: 'Role for Telegram ID 1' }, added.value)
+  await view.press({ text: 'Save' })
+  assert.equal(savedRole(saved[0], added.value).name, 'New role')
+  assert.deepEqual(saved[0].roleAssignments, { '123456': added.value })
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('roles: deleting a custom role moves its rows to Member, with a note', async () => {
+  const saved: SaveConfigInput[] = []
+  const state = makeState({
+    bridges: [
+      makeBridge('b1', {
+        config: {
+          allowedUserIds: '123456, 777',
+          roles: [...defaultRoles(), customRole('r-team', 'Team')],
+          roleAssignments: { '123456': 'r-team', '777': 'full' }
+        }
+      })
+    ]
+  })
+  const view = await mount(panel, { host: rolesHost(state, saved).host })
+  await openEditor(view, 'b1')
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 1' }), 'r-team')
+  await openRoles(view)
+  await view.toggle({ type: 'Collapsible', label: 'Team' })
+  assert.equal(view.find({ testId: 'role-name:r-team' })!.disabled, false)
+  await view.press({ testId: 'delete-role:r-team' })
+  assert.equal(view.find({ type: 'Collapsible', label: 'Team' }), null)
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 1' }), 'member')
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 2' }), 'full')
+  assert.ok(view.find({ text: /1 person or group had a role that is gone and now have Member/ }))
+
+  await view.press({ text: 'Save' })
+  assert.deepEqual(
+    saved[0].roles!.map((r) => r.id),
+    ['full', 'member', 'stranger']
+  )
+  assert.deepEqual(saved[0].roleAssignments, { '123456': 'member', '777': 'full' })
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('roles: Copy takes another bridge’s roles into this editor, not its people', async () => {
+  const saved: SaveConfigInput[] = []
+  const bridges = twoBridges()
+  bridges[0].config.roles = [...defaultRoles(), customRole('r-team', 'Team')]
+  bridges[1].config.roles = [...defaultRoles(), customRole('r-old', 'Old')]
+  bridges[1].config.roleAssignments = { '555': 'r-old' }
+  const view = await mount(panel, { host: rolesHost(makeState({ bridges }), saved).host })
+  // Assistant is selected: the open @dev_bot shows
+  await openEditor(view, 'dev')
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '555')
+  await openRoles(view)
+  assert.ok(view.find({ type: 'Collapsible', label: 'Old' }))
+  const from = view.find({ label: 'Copy roles from' })!.props.options as { value: string; label: string }[]
+  assert.deepEqual(from, [{ value: 'ci', label: '@ci_bot' }])
+
+  await view.select({ label: 'Copy roles from' }, 'ci')
+  await view.press({ text: 'Copy' })
+  assert.ok(view.find({ type: 'Collapsible', label: 'Team' }))
+  assert.equal(view.find({ type: 'Collapsible', label: 'Old' }), null)
+  // the people stay; a role that is gone falls back to Member
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '555')
+  assert.equal(view.valueOf({ label: 'Role for Telegram ID 1' }), 'member')
+
+  await view.press({ text: 'Save' })
+  assert.deepEqual(
+    saved[0].roles!.map((r) => r.id),
+    ['full', 'member', 'stranger', 'r-team']
+  )
+  assert.deepEqual(saved[0].roleAssignments, { '555': 'member' })
+  assert.equal(saved[0].allowedUserIds, '')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('the review banner shows on the card and in the editor until the roles are saved', async () => {
+  const saved: SaveConfigInput[] = []
+  const state = makeState({ bridges: [makeBridge('b1', { config: { rolesReviewed: false } })] })
+  const view = await mount(panel, { host: rolesHost(state, saved).host })
+  assert.equal(calloutsTitled(view, 'Review roles').length, 1)
+  assert.ok(view.find({ text: REVIEW_TEXT }))
+  await openEditor(view, 'b1')
+  // the card stays above its open editor: one banner each
+  assert.equal(calloutsTitled(view, 'Review roles').length, 2)
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(calloutsTitled(view, 'Review roles').length, 0)
+  assert.equal(view.find({ text: REVIEW_TEXT }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('no review banner once the roles were reviewed', async () => {
+  const view = await mountWithAllowed('123456')
+  assert.equal(calloutsTitled(view, 'Review roles').length, 0)
+  await view.unmount()
+})
+
+test('each bridge card says who can talk and with which role', async () => {
+  const restricted = makeState({
+    bridges: [
+      makeBridge('b1', {
+        config: { allowedUserIds: '1, 2, 3', roleAssignments: { '1': 'full', '2': 'member' } }
+      })
+    ]
+  })
+  let view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => restricted } }) })
+  // ID 3 has no role: Member
+  assert.ok(view.find({ text: 'People: 3 (Full access 1, Member 2)' }))
+  await view.unmount()
+
+  const open = makeState({ bridges: [makeBridge('b1', { config: { allowedUserIds: '' } })] })
+  view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => open } }) })
+  assert.ok(view.find({ text: 'Anyone on Telegram (Stranger)' }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
 })

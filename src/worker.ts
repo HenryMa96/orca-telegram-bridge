@@ -11,7 +11,8 @@ import {
   t,
   TELEGRAM_COMMAND_NAMES,
   type Messages,
-  type ReplyLanguage
+  type ReplyLanguage,
+  type TelegramCommandName
 } from './i18n'
 import {
   computeTailHashes,
@@ -51,6 +52,19 @@ import type {
   TestConnectionResult
 } from './protocol'
 import {
+  defaultRoles,
+  FULL_ROLE_ID,
+  MEMBER_ROLE_ID,
+  normalizeRoleAssignments,
+  normalizeRoles,
+  permissionForCallback,
+  permissionForCommand,
+  resolveRole,
+  roleAllows,
+  roleMayRun,
+  type BridgeRole
+} from './roles'
+import {
   extractTablesFromMarkdown,
   renderTableToPng,
   type ExtractedTable
@@ -63,6 +77,7 @@ import {
   TelegramApiError,
   type TelegramAudio,
   type TelegramBotCommand,
+  type TelegramBotCommandScope,
   type TelegramCallbackQuery,
   type TelegramChat,
   type TelegramChatMemberUpdated,
@@ -84,10 +99,11 @@ import {
 // state lives under `tg.<id>.*`.
 const STORAGE_BRIDGES = 'bridges'
 const STORAGE_LOGS = 'tg.logs'
-const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages'] as const
+// commandScopes: the user/group ids that got a command menu of their own, so a removed id's menu is deleted.
+const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages', 'commandScopes'] as const
 // What 0.4.0 and earlier stored for their single bridge; moved into "Bridge 1" on the first start.
 const LEGACY_SECRET_BOT_TOKEN = 'botToken'
-// chatLanguages came later, so 0.4.0 had nothing to move for it.
+// chatLanguages and commandScopes came later, so 0.4.0 had nothing to move for them.
 const LEGACY_STORAGE: Partial<Record<(typeof BRIDGE_STORAGE_NAMES)[number], string>> = {
   offset: 'tg.updateOffset',
   bindings: 'tg.bindings',
@@ -209,6 +225,21 @@ function parseAllowedIds(raw: string): Set<string> {
 // An empty allowlist opens the bridge to everyone; otherwise the sender or the chat must be listed.
 function isAllowed(allowed: Set<string>, fromId: string, tgChatId: string): boolean {
   return allowed.size === 0 || allowed.has(fromId) || allowed.has(tgChatId)
+}
+
+// The menu commands a role may use in a private chat or in a group; /help is always one of them.
+function commandsForRole(role: BridgeRole, isGroup: boolean): TelegramCommandName[] {
+  return TELEGRAM_COMMAND_NAMES.filter((name) => roleAllows(role, permissionForCommand(`/${name}`, isGroup)))
+}
+
+// Everything the Telegram command menus depend on; a change means they must be sent again.
+function menuKey(config: BridgeConfig): string {
+  return JSON.stringify([
+    config.replyLanguage,
+    parseAllowedIds(config.allowedUserIds).size === 0,
+    config.roles,
+    config.roleAssignments
+  ])
 }
 
 // Removes text[start, end) and the space it leaves behind: 'a @bot b' -> 'a b', 'hi @bot, x' -> 'hi, x'.
@@ -360,9 +391,10 @@ function callbackDataKind(data: string | undefined): string | undefined {
   return data === undefined ? undefined : `${data.split(':')[0]}:`
 }
 
+// Roles and assignments are objects, so fields are compared by value.
 function changedConfigFields(prev: BridgeConfig, next: BridgeConfig): string[] {
   return (Object.keys(next) as (keyof BridgeConfig)[]).filter(
-    (key) => key !== 'hasToken' && prev[key] !== next[key]
+    (key) => key !== 'hasToken' && JSON.stringify(prev[key]) !== JSON.stringify(next[key])
   )
 }
 
@@ -430,16 +462,30 @@ function clampTimeout(value: unknown): number {
   return Math.min(1800, Math.max(30, Math.round(n)))
 }
 
+// Bridges read from a store written before roles existed. Their people who chatted before also keep
+// full access, but bindings load later (loadRuntimeState), so the runtime finishes the migration.
+const storedBeforeRoles = new WeakSet<StoredBridge>()
+
 // Reads one stored bridge, or a 0.4.0 settings object; a missing or wrong-typed field takes its default.
 // Groups default to on: 0.4.0 answered in groups, and so did bridges stored before group options.
 function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName: string): StoredBridge {
   const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
-  return {
+  const allowedUserIds = text(raw.allowedUserIds)
+  const roles = normalizeRoles(raw.roles)
+  // Stored before roles existed: everyone already allowed keeps full access, so nobody loses rights
+  // on update, until the owner reviews the roles and saves.
+  const beforeRoles = raw.roles === undefined
+  const stored: StoredBridge = {
     id,
     name: text(raw.name) || fallbackName,
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : false,
     orcaBot: text(raw.orcaBot),
-    allowedUserIds: text(raw.allowedUserIds),
+    allowedUserIds,
+    roles,
+    roleAssignments: beforeRoles
+      ? Object.fromEntries([...parseAllowedIds(allowedUserIds)].map((userId) => [userId, FULL_ROLE_ID]))
+      : normalizeRoleAssignments(raw.roleAssignments, roles),
+    rolesReviewed: beforeRoles ? false : typeof raw.rolesReviewed === 'boolean' ? raw.rolesReviewed : true,
     proxyUrl: text(raw.proxyUrl),
     replyTimeoutSec: clampTimeout(raw.replyTimeoutSec),
     syncOrcaOutbound: typeof raw.syncOrcaOutbound === 'boolean' ? raw.syncOrcaOutbound : false,
@@ -457,6 +503,8 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
     voiceProvider: raw.voiceProvider === 'openai' ? 'openai' : 'openrouter',
     voiceModel: text(raw.voiceModel)
   }
+  if (beforeRoles) storedBeforeRoles.add(stored)
+  return stored
 }
 
 function isGroupChat(chat: TelegramChat): boolean {
@@ -509,9 +557,15 @@ function traceTelegram(client: TelegramClient, tracer: Tracer): TelegramClient {
   return {
     getMe: (token, options) =>
       trace('getMe', () => client.getMe(token, options), (me) => `@${me.username ?? me.id}`),
-    setMyCommands: (token, commands, options, languageCode) =>
-      trace(`setMyCommands (${commands.length} commands${languageCode ? `, ${languageCode}` : ''})`, () =>
-        client.setMyCommands(token, commands, options, languageCode)
+    setMyCommands: (token, commands, options, languageCode, scope) =>
+      trace(
+        `setMyCommands (${commands.length} commands${languageCode ? `, ${languageCode}` : ''}${scope ? `, chat ${scope.chat_id}` : ''})`,
+        () => client.setMyCommands(token, commands, options, languageCode, scope)
+      ),
+    deleteMyCommands: (token, options, scope, languageCode) =>
+      trace(
+        `deleteMyCommands (${scope ? `chat ${scope.chat_id}` : 'default'}${languageCode ? `, ${languageCode}` : ''})`,
+        () => client.deleteMyCommands(token, options, scope, languageCode)
       ),
     getUpdates: (token, params, options) =>
       trace(
@@ -635,6 +689,12 @@ export class BridgeRuntime {
   // deps.transcribe (or the real one), traced like the Telegram and CLI calls.
   private readonly transcribe: Transcriber
   private commandsRegistered = false
+  // The user/group ids whose own command menu is set (stored as commandScopes), and those whose menu
+  // Telegram refused (it knows no chat with a person until they write to the bot).
+  private commandScopeIds: string[] = []
+  private unsetScopeIds = new Set<string>()
+  // Read from a store written before roles: finish the migration once the bindings are loaded.
+  private seedRolesFromBindings: boolean
   private pollAbort: AbortController | null = null
   private pollLoopPromise: Promise<void> | null = null
   private outboundLoopPromise: Promise<void> | null = null
@@ -660,6 +720,7 @@ export class BridgeRuntime {
     this.orca = manager.orca
     this.id = stored.id
     this.config = { ...stored, hasToken: false, hasVoiceKey: false }
+    this.seedRolesFromBindings = storedBeforeRoles.has(stored)
     const tracer: Tracer = {
       enabled: () => manager.debugLogging,
       log: (level, scope, message, details) => this.appendLog(level, scope, message, details)
@@ -814,6 +875,7 @@ export class BridgeRuntime {
 
     const replyLanguage =
       input.replyLanguage === undefined ? prev.replyLanguage : normalizeLanguageSetting(input.replyLanguage)
+    const roles = input.roles === undefined ? prev.roles : normalizeRoles(input.roles)
     this.config = {
       id: this.id,
       name: input.name?.trim() || prev.name,
@@ -821,6 +883,10 @@ export class BridgeRuntime {
       enabled: input.enabled ?? prev.enabled,
       orcaBot: input.orcaBot.trim(),
       allowedUserIds: input.allowedUserIds.trim(),
+      roles,
+      // Assignments to a role that no longer exists are dropped.
+      roleAssignments: normalizeRoleAssignments(input.roleAssignments ?? prev.roleAssignments, roles),
+      rolesReviewed: input.roles !== undefined || input.roleAssignments !== undefined ? true : prev.rolesReviewed,
       proxyUrl: input.proxyUrl.trim(),
       replyTimeoutSec: clampTimeout(input.replyTimeoutSec || 300),
       syncOrcaOutbound: Boolean(input.syncOrcaOutbound),
@@ -839,8 +905,8 @@ export class BridgeRuntime {
     if (prev.orcaBot !== this.config.orcaBot) {
       this.pinnedBotId = null
     }
-    if (prev.replyLanguage !== replyLanguage) {
-      // The next poll registers the command menu again in the new language.
+    if (menuKey(prev) !== menuKey(this.config)) {
+      // The next poll registers the command menus again (language, access mode or roles changed).
       this.commandsRegistered = false
     }
     if (!prev.syncOrcaOutbound && this.config.syncOrcaOutbound) {
@@ -950,6 +1016,11 @@ export class BridgeRuntime {
     const existing = parseAllowedIds(this.config.allowedUserIds)
     existing.add(clean)
     this.config.allowedUserIds = Array.from(existing).join(', ')
+    // Allowed from the panel's Allow button: a Member, unless the owner already gave them a role.
+    if (!this.config.roleAssignments[clean]) {
+      this.config.roleAssignments = { ...this.config.roleAssignments, [clean]: MEMBER_ROLE_ID }
+    }
+    this.commandsRegistered = false
     await this.manager.saveBridges()
     if (this.lastBlockedUserId === clean) {
       this.lastBlockedUserId = null
@@ -1086,6 +1157,11 @@ export class BridgeRuntime {
     const unaddressed = group?.addressed === false
     // Only an allowed chat's language is kept, so strangers never grow the stored map.
     if (msg.from?.language_code) await this.rememberChatLanguage(tgChatId, languageFromTelegramCode(msg.from.language_code))
+    // Telegram refused this person's or group's own menu while it knew no chat with them; now it does.
+    if (this.unsetScopeIds.has(fromId) || this.unsetScopeIds.has(tgChatId)) this.commandsRegistered = false
+    // Each command is checked in handleSlashCommand; anything else is a message and needs 'chat'.
+    const isCommand = !image && !unsupportedImage && !voice && text.startsWith('/')
+    if (!isCommand && !(await this.mayChat(msg))) return null
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
         if (unsupportedImage) {
@@ -1165,6 +1241,23 @@ export class BridgeRuntime {
       return null
     }
 
+    // A button acts only when the tapper's role may do what it does; a Run button also needs that
+    // automation on the role's list. A refusal answers the tap and does nothing else.
+    const role = this.roleOf(fromId, cq.message.chat)
+    const data = cq.data
+    if (
+      !roleAllows(role, permissionForCallback(data, isGroupChat(cq.message.chat))) ||
+      (data.startsWith('r:') && !roleMayRun(role, data.slice(2)))
+    ) {
+      await this.appendLog(
+        'info',
+        'bridge',
+        `Refused button ${callbackDataKind(data)} from ${fromId} in chat ${tgChatId}: role "${role.name}" does not allow it.`
+      )
+      await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.notAllowedForRole, true)
+      return null
+    }
+
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
         await this.processCallbackQuery(token, cq)
@@ -1181,6 +1274,46 @@ export class BridgeRuntime {
       }
     })
     return { done }
+  }
+
+  // The role that applies to this sender in this chat (rules in src/roles.ts).
+  private roleOf(senderId: string, chat: TelegramChat): BridgeRole {
+    return resolveRole(this.config.roles, this.config.roleAssignments, {
+      senderId,
+      chatId: String(chat.id),
+      isGroup: isGroupChat(chat),
+      openToEveryone: parseAllowedIds(this.config.allowedUserIds).size === 0
+    })
+  }
+
+  // One plain line for what the sender's role does not allow; the log names the role and what was
+  // refused, never the message text.
+  private async refuseForRole(token: string, msg: TelegramMessage, role: BridgeRole, what: string): Promise<void> {
+    const fromId = msg.from ? String(msg.from.id) : String(msg.chat.id)
+    await this.appendLog(
+      'info',
+      'bridge',
+      `Refused ${what} from ${fromId} in chat ${msg.chat.id}: role "${role.name}" does not allow it.`
+    )
+    await this.safeSendTelegram(token, msg.chat.id, this.i18n.notAllowedForRole, msg.message_id)
+  }
+
+  // Messages need the sender's role to allow 'chat'. Without it a private chat gets the refusal
+  // line; a group is left alone, as its other members may be talking among themselves.
+  private async mayChat(msg: TelegramMessage): Promise<boolean> {
+    const role = this.roleOf(msg.from ? String(msg.from.id) : String(msg.chat.id), msg.chat)
+    if (roleAllows(role, 'chat')) return true
+    if (isGroupChat(msg.chat)) {
+      await this.appendLog(
+        'debug',
+        'bridge',
+        `Ignored message ${msg.message_id} in group ${msg.chat.id}: role "${role.name}" may not chat.`
+      )
+      return false
+    }
+    const token = await this.readToken()
+    if (token) await this.refuseForRole(token, msg, role, 'a message')
+    return false
   }
 
   private enqueueChatWork(tgChatId: string, work: () => Promise<void>): Promise<void> {
@@ -1344,6 +1477,7 @@ export class BridgeRuntime {
         userText: text,
         imagePaths,
         unaddressedGroupReply: unaddressed ? this.config.groupReply : undefined,
+        rolePrompt: this.roleOf(fromId, msg.chat).prompt,
         answerLanguage:
           this.config.replyLanguage === 'auto' ? LANGUAGE_NAMES[messageLanguage.getStore() ?? 'en'] : undefined,
         timeoutMs: this.config.replyTimeoutSec * 1000,
@@ -1871,13 +2005,22 @@ export class BridgeRuntime {
     const arg = rest.join(' ').trim()
     const tgChatId = String(msg.chat.id)
     const fromId = msg.from ? String(msg.from.id) : tgChatId
+    const isGroup = isGroupChat(msg.chat)
+    const role = this.roleOf(fromId, msg.chat)
+    // Checked before anything else, so a refused command has no side effect (not even a binding).
+    // Unknown commands need 'chat', as they go to the Orca bot as a message.
+    if (!roleAllows(role, permissionForCommand(cmd, isGroup))) {
+      await this.refuseForRole(token, msg, role, /^\/\w+$/.test(cmd) ? cmd : 'a command')
+      return true
+    }
     const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId, fromId))
 
     if (cmd === '/start' || cmd === '/help') {
       const helpText = this.i18n.help({
         botName: binding.botName,
         orcaChatId: binding.orcaChatId,
-        syncOn: this.config.syncOrcaOutbound
+        syncOn: this.config.syncOrcaOutbound,
+        commands: commandsForRole(role, isGroup)
       })
       await this.safeSendTelegram(token, msg.chat.id, helpText, msg.message_id)
       return true
@@ -2078,7 +2221,10 @@ export class BridgeRuntime {
 
     if (cmd === '/automations') {
       try {
-        const automations = await this.deps.orcaCli.listAutomations()
+        // Only the automations on this role's list; Run buttons only when the role may run them.
+        const automations = (await this.deps.orcaCli.listAutomations()).filter(
+          (a) => role.runAutomationIds === null || role.runAutomationIds.includes(a.id)
+        )
         if (automations.length === 0) {
           await this.safeSendTelegram(token, msg.chat.id, this.i18n.noAutomations, msg.message_id)
           return true
@@ -2099,7 +2245,7 @@ export class BridgeRuntime {
           lines.join('\n'),
           msg.message_id,
           false,
-          { inline_keyboard: keyboardRows }
+          roleAllows(role, 'run') ? { inline_keyboard: keyboardRows } : undefined
         )
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
@@ -2128,6 +2274,10 @@ export class BridgeRuntime {
           this.i18n.runUsage,
           msg.message_id
         )
+        return true
+      }
+      if (!roleMayRun(role, arg)) {
+        await this.refuseForRole(token, msg, role, '/run of an automation not on its list')
         return true
       }
       try {
@@ -2452,33 +2602,97 @@ export class BridgeRuntime {
 
   private async ensureCommandsRegistered(token: string, signal?: AbortSignal): Promise<void> {
     if (this.commandsRegistered) return
-    const setting = this.config.replyLanguage
-    const commandsIn = (language: ReplyLanguage): TelegramBotCommand[] =>
-      TELEGRAM_COMMAND_NAMES.map((command) => ({ command, description: t(language).commands[command] }))
+    const key = menuKey(this.config)
+    const { replyLanguage: setting, roles, roleAssignments } = this.config
+    const openToEveryone = parseAllowedIds(this.config.allowedUserIds).size === 0
+    const options = { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000, signal }
     // Every language's menu is set each time, so leaving 'auto' replaces the per-language menus too.
     const menus: Array<[code: string | undefined, language: ReplyLanguage]> = [
       [undefined, setting === 'auto' ? 'en' : setting],
       ...MENU_LANGUAGES.map(([code, language]): [string, ReplyLanguage] => [code, setting === 'auto' ? language : setting])
     ]
-    try {
+    // One menu (the default, or one chat's) in every menu language, listing what that role may use.
+    const setMenus = async (role: BridgeRole, isGroup: boolean, scope?: TelegramBotCommandScope) => {
+      const names = commandsForRole(role, isGroup)
       for (const [code, language] of menus) {
-        await this.deps.telegram.setMyCommands(
-          token,
-          commandsIn(language),
-          { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000, signal },
-          code
-        )
+        const commands: TelegramBotCommand[] = names.map((command) => ({ command, description: t(language).commands[command] }))
+        await this.deps.telegram.setMyCommands(token, commands, options, code, scope)
       }
-      // A language change during the calls leaves the flag unset, so the next poll sends the new menus.
-      this.commandsRegistered = setting === this.config.replyLanguage
+    }
+    try {
+      // The default menu is for everyone without a role of their own: Stranger while open, else Member.
+      await setMenus(resolveRole(roles, {}, { senderId: '', chatId: '', isGroup: false, openToEveryone }), false)
       this.lastFailures.delete('setMyCommands')
-      await this.appendLog('info', 'telegram', `Registered Telegram slash command menu (${setting}).`)
     } catch (err) {
       // Retried on every poll until it works; logged again only when the failure changes.
       if (this.isRepeatedFailure('setMyCommands', err)) return
       const message = err instanceof Error ? err.message : String(err)
       await this.appendLog('warn', 'telegram', `Failed to register Telegram commands: ${message}`, describeError(err))
+      return
     }
+
+    // One menu per person or group with a role: a user id is their private chat, a group id the group.
+    const ids = Object.keys(roleAssignments)
+    const unset = new Set<string>()
+    for (const id of ids) {
+      const isGroup = id.startsWith('-')
+      const site = `setMyCommands:${id}`
+      try {
+        const role = resolveRole(roles, roleAssignments, { senderId: id, chatId: id, isGroup, openToEveryone })
+        await setMenus(role, isGroup, { type: 'chat', chat_id: Number(id) })
+        this.lastFailures.delete(site)
+      } catch (err) {
+        if (signal?.aborted) return
+        // Usually "chat not found": Telegram knows no chat with a person until they write to the bot.
+        // Their next message makes the next poll try again.
+        unset.add(id)
+        if (this.isRepeatedFailure(site, err)) continue
+        const message = err instanceof Error ? err.message : String(err)
+        await this.appendLog(
+          'warn',
+          'telegram',
+          `Could not set the command menu of chat ${id}: ${message}`,
+          describeError(err, { tgChatId: id })
+        )
+      }
+    }
+
+    // Ids that lost their role (or were removed) fall back to the default menu.
+    const notRemoved: string[] = []
+    for (const id of this.commandScopeIds.filter((scopeId) => !roleAssignments[scopeId])) {
+      try {
+        for (const [code] of menus) {
+          await this.deps.telegram.deleteMyCommands(token, options, { type: 'chat', chat_id: Number(id) }, code)
+        }
+      } catch (err) {
+        if (signal?.aborted) return
+        // Kept in the list, so the next registration tries again.
+        notRemoved.push(id)
+        const message = err instanceof Error ? err.message : String(err)
+        await this.appendLog(
+          'warn',
+          'telegram',
+          `Could not remove the command menu of chat ${id}: ${message}`,
+          describeError(err, { tgChatId: id })
+        )
+      }
+    }
+    // A menu set before and failing now may still be there; it stays listed so a removal deletes it.
+    const before = this.commandScopeIds
+    this.commandScopeIds = [...ids.filter((id) => !unset.has(id) || before.includes(id)), ...notRemoved]
+    this.unsetScopeIds = unset
+    try {
+      await this.orca.storage.set(this.key('commandScopes'), this.commandScopeIds)
+    } catch (err) {
+      await this.appendLog('warn', 'telegram', 'Could not store which chats have their own command menu', describeError(err))
+    }
+    // A change during the calls leaves the flag unset, so the next poll sends the new menus.
+    this.commandsRegistered = key === menuKey(this.config)
+    await this.appendLog(
+      'info',
+      'telegram',
+      `Registered Telegram slash command menu (${setting}${ids.length > 0 ? `, ${ids.length - unset.size} of ${ids.length} chat menu(s)` : ''}).`
+    )
   }
 
   private startPolling(): void {
@@ -2990,6 +3204,32 @@ export class BridgeRuntime {
       this.pinnedBotId =
         this.bindings.find((b) => b.botName === this.config.orcaBot && b.botId)?.botId ?? null
     }
+
+    const savedScopes = await this.orca.storage.get(this.key('commandScopes'))
+    this.commandScopeIds = Array.isArray(savedScopes)
+      ? savedScopes.filter((id): id is string => typeof id === 'string' && /^-?\d+$/.test(id))
+      : []
+
+    if (this.seedRolesFromBindings) await this.seedFullAccessFromBindings()
+  }
+
+  // Before roles, everyone who could talk had every command. An open bridge has no list to carry
+  // over, so the people who already chatted with it in private (their bindings) keep full access.
+  // A restricted bridge is skipped: its list already holds everyone allowed, and assigning a
+  // removed person a role would put them back on the list at the next save.
+  private async seedFullAccessFromBindings(): Promise<void> {
+    this.seedRolesFromBindings = false
+    if (parseAllowedIds(this.config.allowedUserIds).size === 0) {
+      const assignments = { ...this.config.roleAssignments }
+      for (const b of this.bindings) {
+        if (!/^\d+$/.test(b.tgChatId)) continue
+        for (const userId of [b.tgChatId, b.ownerUserId]) {
+          if (userId && /^\d+$/.test(userId) && !assignments[userId]) assignments[userId] = FULL_ROLE_ID
+        }
+      }
+      this.config.roleAssignments = assignments
+    }
+    await this.manager.saveBridges()
   }
 
   // The language a chat last showed, kept so 'auto' still knows it after a restart, for a message
@@ -3395,7 +3635,11 @@ export class BridgeManager {
     let n = this.runtimes.length + 1
     while (names.has(`Bridge ${n}`)) n++
     // A new bridge stays out of groups until the owner allows them.
-    const runtime = new BridgeRuntime(this, readStoredBridge({ name, orcaBot, allowGroups: false }, id, `Bridge ${n}`))
+    // Given roles, a new bridge is not taken for one stored before roles: nothing to review.
+    const runtime = new BridgeRuntime(
+      this,
+      readStoredBridge({ name, orcaBot, allowGroups: false, roles: defaultRoles() }, id, `Bridge ${n}`)
+    )
     this.runtimes.push(runtime)
     await this.saveBridges()
     await runtime.init()
@@ -3811,6 +4055,10 @@ export async function activateWithDeps(orca: OrcaWorkerApi, deps: BridgeDeps): P
   })
   orca.panels.handle('bridge.exportLogs', () => manager.exportLogs())
   orca.panels.handle('bridge.focusedBot', () => manager.focusedBot())
+  // For a role's "may run only these" list in the panel: ids and names only.
+  orca.panels.handle('bridge.listAutomations', async () =>
+    toPlainJson((await deps.orcaCli.listAutomations()).map((a) => ({ id: a.id, name: a.name })))
+  )
 
   orca.commands.register('telegram-bridge.togglePolling', () => manager.togglePolling())
   orca.commands.register('telegram-bridge.openPanel', () => manager.openPanel())

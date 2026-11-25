@@ -1,13 +1,44 @@
 import { defineCheck } from 'orca/testing'
+import { defaultRoles } from './roles'
 import type { FocusedBot } from './protocol'
 
 // The panel shows the bridges of the bot selected in Orca's sidebar; a check has no sidebar.
 const ASSISTANT_SELECTED: FocusedBot = { kind: 'bot', bot: { id: 'bot-1', name: 'Assistant' } }
 const FOCUS_UNKNOWN: FocusedBot = { kind: 'unknown', reason: 'This Orca does not name the focused workspace.' }
+// Plain JSON, as storage holds it: a custom role besides the three built-in ones.
+const CHECK_ROLES = [
+  ...defaultRoles(),
+  { id: 'r-team', name: 'Team', permissions: ['chat', 'status', 'sync'], prompt: 'Keep answers short.', runAutomationIds: null }
+]
 
 export default defineCheck({
   // A new install: no bridges, no token, no logs.
   fresh: {},
+  // A bridge stored before roles existed: everyone listed keeps Full access, and the review banner shows.
+  afterUpdate: {
+    requests: { 'bridge.focusedBot': ASSISTANT_SELECTED },
+    secrets: { 'botToken.b1': '123456:CHECK_TOKEN' },
+    storage: {
+      bridges: [
+        {
+          id: 'b1',
+          name: 'CI',
+          enabled: false,
+          orcaBot: 'Assistant',
+          allowedUserIds: '123456789, 987654321',
+          proxyUrl: '',
+          replyTimeoutSec: 300,
+          syncOrcaOutbound: false,
+          replyLanguage: 'en',
+          allowGroups: false,
+          voiceEnabled: false,
+          voiceProvider: 'openrouter',
+          voiceModel: '',
+          groupMode: 'addressed'
+        }
+      ]
+    }
+  },
   // Orca did not say which bot is selected: every bridge, with the bridge filter in Logs.
   focusUnknown: {
     requests: { 'bridge.focusedBot': FOCUS_UNKNOWN }
@@ -30,6 +61,9 @@ export default defineCheck({
           orcaBot: 'Assistant',
           allowedUserIds: '123456789, -1001234567890',
           proxyUrl: 'http://127.0.0.1:7890',
+          roles: CHECK_ROLES,
+          roleAssignments: { '123456789': 'full', '-1001234567890': 'r-team' },
+          rolesReviewed: true,
           replyTimeoutSec: 300,
           syncOrcaOutbound: true,
           replyLanguage: 'pt-BR',
@@ -45,6 +79,9 @@ export default defineCheck({
           enabled: false,
           orcaBot: '',
           allowedUserIds: '',
+          roles: defaultRoles(),
+          roleAssignments: {},
+          rolesReviewed: true,
           proxyUrl: '',
           replyTimeoutSec: 300,
           syncOrcaOutbound: false,

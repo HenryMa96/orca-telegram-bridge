@@ -149,6 +149,9 @@ export type TelegramBotCommand = {
   description: string
 }
 
+// Telegram's BotCommandScopeChat: the menu shown in one chat (a user's private chat or a group).
+export type TelegramBotCommandScope = { type: 'chat'; chat_id: number | string }
+
 export interface TelegramClient {
   getMe(token: string, options?: TelegramRequestOptions): Promise<TelegramUser>
   setMyCommands(
@@ -156,6 +159,15 @@ export interface TelegramClient {
     commands: TelegramBotCommand[],
     options?: TelegramRequestOptions,
     // Two-letter ISO 639-1 code: the menu for users with that app language; absent = everyone else.
+    languageCode?: string,
+    // Absent = the default menu for every chat without a menu of its own.
+    scope?: TelegramBotCommandScope
+  ): Promise<boolean>
+  // Removes a menu, so that chat falls back to the default one.
+  deleteMyCommands(
+    token: string,
+    options?: TelegramRequestOptions,
+    scope?: TelegramBotCommandScope,
     languageCode?: string
   ): Promise<boolean>
   getUpdates(
@@ -710,11 +722,19 @@ export function createTelegramClient(): TelegramClient {
     getMe(token, options) {
       return callTelegramApi<TelegramUser>(token, 'getMe', undefined, options)
     },
-    setMyCommands(token, commands, options, languageCode) {
+    setMyCommands(token, commands, options, languageCode, scope) {
       return callTelegramApi<boolean>(
         token,
         'setMyCommands',
-        languageCode ? { commands, language_code: languageCode } : { commands },
+        { commands, ...(scope ? { scope } : {}), ...(languageCode ? { language_code: languageCode } : {}) },
+        options
+      )
+    },
+    deleteMyCommands(token, options, scope, languageCode) {
+      return callTelegramApi<boolean>(
+        token,
+        'deleteMyCommands',
+        { ...(scope ? { scope } : {}), ...(languageCode ? { language_code: languageCode } : {}) },
         options
       )
     },

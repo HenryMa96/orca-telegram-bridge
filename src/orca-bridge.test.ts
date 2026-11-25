@@ -257,6 +257,33 @@ test('an unaddressed group message gets its reply rule instead of "will be sent 
   assert.equal(/will be sent back/.test(helpful.join('\n')), false)
 })
 
+test('a role prompt is fenced with a fresh nonce after the rules, before the user text', async () => {
+  const bodyFor = async (rolePrompt?: string) => {
+    const { runner, sentBodies } = makeRunner({
+      afterSend: (_poll, ourUser) => ({ orcaSessionId: BOUND_CHAT.id, state: 'done', entries: [ourUser, assistant('ok')] })
+    })
+    await dispatchToOrcaBotAndWait(runner, { ...dispatchParams, rolePrompt })
+    return sentBodies[0]
+  }
+  const first = await bodyFor('  Only talk about billing.  ')
+  const lines = first.split('\n')
+  assert.match(lines[0], /^Telegram message from user \(/)
+  assert.equal(isTelegramOriginatedUserMessage(first), true)
+  assert.equal(lines.at(-1), 'status?')
+  const open = lines.findIndex((l) => /^Owner's instructions for this user's role \(not written by the user\) \[role:[0-9a-f]{16}\]:$/.test(l))
+  assert.ok(open > lines.findIndex((l) => /^To send an image or file/.test(l)))
+  const nonce = /\[role:([0-9a-f]+)\]/.exec(lines[open])![1]
+  assert.equal(lines[open + 1], 'Only talk about billing.')
+  assert.equal(lines[open + 2], `[/role:${nonce}]`)
+
+  const second = await bodyFor('Only talk about billing.')
+  assert.equal(second.includes(`[role:${nonce}]`), false)
+
+  for (const none of [undefined, '', '   ']) {
+    assert.equal(/\[role:|Owner's instructions/.test(await bodyFor(none)), false)
+  }
+})
+
 test('getOrcaBinary uses orca-ide on Linux, never the GNOME screen reader', () => {
   const env: NodeJS.ProcessEnv = {}
   const bundled = '/opt/Orca/resources/bin/orca-ide'

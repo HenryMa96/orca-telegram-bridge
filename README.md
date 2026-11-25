@@ -150,7 +150,7 @@ Each bridge has its own **Who can talk** choice (Setup tab → the bridge's **Ed
 - **Anyone on Telegram: open to everyone.** Any Telegram user who finds your bot, and any group it is in, can use it. The panel shows an **Open to everyone** warning on the card.
 - **Only these people and groups: restricted.** Only the listed IDs can use the bot. A user ID allows that person in private chats and in any group. A group ID (a negative number, e.g. `-1001234567890`) allows every member of that group. Saving this choice needs at least one ID.
 
-Every person who can use the bot uses its Orca bot with your rights: they can chat with it, list and bind that Orca bot's existing chats (`/chats`, `/bind`) and run automations. Keep the bot open only if you accept that, or restrict it.
+Each listed person or group has a **role** (see [Roles](#roles)) that sets what they may do. With **Anyone on Telegram**, everyone not listed gets the **Stranger** role, which can chat but can never run automations, change sync or reach your Orca chats.
 
 [Orca → Telegram sync](#features) works only with a restricted list. While the bot is open to everyone, sync is paused, so a stranger who binds one of your Orca chats does not receive what you write in Orca.
 
@@ -158,11 +158,24 @@ Every person who can use the bot uses its Orca bot with your rights: they can ch
 
 1. Ask each person to send any message to the bot (in a group, mention the bot).
 2. While the bot is open, it answers them. To restrict it, add at least one ID: your own first. Your ID: send a message to the bot, then read it in the panel's **Chats** tab (`TG <ID> -> …`), or ask a bot such as `@userinfobot`.
-3. Choose **Only these people and groups**, type the IDs separated by commas or spaces, and click **Save**.
+3. Choose **Only these people and groups**, add a row per ID (**Add person or group**), pick each one's role, and click **Save**.
 
-Once the list is restricted, an unknown person gets one short reply with their Telegram ID (at most once a minute), and the panel shows a banner: `User <ID> messaged your bot but is not in the allowlist.` Click **Allow \<ID\>** to add them. The banner shows only the latest unknown person.
+Once the list is restricted, an unknown person gets one short reply with their Telegram ID (at most once a minute), and the panel shows a banner: `User <ID> messaged your bot but is not in the allowlist.` Click **Allow \<ID\>** to add them with the **Member** role. The banner shows only the latest unknown person.
 
 Removing an ID stops the bot from answering that person or group, and stops sync to their chats. Choosing **Anyone on Telegram** opens the bot to everyone again.
+
+### Roles
+
+Each bridge has its own roles (Setup tab → the bridge's **Edit** → **Roles**). A role has:
+
+- **What it may do**, one checkbox each: chat with the bot, `/status`, `/bots`, `/new`, `/home` and `/chats` + `/bind` (each separately **in private** and **in groups**, so a teammate can start a fresh private chat without resetting the group's shared chat), `/rename`, `/sync`, `/automations` and `/run`. With `/run`, choose **All** automations or **Only these**. `/help` always works and lists only what the role may do; the `/` menu each person sees follows their role too.
+- **An extra prompt for the Orca bot**, added to every message from people with that role, for example "Finance user: read-only, answer in plain Spanish". It is a hint to the bot, not a lock: only the checkboxes are enforced by the bridge. People never see it.
+
+Three roles come built in: **Full access** (everything), **Member** (chat, `/status`, `/new` in their own private chat) and **Stranger** (for **Anyone on Telegram**; it can never get the risky commands). Add your own with **Add role**, or **Copy roles from** another bridge.
+
+Which role applies: a listed person's own role, also in groups; a group's role for its members who are not listed; else **Member** (restricted) or **Stranger** (open). A refused command or button gets one plain line: "This isn't available for you. Ask the bot's owner."
+
+After the update that brought roles, everyone already on the list keeps **Full access**, so nothing changes until you choose otherwise; the panel asks you to review their roles once.
 
 ### Use the bot in a group
 

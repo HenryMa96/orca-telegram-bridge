@@ -17,6 +17,7 @@ import {
   type OrcaSessionRead
 } from './orca-bridge'
 import type { BridgeLogEntry, BridgeState, ExportLogsResult, SaveConfigInput } from './protocol'
+import { defaultRoles, type BridgeRole } from './roles'
 import { extractTablesFromMarkdown } from './table-render'
 import {
   markdownToTelegramHtml,
@@ -63,9 +64,12 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
   const outbox: string[] = []
   const sentActions: { chatId: number | string; action: string }[] = []
   const answeredCallbacks: { callbackQueryId: string; text?: string; showAlert?: boolean }[] = []
-  // Default-language menus only (what most tests count); every menu with its language is in registeredMenus.
+  // Default-scope menus only: default language (what most tests count), and every menu with its
+  // language in registeredMenus. Per-chat menus are in chatMenus, removed ones in deletedChatMenus.
   const registeredCommands: TelegramBotCommand[][] = []
   const registeredMenus: { languageCode: string | null; commands: TelegramBotCommand[] }[] = []
+  const chatMenus: { chatId: number | string; languageCode: string | null; commands: TelegramBotCommand[] }[] = []
+  const deletedChatMenus: { chatId: number | string; languageCode: string | null }[] = []
   const sentToBots: { botName: string; chatId: string; subject: string; body: string }[] = []
   const renamedChats: { sessionId: string; name: string }[] = []
   const triggeredAutomations: string[] = []
@@ -92,9 +96,17 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async getMe() {
       return { id: 100000001, is_bot: true, first_name: 'DemoBot', username: 'demo_orca_bot' }
     },
-    async setMyCommands(_token, commands, _options, languageCode) {
+    async setMyCommands(_token, commands, _options, languageCode, scope) {
+      if (scope) {
+        chatMenus.push({ chatId: scope.chat_id, languageCode: languageCode ?? null, commands })
+        return true
+      }
       registeredMenus.push({ languageCode: languageCode ?? null, commands })
       if (!languageCode) registeredCommands.push(commands)
+      return true
+    },
+    async deleteMyCommands(_token, _options, scope, languageCode) {
+      if (scope) deletedChatMenus.push({ chatId: scope.chat_id, languageCode: languageCode ?? null })
       return true
     },
     async getUpdates() {
@@ -277,6 +289,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     answeredCallbacks,
     registeredCommands,
     registeredMenus,
+    chatMenus,
+    deletedChatMenus,
     sentToBots,
     renamedChats,
     triggeredAutomations,
@@ -916,7 +930,7 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   })
 
   const deps = makeMockDeps()
-  const { controller, worker: capturedWorker } = await mountController(host, {
+  const { manager, controller, worker: capturedWorker } = await mountController(host, {
     telegram: deps.telegram,
     orcaCli: deps.orcaCli,
     pollIntervalMs: 10
@@ -944,8 +958,11 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   assert.equal(controller.view().lastBlockedUserId, '777888')
   assert.match(deps.sentMessages[0].text, /777888/)
 
-  // 2. Allow the user ID and send a real message -> creates new Orca chat & replies
+  // 2. Allow the user ID and send a real message -> creates new Orca chat & replies. Allow gives
+  // the Member role; the owner then gives this person Full access for the commands below.
   await controller.allowUserId('777888')
+  assert.equal(controller.view().config.roleAssignments['777888'], 'member')
+  await manager.saveConfig(saveInput(controller, { roleAssignments: { '42': 'full', '777888': 'full' } }))
   await controller.handleIncomingUpdate({
     update_id: 2,
     message: {
@@ -1765,7 +1782,7 @@ type BridgeSeed = {
   token?: string
   voiceKey?: string
   config?: Record<string, JsonValue>
-  state?: Partial<Record<'offset' | 'bindings' | 'syncCursors' | 'lastBlocked', JsonValue>>
+  state?: Partial<Record<'offset' | 'bindings' | 'syncCursors' | 'lastBlocked' | 'commandScopes', JsonValue>>
 }
 
 function bridgesHost(
@@ -2709,6 +2726,10 @@ test('a 0.4.0 setup becomes "Bridge 1" with its token, settings, chats and offse
       enabled: true,
       orcaBot: 'Daily standup notes',
       allowedUserIds: '777888',
+      // Roles did not exist in 0.4.0: everyone allowed keeps full access until the owner reviews.
+      roles: defaultRoles(),
+      roleAssignments: { '777888': 'full' },
+      rolesReviewed: false,
       proxyUrl: '',
       replyTimeoutSec: 240,
       syncOrcaOutbound: true,
@@ -4028,4 +4049,330 @@ test('Orca -> Telegram sync sends the attachments of a bot reply too', async () 
       await worker.deactivate()
     }
   })
+})
+
+// Roles as storage holds them (plain JSON).
+function asJson(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value)) as JsonValue
+}
+
+// A bridge stored after roles existed (default roles unless `config.roles` says otherwise). It knows
+// its @username, so group lines addressed to it are read.
+async function withRoles(
+  config: Record<string, JsonValue>,
+  run: (controller: BridgeRuntime, deps: ReturnType<typeof makeMockDeps>, manager: BridgeManager) => Promise<void>,
+  orcaCli: Partial<OrcaCliRunner> = {}
+): Promise<void> {
+  const host = bridgesHost([{ id: 'b-roles001', token: '123456:TEST_TOKEN', config: { roles: asJson(defaultRoles()), ...config } }])
+  const deps = makeMockDeps({ orcaCli })
+  const { manager, controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    await controller.testConnection()
+    await run(controller, deps, manager)
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+}
+
+function buttonUpdate(updateId: number, userId: number, chatId: number, data: string): TelegramUpdate {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `cb-${updateId}`,
+      from: { id: userId, is_bot: false, first_name: 'User' },
+      message: {
+        message_id: 901,
+        chat: chatId < 0 ? { id: chatId, type: 'supergroup' } : { id: chatId, type: 'private' },
+        date: 2000
+      },
+      data
+    }
+  }
+}
+
+test('a bridge stored before roles keeps every listed id with Full access until roles are saved', async () => {
+  const host = bridgesHost([{ id: 'b-old00001', token: '123456:TEST_TOKEN', config: { allowedUserIds: `777888, ${GROUP_ID}` } }])
+  const deps = makeMockDeps()
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    const { config } = controller.view()
+    assert.deepEqual(config.roleAssignments, { '777888': 'full', [String(GROUP_ID)]: 'full' })
+    assert.equal(config.rolesReviewed, false)
+    assert.deepEqual(config.roles.map((r) => r.id), ['full', 'member', 'stranger'])
+
+    // A save without roles keeps them as they are, still to be reviewed.
+    await manager.saveConfig(saveInput(controller, { replyTimeoutSec: 120 }))
+    assert.equal(controller.view().config.rolesReviewed, false)
+
+    await manager.saveConfig(
+      saveInput(controller, { roleAssignments: { '777888': 'full', [String(GROUP_ID)]: 'member', '5': 'no-such-role' } })
+    )
+    const saved = controller.view().config
+    assert.equal(saved.rolesReviewed, true)
+    assert.deepEqual(saved.roleAssignments, { '777888': 'full', [String(GROUP_ID)]: 'member' })
+    const stored = (host.data().storage.bridges as { rolesReviewed: boolean }[])[0]
+    assert.equal(stored.rolesReviewed, true)
+
+    // A new bridge has nothing to review.
+    const added = (await worker.request('bridge.add', {})) as { bridgeId: string; state: BridgeState }
+    const fresh = added.state.bridges.find((b) => b.id === added.bridgeId)?.config
+    assert.equal(fresh?.rolesReviewed, true)
+    assert.equal(Object.keys(fresh?.roleAssignments ?? { x: 'x' }).length, 0)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('an open bridge stored before roles gives Full access to everyone who already chatted in private', async () => {
+  const binding = { botId: 'bot-1', botName: 'Assistant', orcaChatId: 'home-chat-1', updatedAt: 1000 }
+  const host = bridgesHost([
+    {
+      id: 'b-open0001',
+      token: '123456:TEST_TOKEN',
+      config: { allowedUserIds: '' },
+      state: {
+        bindings: [
+          { ...binding, tgChatId: '555', ownerUserId: '555' },
+          // Someone who only wrote in a group is not carried over.
+          { ...binding, tgChatId: String(GROUP_ID), ownerUserId: '556' }
+        ]
+      }
+    }
+  ])
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    assert.deepEqual(controller.view().config.roleAssignments, { '555': 'full' })
+    assert.equal(controller.view().config.rolesReviewed, false)
+    const stored = (host.data().storage.bridges as { roleAssignments: Record<string, string> }[])[0]
+    assert.deepEqual(stored.roleAssignments, { '555': 'full' })
+
+    await within(controller.handleIncomingUpdate(textUpdate(1, 555, '/run auto-1')), '/run from a former user')
+    assert.deepEqual(deps.triggeredAutomations, ['auto-1'])
+
+    // Anyone new on an open bridge is a Stranger.
+    await within(controller.handleIncomingUpdate(textUpdate(2, 999, '/run auto-1')), '/run from a stranger')
+    assert.equal(deps.triggeredAutomations.length, 1)
+    assert.equal(deps.sentMessages.at(-1)?.text, t('en').notAllowedForRole)
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('a Member is refused /run, /chats, /sync, /bind, /home and group /new with one line in the chat language', async () => {
+  await withRoles({ allowedUserIds: '42', roleAssignments: { '42': 'member' }, replyLanguage: 'pt-BR' }, async (controller, deps, manager) => {
+    const refusal = t('pt-BR').notAllowedForRole
+    const refused = ['/run auto-1', '/chats', '/sync on', '/bind home-chat-1', '/home']
+    for (const [i, text] of refused.entries()) {
+      await within(controller.handleIncomingUpdate(textUpdate(i + 1, 42, text)), text)
+    }
+    assert.deepEqual(deps.sentMessages.map((m) => m.text), refused.map(() => refusal))
+    assert.equal(deps.triggeredAutomations.length, 0)
+    assert.equal(controller.view().config.syncOrcaOutbound, false)
+    assert.equal(deps.sentToBots.length, 0)
+    const log = manager.getState().logs.find((e) => e.level === 'info' && e.message.startsWith('Refused /run'))
+    assert.ok(log?.message.includes('role "Member"'), JSON.stringify(log))
+
+    // /new is allowed in a private chat, not in a group.
+    await within(controller.handleIncomingUpdate(textUpdate(10, 42, '/new')), 'private /new')
+    assert.equal(deps.sentMessages.at(-1)?.text, t('pt-BR').contextReset('Assistant'))
+    await within(controller.handleIncomingUpdate(groupUpdate(11, 42, '/new')), 'group /new')
+    assert.equal(deps.sentMessages.at(-1)?.text, refusal)
+    assert.equal(deps.sentMessages.at(-1)?.chatId, GROUP_ID)
+
+    // /help lists only what the role may use.
+    await within(controller.handleIncomingUpdate(textUpdate(12, 42, '/help')), '/help')
+    const help = deps.sentMessages.at(-1)?.text ?? ''
+    assert.ok(help.includes('/new') && help.includes('/status'), help)
+    assert.ok(!help.includes('/run') && !help.includes('/chats') && !help.includes('/sync'), help)
+  })
+})
+
+test('a refused button is answered with the refusal and does nothing', async () => {
+  await withRoles({ allowedUserIds: '42', roleAssignments: { '42': 'member' } }, async (controller, deps) => {
+    for (const [i, data] of ['r:auto-1', 's:on', 'b:home-chat-1', 'c:home'].entries()) {
+      await within(controller.handleIncomingUpdate(buttonUpdate(i + 1, 42, 42, data)), data)
+    }
+    assert.deepEqual(
+      deps.answeredCallbacks.map((a) => a.text),
+      [1, 2, 3, 4].map(() => t('en').notAllowedForRole)
+    )
+    assert.equal(deps.triggeredAutomations.length, 0)
+    assert.equal(controller.view().config.syncOrcaOutbound, false)
+    assert.equal(controller.view().bindings.length, 0)
+    assert.equal(deps.sentMessages.length, 0)
+
+    // A button the role allows still acts.
+    await within(controller.handleIncomingUpdate(buttonUpdate(5, 42, 42, 'c:new')), 'c:new')
+    assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').contextResetToast)
+  })
+})
+
+test("in a group a listed person's own role applies; an unlisted member gets the group's role", async () => {
+  await withRoles(
+    { allowedUserIds: `${GROUP_ID}, 42`, roleAssignments: { [String(GROUP_ID)]: 'member', '42': 'full' } },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(groupUpdate(1, 42, '/run auto-1')), 'full /run')
+      assert.deepEqual(deps.triggeredAutomations, ['auto-1'])
+
+      await within(controller.handleIncomingUpdate(groupUpdate(2, 555, '/run auto-1')), 'member /run')
+      assert.equal(deps.triggeredAutomations.length, 1)
+      assert.equal(deps.sentMessages.at(-1)?.text, t('en').notAllowedForRole)
+
+      const before = deps.sentMessages.length
+      await within(controller.handleIncomingUpdate(groupUpdate(3, 555, '/status')), 'member /status')
+      assert.equal(deps.sentMessages.length, before + 1)
+      assert.notEqual(deps.sentMessages.at(-1)?.text, t('en').notAllowedForRole)
+    }
+  )
+})
+
+test("/run, Run buttons and /automations keep to the role's automation list; no Run buttons without run", async () => {
+  const ops: BridgeRole = { id: 'ops', name: 'Ops', permissions: ['chat', 'automations', 'run'], prompt: '', runAutomationIds: ['auto-2'] }
+  const viewer: BridgeRole = { id: 'viewer', name: 'Viewer', permissions: ['chat', 'automations'], prompt: '', runAutomationIds: null }
+  const listAutomations = async () => [
+    { id: 'auto-1', name: 'Daily backup', enabled: true, lastRunStatus: 'completed' },
+    { id: 'auto-2', name: 'Nightly report', enabled: true, lastRunStatus: null }
+  ]
+  await withRoles(
+    {
+      allowedUserIds: '42, 43',
+      roles: asJson([...defaultRoles(), ops, viewer]),
+      roleAssignments: { '42': 'ops', '43': 'viewer' }
+    },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 42, '/automations')), 'ops /automations')
+      const list = deps.sentMessages.at(-1)
+      assert.ok(list?.text.includes('auto-2') && !list.text.includes('auto-1'), list?.text)
+      assert.deepEqual(
+        (list?.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data),
+        ['r:auto-2']
+      )
+
+      await within(controller.handleIncomingUpdate(textUpdate(2, 42, '/run auto-1')), '/run off the list')
+      assert.equal(deps.sentMessages.at(-1)?.text, t('en').notAllowedForRole)
+      await within(controller.handleIncomingUpdate(textUpdate(3, 42, '/run auto-2')), '/run on the list')
+      assert.deepEqual(deps.triggeredAutomations, ['auto-2'])
+
+      await within(controller.handleIncomingUpdate(buttonUpdate(4, 42, 42, 'r:auto-1')), 'button off the list')
+      assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').notAllowedForRole)
+      await within(controller.handleIncomingUpdate(buttonUpdate(5, 42, 42, 'r:auto-2')), 'button on the list')
+      assert.deepEqual(deps.triggeredAutomations, ['auto-2', 'auto-2'])
+
+      await within(controller.handleIncomingUpdate(textUpdate(6, 43, '/automations')), 'viewer /automations')
+      const viewed = deps.sentMessages.at(-1)
+      assert.ok(viewed?.text.includes('auto-1') && viewed.text.includes('auto-2'), viewed?.text)
+      assert.equal(viewed?.replyMarkup, undefined)
+    },
+    { listAutomations }
+  )
+})
+
+test('a role without chat is refused in a private chat and ignored in a group; its unknown commands too', async () => {
+  const quiet: BridgeRole = { id: 'quiet', name: 'Quiet', permissions: ['status'], prompt: '', runAutomationIds: null }
+  await withRoles(
+    { allowedUserIds: `42, ${GROUP_ID}`, roles: asJson([...defaultRoles(), quiet]), roleAssignments: { '42': 'quiet' } },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 42, 'hello')), 'private message')
+      await within(controller.handleIncomingUpdate(textUpdate(2, 42, '/whatever now')), 'unknown command')
+      assert.deepEqual(deps.sentMessages.map((m) => m.text), [t('en').notAllowedForRole, t('en').notAllowedForRole])
+
+      await within(controller.handleIncomingUpdate(groupUpdate(3, 42, '@demo_orca_bot hello')), 'group mention')
+      assert.equal(deps.sentMessages.length, 2)
+      assert.equal(deps.sentToBots.length, 0)
+
+      await within(controller.handleIncomingUpdate(textUpdate(4, 42, '/status')), 'allowed command')
+      assert.equal(deps.sentMessages.length, 3)
+      assert.notEqual(deps.sentMessages.at(-1)?.text, t('en').notAllowedForRole)
+    }
+  )
+})
+
+test("the role's prompt reaches the Orca bot fenced with a nonce, before the user's words, never Telegram", async () => {
+  const roles = defaultRoles().map((r) => (r.id === 'member' ? { ...r, prompt: 'Only discuss the garden.' } : r))
+  await withRoles({ allowedUserIds: '42', roles: asJson(roles), roleAssignments: { '42': 'member' } }, async (controller, deps) => {
+    await within(controller.handleIncomingUpdate(textUpdate(1, 42, 'what should I plant?')), 'message')
+    const lines = deps.sentToBots[0].body.split('\n')
+    assert.match(lines[0], /^Telegram message from user \(/)
+    const open = lines.findIndex((l) => /\[role:[0-9a-f]+\]:$/.test(l))
+    assert.ok(open > 0, lines.join('\n'))
+    const nonce = /\[role:([0-9a-f]+)\]/.exec(lines[open])?.[1]
+    assert.equal(lines[open + 1], 'Only discuss the garden.')
+    assert.equal(lines[open + 2], `[/role:${nonce}]`)
+    assert.equal(lines.at(-1), 'what should I plant?')
+    assert.ok(deps.sentMessages.length > 0)
+    assert.ok(!deps.sentMessages.some((m) => m.text.includes('garden') || m.text.includes('[role:')))
+  })
+})
+
+test('menus: a default menu per access mode, one per assigned id, and a removed id loses its own', async () => {
+  const host = bridgesHost([
+    {
+      id: 'b-menus001',
+      token: '123456:TEST_TOKEN',
+      config: {
+        enabled: true,
+        allowedUserIds: `42, 43, ${GROUP_ID}`,
+        roles: asJson(defaultRoles()),
+        roleAssignments: { '42': 'full', '43': 'member', [String(GROUP_ID)]: 'member' }
+      },
+      // 99 had a menu of its own before and no longer has a role.
+      state: { commandScopes: ['42', '99'] }
+    }
+  ])
+  // Each long poll stays open until the test answers it, as Telegram does while no message arrives.
+  const polls: PromiseWithResolvers<TelegramUpdate[]>[] = []
+  const deps = makeMockDeps({
+    telegram: {
+      getUpdates(_token, _params, options) {
+        const poll = Promise.withResolvers<TelegramUpdate[]>()
+        polls.push(poll)
+        options?.signal?.addEventListener('abort', () => poll.resolve([]), { once: true })
+        return poll.promise
+      }
+    }
+  })
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  const names = (commands: TelegramBotCommand[] | undefined) => (commands ?? []).map((c) => c.command)
+  const menuOf = (chatId: string) => deps.chatMenus.filter((m) => String(m.chatId) === chatId)
+  const scopes = () => [...((host.data().storage['tg.b-menus001.commandScopes'] as string[] | undefined) ?? [])].sort()
+  try {
+    await until(() => polls.length === 1, 'the first poll')
+    // Restricted: people without a role of their own are Members.
+    assert.deepEqual(names(deps.registeredCommands[0]), ['help', 'new', 'status'])
+    assert.equal(deps.registeredMenus.length, 4)
+    assert.deepEqual(menuOf('42').map((m) => m.languageCode), [null, 'pt', 'es', 'zh'])
+    assert.ok(names(menuOf('42')[0]?.commands).includes('run'))
+    assert.deepEqual(names(menuOf('43')[0]?.commands), ['help', 'new', 'status'])
+    // In a group, /new needs the group permission, which Member does not have.
+    assert.deepEqual(names(menuOf(String(GROUP_ID))[0]?.commands), ['help', 'status'])
+    assert.deepEqual(
+      deps.deletedChatMenus.map((m) => `${m.chatId}:${m.languageCode}`),
+      ['99:null', '99:pt', '99:es', '99:zh']
+    )
+    assert.deepEqual(scopes(), ['-100500', '42', '43'].sort())
+
+    // Open to everyone: the default menu is the Stranger's; 43 lost its role and its menu.
+    await within(
+      manager.saveConfig(
+        saveInput(controller, { enabled: true, allowedUserIds: '', roleAssignments: { '42': 'full', [String(GROUP_ID)]: 'member' } })
+      ),
+      'save without 43'
+    )
+    polls[0].resolve([])
+    await until(() => polls.length === 2, 'the menus sent again')
+    assert.deepEqual(names(deps.registeredCommands[1]), ['help', 'new'])
+    assert.deepEqual(deps.deletedChatMenus.slice(4).map((m) => String(m.chatId)), ['43', '43', '43', '43'])
+    assert.deepEqual(scopes(), ['-100500', '42'].sort())
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
 })

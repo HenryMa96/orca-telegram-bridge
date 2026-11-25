@@ -175,6 +175,34 @@ test('setMyCommands sends language_code only for a language menu', async () => {
   assert.deepEqual(JSON.parse(spanish.body), { commands: [{ command: 'help', description: 'Ayuda' }], language_code: 'es' })
 })
 
+// A misspelled scope field would quietly set the menu for every chat instead of one.
+test('setMyCommands and deleteMyCommands send a chat scope as Telegram expects it', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: true, result: true }))
+    },
+    async (proxyUrl) => {
+      const commands = [{ command: 'help', description: 'Help' }]
+      await client.setMyCommands(TOKEN, commands, { proxyUrl }, 'pt', { type: 'chat', chat_id: 42 })
+      assert.equal(await client.deleteMyCommands(TOKEN, { proxyUrl }, { type: 'chat', chat_id: -100500 }, 'pt'), true)
+      await client.deleteMyCommands(TOKEN, { proxyUrl }, { type: 'chat', chat_id: 7 })
+    }
+  )
+  const [set, deleted, deletedNoLanguage] = requests
+  assert.match(set.path, /\/setMyCommands$/)
+  assert.deepEqual(JSON.parse(set.body), {
+    commands: [{ command: 'help', description: 'Help' }],
+    scope: { type: 'chat', chat_id: 42 },
+    language_code: 'pt'
+  })
+  assert.match(deleted.path, /\/deleteMyCommands$/)
+  assert.deepEqual(JSON.parse(deleted.body), { scope: { type: 'chat', chat_id: -100500 }, language_code: 'pt' })
+  assert.deepEqual(JSON.parse(deletedNoLanguage.body), { scope: { type: 'chat', chat_id: 7 } })
+})
+
 test('an https:// proxy URL fails with a clear message', async () => {
   await assert.rejects(
     client.getMe(TOKEN, { proxyUrl: 'https://127.0.0.1:1', timeoutMs: 1000 }),

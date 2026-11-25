@@ -1,9 +1,11 @@
 import {
   atom,
   Badge,
+  Box,
   Button,
   Callout,
   Card,
+  Checkbox,
   Code,
   CodeView,
   Collapsible,
@@ -11,6 +13,7 @@ import {
   files,
   Heading,
   host,
+  IconButton,
   Input,
   List,
   ListItem,
@@ -28,11 +31,13 @@ import {
   Tab,
   Tabs,
   Text,
+  Textarea,
   type Atom,
   type IconName,
   type PanelContext
 } from 'orca'
 import type {
+  BridgeConfig,
   BridgeConnectionStatus,
   BridgeLogEntry,
   BridgeState,
@@ -44,6 +49,17 @@ import type {
   VoiceProvider
 } from './protocol'
 import type { ReplyLanguageSetting } from './i18n'
+import {
+  BUILT_IN_ROLE_IDS,
+  FULL_ROLE_ID,
+  MEMBER_ROLE_ID,
+  normalizeRoles,
+  ROLE_PERMISSIONS,
+  STRANGER_FORBIDDEN,
+  STRANGER_ROLE_ID,
+  type BridgeRole,
+  type RolePermission
+} from './roles'
 
 type LogFilter = 'all' | 'errors' | 'warnings' | 'debug'
 // Who can talk to the bot: only the listed Telegram IDs, or anyone (saved as an empty list).
@@ -66,12 +82,31 @@ let focusRequest = 0
 const editingBridgeId = atom<string | null>(null)
 // The bridge whose Remove was pressed once; a second press on Confirm remove removes it.
 const confirmRemoveId = atom<string | null>(null)
+// Roles whose section is open in the editor; Collapsible is driven from here so it opens and
+// closes predictably.
+const openRoleIds = atom<string[]>([])
 
 const tokenDraft = atom('')
 const accessModeDraft = atom<AccessMode>('restricted')
-const allowedIdsDraft = atom('')
-// Shown under the IDs field when Save is refused because the list has no valid ID.
+// One row per Telegram user or group ID with its role. `key` keeps each row's field in place
+// while rows above it are removed.
+type AssignmentRow = { key: string; id: string; roleId: string }
+const assignmentRowsDraft = atom<AssignmentRow[]>([])
+let rowSeq = 0
+// Shown under the rows when Save is refused: no valid ID, or a row that is not an ID.
 const allowedIdsError = atom<string | null>(null)
+const rolesDraft = atom<BridgeRole[]>([])
+// Why rows changed role without being touched (their role was deleted or copied over).
+const rolesNote = atom<string | null>(null)
+// The bridge whose roles "Copy" takes; '' = none chosen.
+const copyRolesFrom = atom('')
+// Orca's automations for the "Only these" run list, loaded when Roles is opened.
+type AutomationsLoad =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; items: { id: string; name: string }[] }
+  | { status: 'failed'; reason: string }
+const automations = atom<AutomationsLoad>({ status: 'idle' })
 // Why the last Save failed; shown only next to the editor's buttons, not again at the top.
 const saveError = atom<string | null>(null)
 const proxyUrlDraft = atom('')
@@ -95,6 +130,8 @@ const formDirty = atom(false)
 const MAX_LABEL = 500
 const NEW_BOT_LABEL = 'New Telegram bot'
 const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
+const REVIEW_ROLES = 'After the update everyone on the list kept full access. Review their roles.'
+const PROMPT_HELPER = 'A hint to the bot, not a lock: only the checkboxes above are enforced. People never see it.'
 const ALL_NEEDS_IDS =
   'Following the conversation works only with "Only these people and groups". While anyone can talk, the bot reads only messages for it.'
 
@@ -114,6 +151,25 @@ const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguageSetting; label: string
 const ACCESS_OPTIONS: Array<{ value: AccessMode; label: string }> = [
   { value: 'restricted', label: 'Only these people and groups' },
   { value: 'open', label: 'Anyone on Telegram' }
+]
+const PERMISSION_LABEL: Record<RolePermission, string> = {
+  chat: 'Chat with the bot',
+  status: '/status',
+  bots: '/bots',
+  newPrivate: '/new in private',
+  newGroup: '/new in groups',
+  homePrivate: '/home in private',
+  homeGroup: '/home in groups',
+  bindPrivate: '/chats and /bind in private',
+  bindGroup: '/chats and /bind in groups',
+  rename: '/rename',
+  sync: '/sync',
+  automations: '/automations',
+  run: '/run'
+}
+const RUN_SCOPE_OPTIONS = [
+  { value: 'all', label: 'All' },
+  { value: 'only', label: 'Only these' }
 ]
 // One choice says both what the bot reads in a group and when it answers; it maps to allowGroups,
 // groupMode and groupReply.
@@ -179,6 +235,95 @@ function findBridge(state: BridgeState, bridgeId: string | null): BridgeView | u
   return bridgeId ? state.bridges.find((b) => b.id === bridgeId) : undefined
 }
 
+function isTelegramId(id: string): boolean {
+  return /^-?\d+$/.test(id)
+}
+
+// The valid IDs of a saved list, as the worker reads it.
+function telegramIds(raw: string): string[] {
+  return [...new Set(raw.split(/[\s,;]+/).filter(isTelegramId))]
+}
+
+function newRow(id: string, roleId: string): AssignmentRow {
+  rowSeq += 1
+  return { key: `row-${rowSeq}`, id, roleId }
+}
+
+// Restricted: the listed IDs, each with its role (Member when it has none, as the worker reads
+// it). Open: the IDs that have a role. Assignments outside a restricted list are not shown, so
+// a save never lets them talk.
+function rowsFromConfig(config: BridgeConfig): AssignmentRow[] {
+  const ids = hasAllowedIds(config.allowedUserIds)
+    ? telegramIds(config.allowedUserIds)
+    : Object.keys(config.roleAssignments)
+  return ids.map((id) => newRow(id, config.roleAssignments[id] ?? MEMBER_ROLE_ID))
+}
+
+function updateRow(key: string, patch: Partial<AssignmentRow>): void {
+  edit(
+    assignmentRowsDraft,
+    read(assignmentRowsDraft).map((row) => (row.key === key ? { ...row, ...patch } : row))
+  )
+}
+
+function updateRole(roleId: string, change: (role: BridgeRole) => BridgeRole): void {
+  edit(
+    rolesDraft,
+    read(rolesDraft).map((role) => (role.id === roleId ? change(role) : role))
+  )
+}
+
+// After roles were deleted or replaced, rows whose role is gone get Member, and the note says so.
+function rowsFallBackToMember(roles: BridgeRole[]): void {
+  const known = new Set(roles.map((r) => r.id))
+  const rows = read(assignmentRowsDraft)
+  const moved = rows.filter((row) => !known.has(row.roleId)).length
+  if (moved === 0) return
+  edit(
+    assignmentRowsDraft,
+    rows.map((row) => (known.has(row.roleId) ? row : { ...row, roleId: MEMBER_ROLE_ID }))
+  )
+  set(
+    rolesNote,
+    `${moved === 1 ? '1 person or group' : `${moved} people or groups`} had a role that is gone and now have Member.`
+  )
+}
+
+function addRole(): void {
+  const id = `r-${Math.random().toString(36).slice(2, 8)}`
+  edit(rolesDraft, [
+    ...read(rolesDraft),
+    { id, name: 'New role', permissions: ['chat', 'status', 'newPrivate'], prompt: '', runAutomationIds: null }
+  ])
+}
+
+function deleteRole(roleId: string): void {
+  const roles = read(rolesDraft).filter((r) => r.id !== roleId)
+  edit(rolesDraft, roles)
+  rowsFallBackToMember(roles)
+}
+
+// Replaces this editor's roles with another bridge's; its people are not copied. Saved with Save.
+function copyRoles(state: BridgeState): void {
+  const from = findBridge(state, read(copyRolesFrom))
+  if (!from) return
+  const roles = normalizeRoles(from.config.roles)
+  edit(rolesDraft, roles)
+  rowsFallBackToMember(roles)
+}
+
+async function loadAutomations(): Promise<void> {
+  const now = read(automations).status
+  if (now === 'loading' || now === 'ready') return
+  set(automations, { status: 'loading' })
+  try {
+    const list = await plugin.request('bridge.listAutomations')
+    set(automations, { status: 'ready', items: list.map((a) => ({ id: a.id, name: a.name })) })
+  } catch (err) {
+    set(automations, { status: 'failed', reason: errorText(err) })
+  }
+}
+
 // Fills the drafts from the bridge being edited. Without `force` it only fills an editor that
 // has not been filled yet, so worker pushes never overwrite what the user typed.
 function hydrateForm(state: BridgeState, force = false): void {
@@ -188,7 +333,9 @@ function hydrateForm(state: BridgeState, force = false): void {
   if (!force && read(hydratedFor) === id) return
   set(accessModeDraft, hasAllowedIds(bridge.config.allowedUserIds) ? 'restricted' : 'open')
   set(allowedIdsError, null)
-  set(allowedIdsDraft, bridge.config.allowedUserIds)
+  set(assignmentRowsDraft, rowsFromConfig(bridge.config))
+  set(rolesDraft, normalizeRoles(bridge.config.roles))
+  set(rolesNote, null)
   set(proxyUrlDraft, bridge.config.proxyUrl)
   set(timeoutDraft, String(bridge.config.replyTimeoutSec))
   set(syncOrcaOutboundDraft, bridge.config.syncOrcaOutbound)
@@ -209,6 +356,8 @@ function openEditor(state: BridgeState, bridgeId: string): void {
   set(tokenDraft, '')
   set(voiceKeyDraft, '')
   set(allowedIdsError, null)
+  set(copyRolesFrom, '')
+  set(automations, { status: 'idle' })
   set(saveError, null)
   hydrateForm(state, true)
 }
@@ -317,10 +466,24 @@ async function removeBridge(bridge: BridgeView): Promise<void> {
 // The bridge's bot is fixed by where it is shown: the focused bot, or the bot it already has.
 async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
   const restricted = read(accessModeDraft) === 'restricted'
-  if (restricted && !hasAllowedIds(read(allowedIdsDraft))) {
+  // Empty rows are skipped; a row that is not an ID refuses the save rather than losing it.
+  const rows = read(assignmentRowsDraft)
+    .map((row) => ({ ...row, id: row.id.trim() }))
+    .filter((row) => row.id !== '')
+  const notAnId = rows.find((row) => !isTelegramId(row.id))
+  if (notAnId) {
+    set(allowedIdsError, clip(`"${notAnId.id}" is not a Telegram ID. IDs are numbers, like 123456789 or -1001234567890.`))
+    return
+  }
+  if (restricted && rows.length === 0) {
     set(allowedIdsError, NEEDS_ID)
     return
   }
+  const roles = read(rolesDraft)
+  const known = new Set(roles.map((r) => r.id))
+  const roleAssignments: Record<string, string> = {}
+  for (const row of rows) roleAssignments[row.id] = known.has(row.roleId) ? row.roleId : MEMBER_ROLE_ID
+  const ids = [...new Set(rows.map((row) => row.id))]
   set(busy, true)
   set(feedback, null)
   set(saveError, null)
@@ -331,8 +494,10 @@ async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
     const payload: SaveConfigInput = {
       bridgeId: bridge.id,
       orcaBot,
-      // An empty list is how the worker stores "anyone"; the typed IDs stay in the draft.
-      allowedUserIds: restricted ? read(allowedIdsDraft).trim() : '',
+      // An empty list is how the worker stores "anyone": then the rows only give roles.
+      allowedUserIds: restricted ? ids.join(', ') : '',
+      roleAssignments,
+      roles,
       proxyUrl: read(proxyUrlDraft).trim(),
       replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
       syncOrcaOutbound: read(syncOrcaOutboundDraft),
@@ -404,11 +569,15 @@ async function allowBlockedUser(bridgeId: string, userId: string): Promise<void>
     if (read(editingBridgeId) === bridgeId) {
       const bridge = findBridge(next, bridgeId)
       if (read(formDirty)) {
-        if (bridge) {
-          set(allowedIdsDraft, bridge.config.allowedUserIds)
-          set(accessModeDraft, 'restricted')
-          set(allowedIdsError, null)
+        // Keep what the owner is typing; add the allowed ID with the role the worker gave it.
+        if (bridge && !read(assignmentRowsDraft).some((row) => row.id.trim() === userId)) {
+          set(
+            assignmentRowsDraft,
+            [...read(assignmentRowsDraft), newRow(userId, bridge.config.roleAssignments[userId] ?? MEMBER_ROLE_ID)]
+          )
         }
+        set(accessModeDraft, 'restricted')
+        set(allowedIdsError, null)
       } else hydrateForm(next, true)
     }
     set(feedback, { tone: 'success', text: `Allowed Telegram ID ${userId}` })
@@ -537,7 +706,7 @@ export function setup(ctx: PanelContext): void {
 }
 
 function hasAllowedIds(raw: string): boolean {
-  return raw.split(/[\s,;]+/).some((id) => /^-?\d+$/.test(id))
+  return telegramIds(raw).length > 0
 }
 
 // The card's plain-words line for groups. While the bot is open to everyone the worker reads
@@ -551,6 +720,40 @@ function groupsSummary(bridge: BridgeView, openToEveryone: boolean): string {
   return behavior === 'all-helpful'
     ? 'Groups: follows the conversation, joins in when useful'
     : 'Groups: follows the conversation, answers when called'
+}
+
+// "Full access 1, Member 2": how many of these IDs have each role, in the roles' order.
+function roleCounts(config: BridgeConfig, ids: string[]): string {
+  return config.roles
+    .map((role) => ({
+      name: role.name,
+      count: ids.filter((id) => (config.roleAssignments[id] ?? MEMBER_ROLE_ID) === role.id).length
+    }))
+    .filter((r) => r.count > 0)
+    .map((r) => `${r.name} ${r.count}`)
+    .join(', ')
+}
+
+// The card's line for who can talk and with which role.
+function peopleSummary(bridge: BridgeView, openToEveryone: boolean): string {
+  const { config } = bridge
+  if (!openToEveryone) {
+    const ids = telegramIds(config.allowedUserIds)
+    return `People: ${ids.length} (${roleCounts(config, ids)})`
+  }
+  const ids = Object.keys(config.roleAssignments)
+  return ids.length > 0
+    ? `Anyone on Telegram (Stranger); with a role: ${ids.length} (${roleCounts(config, ids)})`
+    : 'Anyone on Telegram (Stranger)'
+}
+
+// Shown on the card and in the editor until the roles are saved once after the update.
+function reviewRolesCallout() {
+  return (
+    <Callout tone="warning" title="Review roles" icon="warning">
+      <Text size="xs">{REVIEW_ROLES}</Text>
+    </Callout>
+  )
 }
 
 // `botName` is the bridge's Orca bot; '' means the first Orca bot found.
@@ -580,6 +783,9 @@ function bridgeCard(bridge: BridgeView, botName: string, isBusy: boolean) {
             Save a bot token first.
           </Text>
         )}
+        <Text muted size="xs">
+          {clip(peopleSummary(bridge, openToEveryone))}
+        </Text>
         <Text muted size="xs">
           {groupsSummary(bridge, openToEveryone)}
         </Text>
@@ -615,11 +821,12 @@ function bridgeCard(bridge: BridgeView, botName: string, isBusy: boolean) {
           <Callout tone="warning" title="Open to everyone" icon="warning">
             <Text size="xs">
               {clip(
-                `Anyone who finds ${bridge.botUsername ? `@${bridge.botUsername}` : 'this bot'} on Telegram can chat with ${botName || 'your first Orca bot'} and use its commands with your rights. To limit it, press Edit and choose Only these people and groups.`
+                `Anyone who finds ${bridge.botUsername ? `@${bridge.botUsername}` : 'this bot'} on Telegram can chat with ${botName || 'your first Orca bot'}, as a Stranger unless listed with a role. Strangers cannot run automations, change sync or reach your Orca chats, but the bot answers them with your rights. To limit it, press Edit and choose Only these people and groups.`
               )}
             </Text>
           </Callout>
         )}
+        {!bridge.config.rolesReviewed && reviewRolesCallout()}
         <Row gap="xs">
           <Button
             key={`edit:${bridge.id}`}
@@ -637,6 +844,273 @@ function bridgeCard(bridge: BridgeView, botName: string, isBusy: boolean) {
         </Row>
       </Stack>
     </Card>
+  )
+}
+
+// A new row: the first one is most likely the owner, who must not lock themselves out.
+function addRow(): void {
+  const rows = read(assignmentRowsDraft)
+  edit(assignmentRowsDraft, [...rows, newRow('', rows.length === 0 ? FULL_ROLE_ID : MEMBER_ROLE_ID)])
+  set(allowedIdsError, null)
+}
+
+// The Who can talk list: one Telegram ID and its role per row. Optional while anyone can talk.
+function assignmentRows(accessMode: AccessMode, idsError: string | null) {
+  const rows = read(assignmentRowsDraft)
+  const roleOptions = read(rolesDraft).map((r) => ({ value: r.id, label: clip(r.name.trim() || r.id) }))
+  const note = read(rolesNote)
+  return (
+    <Stack gap="xs">
+      <Text size="sm" weight="medium">
+        {accessMode === 'open' ? 'People with roles (everyone else is a Stranger)' : 'People and groups'}
+      </Text>
+      {rows.map((row, i) => {
+        const id = row.id.trim()
+        // NEEDS_ID points at the empty rows; a "not an ID" refusal at the rows that are not IDs.
+        const invalid = idsError !== null && (id === '' ? idsError === NEEDS_ID : !isTelegramId(id))
+        return (
+          <Row key={row.key} gap="xs" align="center">
+            <Input
+              key={`id:${row.key}`}
+              label={`Telegram ID ${i + 1}`}
+              labelHidden
+              value={row.id}
+              placeholder="e.g. 123456789 or -1001234567890"
+              invalid={invalid}
+              onChange={(v) => {
+                updateRow(row.key, { id: v })
+                set(allowedIdsError, null)
+              }}
+            />
+            <Select
+              key={`role:${row.key}`}
+              label={`Role for Telegram ID ${i + 1}`}
+              labelHidden
+              value={row.roleId}
+              options={roleOptions}
+              onChange={(v) => updateRow(row.key, { roleId: v })}
+            />
+            <IconButton
+              key={`remove:${row.key}`}
+              icon="close"
+              label={`Remove Telegram ID ${i + 1}`}
+              size="sm"
+              variant="ghost"
+              onPress={() => {
+                edit(
+                  assignmentRowsDraft,
+                  read(assignmentRowsDraft).filter((r) => r.key !== row.key)
+                )
+                set(allowedIdsError, null)
+              }}
+            />
+          </Row>
+        )
+      })}
+      {idsError && (
+        <Text tone="danger" size="xs">
+          {idsError}
+        </Text>
+      )}
+      {note && (
+        <Text muted size="xs">
+          {note}
+        </Text>
+      )}
+      <Row>
+        <Button size="sm" variant="outline" icon="add" onPress={addRow}>
+          Add person or group
+        </Button>
+      </Row>
+    </Stack>
+  )
+}
+
+// "can: chat, /status, /new in private", for a role's closed title.
+function roleSummary(role: BridgeRole): string {
+  if (role.permissions.length === ROLE_PERMISSIONS.length) return 'can: everything'
+  if (role.permissions.length === 0) return 'can: only /help'
+  return `can: ${role.permissions.map((p) => (p === 'chat' ? 'chat' : PERMISSION_LABEL[p])).join(', ')}`
+}
+
+// With /run allowed: every automation, or only the ticked ones from Orca's list.
+function runPicker(role: BridgeRole) {
+  const load = read(automations)
+  const chosen = role.runAutomationIds
+  return (
+    <Stack gap="xs">
+      <RadioGroup
+        key={`run-scope:${role.id}`}
+        label="Automations it may run"
+        value={chosen === null ? 'all' : 'only'}
+        options={RUN_SCOPE_OPTIONS}
+        orientation="horizontal"
+        onChange={(v) =>
+          updateRole(role.id, (r) => ({ ...r, runAutomationIds: v === 'only' ? (r.runAutomationIds ?? []) : null }))
+        }
+      />
+      {chosen !== null && load.status === 'ready' && load.items.length === 0 && (
+        <Text muted size="xs">
+          Orca has no automations yet.
+        </Text>
+      )}
+      {chosen !== null &&
+        load.status === 'ready' &&
+        load.items.map((a) => (
+          <Checkbox
+            key={`run:${role.id}:${a.id}`}
+            label={clip(a.name)}
+            checked={chosen.includes(a.id)}
+            onChange={(v) =>
+              updateRole(role.id, (r) => {
+                const others = (r.runAutomationIds ?? []).filter((id) => id !== a.id)
+                return { ...r, runAutomationIds: v ? [...others, a.id] : others }
+              })
+            }
+          />
+        ))}
+      {chosen !== null && (load.status === 'idle' || load.status === 'loading') && (
+        <Text muted size="xs">
+          Loading automations…
+        </Text>
+      )}
+      {chosen !== null && load.status === 'failed' && (
+        <Text muted size="xs">
+          {clip(`Could not load Orca's automations: ${load.reason}. Close and open Roles to try again.`)}
+        </Text>
+      )}
+    </Stack>
+  )
+}
+
+function roleEditor(bridge: BridgeView, role: BridgeRole) {
+  const builtIn = BUILT_IN_ROLE_IDS.includes(role.id)
+  return (
+    <Collapsible
+      key={`role:${bridge.id}:${role.id}`}
+      title={clip(role.name.trim() || role.id)}
+      description={clip(roleSummary(role))}
+      open={read(openRoleIds).includes(role.id)}
+      onChange={(open) =>
+        set(openRoleIds, open ? [...read(openRoleIds), role.id] : read(openRoleIds).filter((id) => id !== role.id))
+      }
+    >
+      <Stack gap="sm">
+        <Input
+          key={`role-name:${role.id}`}
+          label="Role name"
+          value={role.name}
+          disabled={builtIn}
+          onChange={(v) => updateRole(role.id, (r) => ({ ...r, name: v }))}
+        />
+        {role.id === FULL_ROLE_ID && (
+          <Text muted size="xs">
+            Full access can always do everything.
+          </Text>
+        )}
+        {role.id === STRANGER_ROLE_ID && (
+          <Text muted size="xs">
+            A Stranger can be anyone on Telegram, so it can never reach your Orca chats, automations or
+            bridge settings.
+          </Text>
+        )}
+        {/* A list item's own key only orders the list; a keyed Box around each checkbox lets the
+            checkbox keep its key (Fragments are flattened into the list). */}
+        {ROLE_PERMISSIONS.map((p) => (
+          <Box key={p}>
+            <Checkbox
+              key={`perm:${role.id}:${p}`}
+              label={PERMISSION_LABEL[p]}
+              checked={role.permissions.includes(p)}
+              disabled={role.id === FULL_ROLE_ID || (role.id === STRANGER_ROLE_ID && STRANGER_FORBIDDEN.includes(p))}
+              onChange={(v) =>
+                updateRole(role.id, (r) => ({
+                  ...r,
+                  permissions: ROLE_PERMISSIONS.filter((x) => (x === p ? v : r.permissions.includes(x)))
+                }))
+              }
+            />
+          </Box>
+        ))}
+        {role.permissions.includes('run') && runPicker(role)}
+        <Textarea
+          key={`prompt:${role.id}`}
+          label="Extra prompt for the Orca bot"
+          value={role.prompt}
+          rows={3}
+          onChange={(v) => updateRole(role.id, (r) => ({ ...r, prompt: v }))}
+        />
+        <Text muted size="xs">
+          {PROMPT_HELPER}
+        </Text>
+        {!builtIn && (
+          <Row>
+            <Button
+              key={`delete-role:${role.id}`}
+              size="sm"
+              variant="ghost"
+              tone="danger"
+              icon="delete"
+              onPress={() => deleteRole(role.id)}
+            >
+              Delete role
+            </Button>
+          </Row>
+        )}
+      </Stack>
+    </Collapsible>
+  )
+}
+
+// Closed until opened; opening it loads Orca's automations for the run lists.
+function rolesEditor(bridge: BridgeView) {
+  const state = read(bridgeState)
+  const others = state ? state.bridges.filter((b) => b.id !== bridge.id) : []
+  const copyFrom = read(copyRolesFrom)
+  return (
+    <Collapsible
+      key={`roles:${bridge.id}`}
+      title="Roles"
+      description="What each role may do, and an extra prompt for it"
+      onChange={(open) => {
+        if (open) void loadAutomations()
+      }}
+    >
+      <Stack gap="sm">
+        {read(rolesDraft).map((role) => roleEditor(bridge, role))}
+        <Row>
+          <Button size="sm" variant="outline" icon="add" onPress={addRole}>
+            Add role
+          </Button>
+        </Row>
+        {others.length > 0 && (
+          <Stack gap="xs">
+            <Row gap="xs" align="end">
+              <Select
+                label="Copy roles from"
+                value={copyFrom}
+                placeholder="Choose a bridge"
+                options={others.map((b) => ({ value: b.id, label: clip(bridgeLabel(b, b.name)) }))}
+                onChange={(v) => set(copyRolesFrom, v)}
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!copyFrom}
+                onPress={() => {
+                  if (state) copyRoles(state)
+                }}
+              >
+                Copy
+              </Button>
+            </Row>
+            <Text muted size="xs">
+              Copy replaces the roles above, not the people. Save keeps it.
+            </Text>
+          </Stack>
+        )}
+      </Stack>
+    </Collapsible>
   )
 }
 
@@ -676,6 +1150,7 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
 
         <Stack gap="sm">
           <Heading level={3}>Who can talk</Heading>
+          {!bridge.config.rolesReviewed && reviewRolesCallout()}
           <RadioGroup
             label="Who can talk"
             labelHidden
@@ -684,35 +1159,21 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
             onChange={(v) => {
               edit(accessModeDraft, v as AccessMode)
               set(allowedIdsError, null)
+              // A restricted list needs an ID, so give the owner a row to type it in.
+              if (v === 'restricted' && read(assignmentRowsDraft).length === 0) addRow()
             }}
           />
-          {accessMode === 'restricted' ? (
-            <Stack gap="xs">
-              <Input
-                label="Telegram user and group IDs"
-                value={read(allowedIdsDraft)}
-                placeholder="e.g. 123456789, -1001234567890"
-                invalid={idsError !== null}
-                onChange={(v) => {
-                  edit(allowedIdsDraft, v)
-                  set(allowedIdsError, null)
-                }}
-              />
-              {idsError && (
-                <Text tone="danger" size="xs">
-                  {idsError}
-                </Text>
-              )}
-            </Stack>
-          ) : (
+          {accessMode === 'open' && (
             <Callout tone="warning" icon="warning" title="Anyone can use this bot">
               <Text size="xs">
                 {clip(
-                  `Anyone who finds this bot can chat with ${botName || 'your first Orca bot'} and use its commands with your rights.`
+                  `Anyone who finds this bot can chat with ${botName || 'your first Orca bot'}. Unlisted people get the Stranger role: no automations, sync or Orca chats, but the bot still answers them with your rights.`
                 )}
               </Text>
             </Callout>
           )}
+          {assignmentRows(accessMode, idsError)}
+          {rolesEditor(bridge)}
         </Stack>
 
         <Stack gap="sm">

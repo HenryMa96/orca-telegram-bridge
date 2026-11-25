@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -739,6 +739,9 @@ export async function dispatchToOrcaBotAndWait(
     // Set when the bridge's reply language is 'auto': the chat's known language (else English), for
     // a message with no words to follow.
     answerLanguage?: string
+    // The owner's prompt for the sender's role ('' or absent = none). Fenced, so text the user types
+    // cannot pass itself off as the owner's.
+    rolePrompt?: string
     timeoutMs: number
     pollIntervalMs?: number
     signal?: AbortSignal
@@ -786,6 +789,17 @@ export async function dispatchToOrcaBotAndWait(
   if (params.answerLanguage && groupReply !== 'mentioned') {
     bodyParts.push(
       `Answer in the language of the user's message; when it has no words (only an image or a file), answer in ${params.answerLanguage}.`
+    )
+  }
+  const rolePrompt = params.rolePrompt?.trim()
+  if (rolePrompt) {
+    // A fresh nonce per message: the user cannot guess it to close the block early or forge one.
+    const nonce = randomBytes(8).toString('hex')
+    bodyParts.push(
+      '',
+      `Owner's instructions for this user's role (not written by the user) [role:${nonce}]:`,
+      rolePrompt,
+      `[/role:${nonce}]`
     )
   }
   if (imagePaths.length > 0) {

@@ -40,6 +40,8 @@ export type HelpInfo = {
   botName: string
   orcaChatId: string | null
   syncOn: boolean
+  // The commands this sender's role may use; /help lists only these.
+  commands: readonly TelegramCommandName[]
 }
 
 export type StatusInfo = {
@@ -50,10 +52,17 @@ export type StatusInfo = {
   pollStatus: string
 }
 
+// Keeps the help lines of the allowed commands; each line starts with its command ('/bind <chatId> - …').
+function allowedLines(lines: string[], allowed: readonly TelegramCommandName[]): string[] {
+  return lines.filter((line) => allowed.includes(line.slice(1).split(/\s/)[0] as TelegramCommandName))
+}
+
 export type Messages = {
   commands: Record<TelegramCommandName, string>
   unauthorized: (userId: string) => string
   callbackUnauthorized: string
+  // A command or button the sender's role does not allow.
+  notAllowedForRole: string
   unsupportedImage: string
   processingFailed: (detail: string) => string
   voiceDisabled: string
@@ -138,6 +147,7 @@ const en: Messages = {
   unauthorized: (userId) =>
     `Not authorized. Your Telegram ID is ${userId}. Ask the bot owner to add it.`,
   callbackUnauthorized: 'Access denied. Add your ID to the allowlist first.',
+  notAllowedForRole: "This isn't available for you. Ask the bot's owner.",
   unsupportedImage: 'This image format is not supported. Send a JPG, PNG, WEBP, GIF or BMP image.',
   processingFailed: (detail) => `Processing failed: ${detail}`,
   voiceDisabled: 'Voice messages are not enabled for this bot. Please send text.',
@@ -158,23 +168,28 @@ const en: Messages = {
   tableMarker: (n) => `📊 **Table ${n}** (see image below)`,
   tableCaption: (n) => `Table ${n}`,
   orcaUserMessageHeader: (botName) => `🗣️ **You sent in Orca (${botName}):**`,
-  help: ({ botName, orcaChatId, syncOn }) =>
+  help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `Current bot: ${botName || '(none found)'}`,
       `Current chat: ${orcaChatId || '(new chat, created with your next message)'}`,
       `Two-way sync (Orca -> TG): ${enOnOff(syncOn)}`,
       '',
       'Commands:',
-      '/bots - List the Orca bots (this Telegram bot talks to one of them)',
-      '/chats - List chats and tap one to bind it',
-      "/home - Bind the current bot's Home Chat",
-      '/new - Clear the context and start a new chat',
-      '/bind <chatId> - Bind to a given Orca chat',
-      '/rename <new title> - Rename the bound chat',
-      '/sync [on|off] - Turn Orca -> Telegram sync on or off',
-      '/automations - List and run automations',
-      '/run <id> - Run an automation now',
-      '/status - Show connection and chat status'
+      ...allowedLines(
+        [
+          '/bots - List the Orca bots (this Telegram bot talks to one of them)',
+          '/chats - List chats and tap one to bind it',
+          "/home - Bind the current bot's Home Chat",
+          '/new - Clear the context and start a new chat',
+          '/bind <chatId> - Bind to a given Orca chat',
+          '/rename <new title> - Rename the bound chat',
+          '/sync [on|off] - Turn Orca -> Telegram sync on or off',
+          '/automations - List and run automations',
+          '/run <id> - Run an automation now',
+          '/status - Show connection and chat status'
+        ],
+        commands
+      )
     ].join('\n'),
   status: ({ botUsername, botName, orcaChatId, syncOn, pollStatus }) =>
     [
@@ -246,6 +261,7 @@ const ptBR: Messages = {
   unauthorized: (userId) =>
     `Sem autorização. Seu ID do Telegram é ${userId}. Peça ao dono do bot para adicioná-lo.`,
   callbackUnauthorized: 'Acesso negado. Adicione seu ID à lista de permitidos primeiro.',
+  notAllowedForRole: 'Isto não está disponível para você. Fale com o dono do bot.',
   unsupportedImage: 'Formato de imagem não suportado. Envie uma imagem JPG, PNG, WEBP, GIF ou BMP.',
   processingFailed: (detail) => `Falha no processamento: ${detail}`,
   voiceDisabled: 'Mensagens de voz não estão ativadas para este bot. Envie texto.',
@@ -267,23 +283,28 @@ const ptBR: Messages = {
   tableMarker: (n) => `📊 **Tabela ${n}** (veja a imagem abaixo)`,
   tableCaption: (n) => `Tabela ${n}`,
   orcaUserMessageHeader: (botName) => `🗣️ **Você enviou no Orca (${botName}):**`,
-  help: ({ botName, orcaChatId, syncOn }) =>
+  help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `Bot atual: ${botName || '(nenhum encontrado)'}`,
       `Conversa atual: ${orcaChatId || '(nova conversa, criada com sua próxima mensagem)'}`,
       `Sincronização bidirecional (Orca -> TG): ${ptOnOff(syncOn)}`,
       '',
       'Comandos:',
-      '/bots - Listar os bots do Orca (este bot do Telegram fala com um deles)',
-      '/chats - Listar as conversas e tocar em uma para vincular',
-      '/home - Vincular o Home Chat do bot atual',
-      '/new - Limpar o contexto e iniciar uma nova conversa',
-      '/bind <chatId> - Vincular a uma conversa específica do Orca',
-      '/rename <novo título> - Renomear a conversa vinculada',
-      '/sync [on|off] - Ativar ou desativar a sincronização Orca -> Telegram',
-      '/automations - Listar e executar automações',
-      '/run <id> - Executar uma automação agora',
-      '/status - Ver o status da conexão e da conversa'
+      ...allowedLines(
+        [
+          '/bots - Listar os bots do Orca (este bot do Telegram fala com um deles)',
+          '/chats - Listar as conversas e tocar em uma para vincular',
+          '/home - Vincular o Home Chat do bot atual',
+          '/new - Limpar o contexto e iniciar uma nova conversa',
+          '/bind <chatId> - Vincular a uma conversa específica do Orca',
+          '/rename <novo título> - Renomear a conversa vinculada',
+          '/sync [on|off] - Ativar ou desativar a sincronização Orca -> Telegram',
+          '/automations - Listar e executar automações',
+          '/run <id> - Executar uma automação agora',
+          '/status - Ver o status da conexão e da conversa'
+        ],
+        commands
+      )
     ].join('\n'),
   status: ({ botUsername, botName, orcaChatId, syncOn, pollStatus }) =>
     [
@@ -354,6 +375,7 @@ const es: Messages = {
   unauthorized: (userId) =>
     `Sin autorización. Tu ID de Telegram es ${userId}. Pide al dueño del bot que lo agregue.`,
   callbackUnauthorized: 'Acceso denegado. Primero agrega tu ID a la lista de permitidos.',
+  notAllowedForRole: 'Esto no está disponible para ti. Pregunta al dueño del bot.',
   unsupportedImage: 'Formato de imagen no compatible. Envía una imagen JPG, PNG, WEBP, GIF o BMP.',
   processingFailed: (detail) => `Error al procesar: ${detail}`,
   voiceDisabled: 'Los mensajes de voz no están activados para este bot. Envía texto.',
@@ -375,23 +397,28 @@ const es: Messages = {
   tableMarker: (n) => `📊 **Tabla ${n}** (mira la imagen abajo)`,
   tableCaption: (n) => `Tabla ${n}`,
   orcaUserMessageHeader: (botName) => `🗣️ **Enviaste en Orca (${botName}):**`,
-  help: ({ botName, orcaChatId, syncOn }) =>
+  help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `Bot actual: ${botName || '(ninguno encontrado)'}`,
       `Conversación actual: ${orcaChatId || '(nueva conversación, se crea con tu próximo mensaje)'}`,
       `Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`,
       '',
       'Comandos:',
-      '/bots - Listar los bots de Orca (este bot de Telegram habla con uno de ellos)',
-      '/chats - Listar las conversaciones y tocar una para vincularla',
-      '/home - Vincular el Home Chat del bot actual',
-      '/new - Borrar el contexto e iniciar una nueva conversación',
-      '/bind <chatId> - Vincular a una conversación específica de Orca',
-      '/rename <nuevo título> - Renombrar la conversación vinculada',
-      '/sync [on|off] - Activar o desactivar la sincronización Orca -> Telegram',
-      '/automations - Listar y ejecutar automatizaciones',
-      '/run <id> - Ejecutar una automatización ahora',
-      '/status - Ver el estado de la conexión y de la conversación'
+      ...allowedLines(
+        [
+          '/bots - Listar los bots de Orca (este bot de Telegram habla con uno de ellos)',
+          '/chats - Listar las conversaciones y tocar una para vincularla',
+          '/home - Vincular el Home Chat del bot actual',
+          '/new - Borrar el contexto e iniciar una nueva conversación',
+          '/bind <chatId> - Vincular a una conversación específica de Orca',
+          '/rename <nuevo título> - Renombrar la conversación vinculada',
+          '/sync [on|off] - Activar o desactivar la sincronización Orca -> Telegram',
+          '/automations - Listar y ejecutar automatizaciones',
+          '/run <id> - Ejecutar una automatización ahora',
+          '/status - Ver el estado de la conexión y de la conversación'
+        ],
+        commands
+      )
     ].join('\n'),
   status: ({ botUsername, botName, orcaChatId, syncOn, pollStatus }) =>
     [
@@ -462,6 +489,7 @@ const zhCN: Messages = {
   unauthorized: (userId) =>
     `未获授权。你的 Telegram ID 是 ${userId}，请联系机器人所有者添加。`,
   callbackUnauthorized: '未授权访问，请先加入白名单。',
+  notAllowedForRole: '此功能对你不可用，请联系机器人的所有者。',
   unsupportedImage: '暂不支持该图片格式，请发送 JPG、PNG、WEBP、GIF 或 BMP 图片。',
   processingFailed: (detail) => `处理失败：${detail}`,
   voiceDisabled: '此机器人未启用语音消息，请发送文字。',
@@ -482,23 +510,28 @@ const zhCN: Messages = {
   tableMarker: (n) => `📊 **表格 ${n}**（见下方图片）`,
   tableCaption: (n) => `表格 ${n}`,
   orcaUserMessageHeader: (botName) => `🗣️ **你在 Orca (${botName}) 发送：**`,
-  help: ({ botName, orcaChatId, syncOn }) =>
+  help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `当前连接 Bot：${botName || '(未检测到)'}`,
       `当前会话：${orcaChatId || '(新会话，将在下一条消息创建)'}`,
       `双向同步 (Orca -> TG)：${zhOnOff(syncOn)}`,
       '',
       '可用指令：',
-      '/bots - 列出 Orca Bot（本 Telegram 机器人只与其中一个对话）',
-      '/chats - 查看并点击绑定历史会话',
-      '/home - 绑定当前 Bot 的 Home Chat',
-      '/new - 清空当前上下文，开启新对话',
-      '/bind <chatId> - 绑定到指定的 Orca 会话',
-      '/rename <新标题> - 重命名当前绑定的会话',
-      '/sync [on|off] - 开关 Orca 端消息双向同步',
-      '/automations - 查看并触发自动化任务',
-      '/run <id> - 立即执行指定自动化任务',
-      '/status - 查看连接与会话状态'
+      ...allowedLines(
+        [
+          '/bots - 列出 Orca Bot（本 Telegram 机器人只与其中一个对话）',
+          '/chats - 查看并点击绑定历史会话',
+          '/home - 绑定当前 Bot 的 Home Chat',
+          '/new - 清空当前上下文，开启新对话',
+          '/bind <chatId> - 绑定到指定的 Orca 会话',
+          '/rename <新标题> - 重命名当前绑定的会话',
+          '/sync [on|off] - 开关 Orca 端消息双向同步',
+          '/automations - 查看并触发自动化任务',
+          '/run <id> - 立即执行指定自动化任务',
+          '/status - 查看连接与会话状态'
+        ],
+        commands
+      )
     ].join('\n'),
   status: ({ botUsername, botName, orcaChatId, syncOn, pollStatus }) =>
     [
