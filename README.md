@@ -122,10 +122,35 @@ Do these steps after the plugin is installed and approved.
 
 1. Open the **Telegram** sidebar panel in Orca.
 2. Paste your `@BotFather` bot token.
-3. Choose a default Orca bot, or keep **(Auto-select first Orca bot)**.
-4. Optional: set an HTTP proxy (e.g. `http://127.0.0.1:7890`).
-5. Click **Save Settings**, then **Test Connection**.
-6. Send a message to your Telegram bot. Then click **Allow \<your ID\>** in the panel banner.
+3. Choose a default Orca bot, or keep **(Auto-select first Orca bot)**. The list shows the bots on this computer (the folders in `~/.orca/bots`).
+4. Choose the **Telegram reply language**: English (default), Português (Brasil) or 中文. The bot uses it for its own replies and its command menu. The Orca bot's answers keep the language the Orca bot writes in.
+5. Optional: set an HTTP proxy (e.g. `http://127.0.0.1:7890`).
+6. Click **Save Settings**, then **Test Connection**.
+7. Authorize yourself: send any message to your Telegram bot, then click **Allow \<your ID\>** in the panel banner. See [Who can talk to the bot](#who-can-talk-to-the-bot).
+
+## Who can talk to the bot
+
+The bot answers only Telegram users whose numeric ID is in **Allowed Telegram User IDs**. Every person who talks to the bot needs their own entry, you included. The list starts empty, so at first the bot answers nobody.
+
+To authorize a person:
+
+1. Ask them to send any message to the bot.
+2. In Orca, open the **Telegram** panel. A banner shows `User <ID> messaged your bot but is not in the allowlist.`
+3. Click **Allow \<ID\>**. Their next message goes to the Orca bot.
+
+What the person sees before that:
+
+- While the allowlist is empty, the bot replies that access is not authorized and shows their Telegram ID.
+- Once the allowlist has at least one ID, the bot does not reply to unknown people at all. Only the panel banner and the Logs tab show the attempt.
+- The banner shows only the latest unknown person. If several people wrote, allow them one by one, or type the IDs yourself.
+
+To add or remove IDs by hand, edit **Allowed Telegram User IDs** in the Setup tab and click **Save Settings**. Separate IDs with commas or spaces. Only numeric user IDs count; group chat IDs are ignored. A person who knows no ID can get theirs from a Telegram bot such as `@userinfobot`.
+
+In a group, the bot checks who sent each message, not the group. If you add the bot to a group, messages from allowed people in it reach your Orca bot, and the replies are visible to everyone in the group.
+
+Removing an ID stops the bot from answering that person. It also stops [Orca-side sync](#features) to their chats.
+
+Every allowed person can use your Orca bots with your rights: chat with them, switch bots, run automations. Allow only people you trust.
 
 ## Telegram Commands
 
