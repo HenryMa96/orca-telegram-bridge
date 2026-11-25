@@ -23,16 +23,18 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 
 ## Install
 
+Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-telegram-bridge).
+
 Once listed on [orca.dev/plugins](https://orca.dev/plugins), install directly:
 
 ```sh
-orca plugin install henryma96.telegram-bridge
+orca plugin install drecchia.telegram-bridge
 ```
 
 or straight from this repository:
 
 ```sh
-orca plugin install henryma96/orca-telegram-bridge
+orca plugin install drecchia/orca-telegram-bridge
 ```
 
 ## Setup
@@ -41,7 +43,7 @@ orca plugin install henryma96/orca-telegram-bridge
    ```sh
    orca plugin dev load . --json
    ```
-   Review the requested capabilities (`storage:own`, `secrets:own`, `settings:own`, `notifications:show`) and re-run with the printed `--approve <fingerprint>` flag.
+   Review the requested capabilities (`storage:own`, `secrets:own`, `settings:own`) and re-run with the printed `--approve <fingerprint>` flag.
 2. Open the **Telegram** sidebar panel in Orca.
 3. Paste your `@BotFather` token, choose a default Orca bot (or leave blank to auto-select the first bot), optionally set an HTTP proxy (e.g. `http://127.0.0.1:7890`), and click **Save Settings** -> **Test Connection**.
 4. Send a message to your Telegram bot, then click **Allow \<your ID\>** in the panel banner.

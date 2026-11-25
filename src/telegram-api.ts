@@ -83,12 +83,15 @@ export type TelegramRequestOptions = {
 export class TelegramApiError extends Error {
   readonly statusCode: number
   readonly retryable: boolean
+  /** Seconds Telegram asks us to wait (`parameters.retry_after` on 429). */
+  readonly retryAfterSec?: number
 
-  constructor(message: string, statusCode = 0, retryable = false) {
+  constructor(message: string, statusCode = 0, retryable = false, retryAfterSec?: number) {
     super(message)
     this.name = 'TelegramApiError'
     this.statusCode = statusCode
     this.retryable = retryable
+    this.retryAfterSec = retryAfterSec
   }
 }
 
@@ -168,10 +171,18 @@ export function resolveProxyUrl(explicitProxy?: string): string | undefined {
   return envProxy?.trim() || undefined
 }
 
-function createProxyAgent(proxyUrl: string): https.Agent {
+function createProxyAgent(proxyUrl: string, timeoutMs: number, signal?: AbortSignal): https.Agent {
   const parsed = new URL(proxyUrl)
+  // Only plain-HTTP CONNECT is implemented; an https:// or socks proxy would get raw TCP and fail obscurely.
+  if (parsed.protocol !== 'http:') {
+    throw new TelegramApiError(
+      `Unsupported proxy protocol "${parsed.protocol}": only http:// proxies are supported`,
+      0,
+      false
+    )
+  }
   const proxyHost = parsed.hostname
-  const proxyPort = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80))
+  const proxyPort = Number(parsed.port || 80)
   const authHeader =
     parsed.username || parsed.password
       ? 'Basic ' +
@@ -206,8 +217,22 @@ function createProxyAgent(proxyUrl: string): https.Agent {
       const done = (err: Error | null, socket?: tls.TLSSocket) => {
         if (settled) return
         settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
         callback(err, socket)
       }
+
+      // The outer request's setTimeout only starts once this callback hands it a socket, so a proxy
+      // that accepts TCP but never answers CONNECT needs its own deadline.
+      const timer = setTimeout(() => {
+        connectReq.destroy()
+        done(new TelegramApiError(`Proxy CONNECT timed out after ${timeoutMs}ms`, 0, true))
+      }, timeoutMs)
+      const onAbort = () => {
+        connectReq.destroy()
+        done(new TelegramApiError('Request aborted', 0, false))
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
 
       connectReq.on('connect', (res, socket) => {
         if (res.statusCode !== 200) {
@@ -303,7 +328,11 @@ async function sendTelegramHttp<T>(
     : extraHeaders
 
   return new Promise<T>((resolve, reject) => {
-    const agent = proxyUrl ? createProxyAgent(proxyUrl) : undefined
+    if (options.signal?.aborted) {
+      reject(new TelegramApiError('Request aborted', 0, false))
+      return
+    }
+    const agent = proxyUrl ? createProxyAgent(proxyUrl, timeoutMs, options.signal) : undefined
     const req = https.request(
       {
         hostname: 'api.telegram.org',
@@ -316,9 +345,24 @@ async function sendTelegramHttp<T>(
       (res) => {
         const chunks: Buffer[] = []
         res.on('data', (chunk: Buffer) => chunks.push(chunk))
+        // A connection dropped mid-body fires neither 'end' nor the request's 'error'.
+        res.on('error', (err) => {
+          reject(new TelegramApiError(`Telegram response error: ${err.message}`, res.statusCode ?? 0, true))
+        })
+        res.on('close', () => {
+          if (!res.complete) {
+            reject(new TelegramApiError('Telegram connection closed before the response finished', res.statusCode ?? 0, true))
+          }
+        })
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8')
-          let parsed: { ok?: boolean; result?: T; description?: string; error_code?: number }
+          let parsed: {
+            ok?: boolean
+            result?: T
+            description?: string
+            error_code?: number
+            parameters?: { retry_after?: number }
+          }
           try {
             parsed = JSON.parse(raw) as typeof parsed
           } catch {
@@ -339,7 +383,8 @@ async function sendTelegramHttp<T>(
               new TelegramApiError(
                 parsed.description || `Telegram API error ${code}`,
                 code,
-                retryable
+                retryable,
+                parsed.parameters?.retry_after
               )
             )
             return
@@ -349,20 +394,16 @@ async function sendTelegramHttp<T>(
       }
     )
 
-    const onAbort = () => {
-      req.destroy(new TelegramApiError('Request aborted', 0, false))
+    // Reject before destroying so the caller sees why, not the response 'close' that follows.
+    const fail = (err: TelegramApiError) => {
+      reject(err)
+      req.destroy(err)
     }
-
-    if (options.signal) {
-      if (options.signal.aborted) {
-        onAbort()
-        return
-      }
-      options.signal.addEventListener('abort', onAbort, { once: true })
-    }
+    const onAbort = () => fail(new TelegramApiError('Request aborted', 0, false))
+    options.signal?.addEventListener('abort', onAbort, { once: true })
 
     req.setTimeout(timeoutMs, () => {
-      req.destroy(new TelegramApiError(`Telegram request timed out after ${timeoutMs}ms`, 0, true))
+      fail(new TelegramApiError(`Telegram request timed out after ${timeoutMs}ms`, 0, true))
     })
 
     req.on('error', (err) => {
@@ -401,7 +442,11 @@ async function downloadTelegramFileBytes(
   const timeoutMs = options.timeoutMs ?? 30_000
 
   return new Promise<Buffer>((resolve, reject) => {
-    const agent = proxyUrl ? createProxyAgent(proxyUrl) : undefined
+    if (options.signal?.aborted) {
+      reject(new TelegramApiError('Request aborted', 0, false))
+      return
+    }
+    const agent = proxyUrl ? createProxyAgent(proxyUrl, timeoutMs, options.signal) : undefined
     const req = https.request(
       {
         hostname: 'api.telegram.org',
@@ -417,10 +462,18 @@ async function downloadTelegramFileBytes(
         res.on('data', (chunk: Buffer) => {
           total += chunk.length
           if (total > MAX_TELEGRAM_DOWNLOAD_BYTES) {
-            req.destroy(new TelegramApiError('Telegram file exceeds 20 MB limit', 413, false))
+            fail(new TelegramApiError('Telegram file exceeds 20 MB limit', 413, false))
             return
           }
           chunks.push(chunk)
+        })
+        res.on('error', (err) => {
+          reject(new TelegramApiError(`Telegram file download error: ${err.message}`, status, true))
+        })
+        res.on('close', () => {
+          if (!res.complete) {
+            reject(new TelegramApiError('Telegram file download closed before it finished', status, true))
+          }
         })
         res.on('end', () => {
           if (status < 200 || status >= 300) {
@@ -438,20 +491,15 @@ async function downloadTelegramFileBytes(
       }
     )
 
-    const onAbort = () => {
-      req.destroy(new TelegramApiError('Request aborted', 0, false))
+    const fail = (err: TelegramApiError) => {
+      reject(err)
+      req.destroy(err)
     }
-
-    if (options.signal) {
-      if (options.signal.aborted) {
-        onAbort()
-        return
-      }
-      options.signal.addEventListener('abort', onAbort, { once: true })
-    }
+    const onAbort = () => fail(new TelegramApiError('Request aborted', 0, false))
+    options.signal?.addEventListener('abort', onAbort, { once: true })
 
     req.setTimeout(timeoutMs, () => {
-      req.destroy(new TelegramApiError(`Telegram file download timed out after ${timeoutMs}ms`, 0, true))
+      fail(new TelegramApiError(`Telegram file download timed out after ${timeoutMs}ms`, 0, true))
     })
 
     req.on('error', (err) => {
@@ -469,6 +517,45 @@ async function downloadTelegramFileBytes(
 
     req.end()
   })
+}
+
+// Longer flood waits are left to the caller; blocking a reply for minutes is worse than failing it.
+const MAX_RETRY_AFTER_SEC = 30
+
+function waitMs(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new TelegramApiError('Request aborted', 0, false))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new TelegramApiError('Request aborted', 0, false))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+// A 429 means Telegram did not accept the message, so one retry cannot post it twice.
+async function retryOnceAfterFloodWait<T>(send: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  try {
+    return await send()
+  } catch (err) {
+    if (
+      !(err instanceof TelegramApiError) ||
+      err.statusCode !== 429 ||
+      err.retryAfterSec === undefined ||
+      err.retryAfterSec > MAX_RETRY_AFTER_SEC
+    ) {
+      throw err
+    }
+    await waitMs(err.retryAfterSec * 1000, signal)
+    return send()
+  }
 }
 
 export function createTelegramClient(): TelegramClient {
@@ -501,7 +588,11 @@ export function createTelegramClient(): TelegramClient {
         text: params.text
       }
       if (params.replyToMessageId !== undefined) {
-        body.reply_to_message_id = params.replyToMessageId
+        // Still deliver the reply when the user deleted the message it answers.
+        body.reply_parameters = {
+          message_id: params.replyToMessageId,
+          allow_sending_without_reply: true
+        }
       }
       if (params.parseMode) {
         body.parse_mode = params.parseMode
@@ -510,7 +601,10 @@ export function createTelegramClient(): TelegramClient {
         body.reply_markup = params.replyMarkup
       }
       body.disable_web_page_preview = true
-      return callTelegramApi<TelegramMessage>(token, 'sendMessage', body, options)
+      return retryOnceAfterFloodWait(
+        () => callTelegramApi<TelegramMessage>(token, 'sendMessage', body, options),
+        options?.signal
+      )
     },
     answerCallbackQuery(token, params, options) {
       const body: Record<string, unknown> = {
@@ -530,19 +624,26 @@ export function createTelegramClient(): TelegramClient {
       }
       if (params.caption) fields.caption = params.caption
       if (params.replyToMessageId !== undefined) {
-        fields.reply_to_message_id = String(params.replyToMessageId)
+        fields.reply_parameters = JSON.stringify({
+          message_id: params.replyToMessageId,
+          allow_sending_without_reply: true
+        })
       }
-      return sendTelegramMultipart<TelegramMessage>(
-        token,
-        'sendPhoto',
-        fields,
-        {
-          field: 'photo',
-          filename: params.filename || 'table.png',
-          contentType: 'image/png',
-          data: params.photo
-        },
-        { ...options, timeoutMs: options?.timeoutMs ?? 25_000 }
+      return retryOnceAfterFloodWait(
+        () =>
+          sendTelegramMultipart<TelegramMessage>(
+            token,
+            'sendPhoto',
+            fields,
+            {
+              field: 'photo',
+              filename: params.filename || 'table.png',
+              contentType: 'image/png',
+              data: params.photo
+            },
+            { ...options, timeoutMs: options?.timeoutMs ?? 25_000 }
+          ),
+        options?.signal
       )
     },
     sendChatAction(token, params, options) {
@@ -584,6 +685,11 @@ export function splitTelegramMessage(text: string, maxLen = 4000): string[] {
     }
     if (cut < Math.floor(maxLen * 0.2)) {
       cut = maxLen
+    }
+    // Never cut between the halves of a surrogate pair: a lone surrogate makes Telegram reject the chunk.
+    const code = remaining.charCodeAt(cut - 1)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      cut--
     }
     chunks.push(remaining.slice(0, cut).trimEnd())
     remaining = remaining.slice(cut).trimStart()

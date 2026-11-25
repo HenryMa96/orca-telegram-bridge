@@ -90,3 +90,81 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   assert.deepEqual(view.refusals, [])
   await view.unmount()
 })
+
+function findOptions(node: unknown): Array<{ value: string; label: string }> | null {
+  if (!node || typeof node !== 'object') return null
+  const rec = node as Record<string, unknown>
+  if (Array.isArray(rec.options)) return rec.options as Array<{ value: string; label: string }>
+  for (const v of Object.values(rec)) {
+    const found = findOptions(v)
+    if (found) return found
+  }
+  return null
+}
+
+test('default bot select offers auto with a non-empty value and saves it as empty defaultBot', async () => {
+  let saved: Record<string, unknown> | null = null
+  const state = makeState({ config: { ...makeState().config, defaultBot: '' } })
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': (input: Record<string, unknown>) => {
+        saved = input
+        return state
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  const options = findOptions(view.tree())
+  assert.ok(options && options.length >= 2)
+  assert.equal(options!.some((o) => o.value === ''), false)
+  assert.equal(view.valueOf(view.find({ label: 'Default Orca Bot' })!), '__auto__')
+
+  await view.select({ label: 'Default Orca Bot' }, 'Assistant')
+  await view.select({ label: 'Default Orca Bot' }, '__auto__')
+  await view.press({ text: 'Save Settings' })
+  assert.equal(saved!.defaultBot, '')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('failing worker request shows feedback and refresh keeps unsaved edits', async () => {
+  let failToggle = true
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => makeState(),
+      'bridge.togglePolling': () => {
+        if (failToggle) throw new Error('worker exploded')
+        return makeState()
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.type({ label: 'HTTP Proxy URL (optional)' }, 'http://10.0.0.1:8080', { replace: true })
+
+  await view.press({ text: 'Pause Polling' })
+  assert.ok(view.find({ text: /worker exploded/ }))
+  // busy must be released so controls stay usable after the failure
+  failToggle = false
+  await view.press({ text: 'Refresh' })
+  assert.equal(view.valueOf(view.find({ label: 'HTTP Proxy URL (optional)' })!), 'http://10.0.0.1:8080')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('long log messages are truncated below the label limit', async () => {
+  const long = 'x'.repeat(5000)
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () =>
+        makeState({ logs: [{ id: '1', at: Date.now(), level: 'error', message: long }] })
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  const item = view.find({ label: /^x+…$/ })
+  assert.ok(item)
+  assert.deepEqual(view.warnings, [])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})

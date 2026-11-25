@@ -1,0 +1,153 @@
+import http from 'node:http'
+import https from 'node:https'
+import net from 'node:net'
+import { assert, test } from 'orca/testing'
+import { createTelegramClient, splitTelegramMessage, TelegramApiError } from './telegram-api'
+
+// Self-signed test-only certificate for api.telegram.org; trusted only via NODE_TLS_REJECT_UNAUTHORIZED below.
+const TEST_KEY = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg57BFix2QIXofeBwK
+gSnmWhJl2087E5h0KuSU4ZZigfahRANCAASvFKo20NSIpHAUIjSsZlhS4Nnf3tic
+cu8q/LHv5+2GtTmjS2sBiH2FWUkbDk1MCr5JjKhMpiSpk+Rdd85KcfNW
+-----END PRIVATE KEY-----
+`
+const TEST_CERT = `-----BEGIN CERTIFICATE-----
+MIIBjTCCATOgAwIBAgIUTM8pkk7iRgfrEMkwPFRK9C4riIAwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQYXBpLnRlbGVncmFtLm9yZzAgFw0yNjExMjUxMjQxMTdaGA8y
+MTI2MTEwMTEyNDExN1owGzEZMBcGA1UEAwwQYXBpLnRlbGVncmFtLm9yZzBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABK8UqjbQ1IikcBQiNKxmWFLg2d/e2Jxy7yr8
+se/n7Ya1OaNLawGIfYVZSRsOTUwKvkmMqEymJKmT5F13zkpx81ajUzBRMB0GA1Ud
+DgQWBBR5xCbmSIZZoNzhPWYza+YNoeZfqzAfBgNVHSMEGDAWgBR5xCbmSIZZoNzh
+PWYza+YNoeZfqzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCZ
+4NtadZ3KeX9EhSxEijTEaMl99Top2PSQbn7d67VorAIgDzm0yKlLKUTxLVbrZTs5
+Kpq+//dqfok+jCJBY4sxVY8=
+-----END CERTIFICATE-----
+`
+
+const TOKEN = '123456:TEST_TOKEN'
+const client = createTelegramClient()
+
+type FakeRequest = { path: string; body: string }
+
+/**
+ * Local HTTP CONNECT proxy whose tunnels end in a local TLS server playing api.telegram.org, so the
+ * real transport (proxy agent, TLS, response handling) runs without network access.
+ */
+async function withFakeTelegram(
+  handler: (req: FakeRequest, res: http.ServerResponse) => void,
+  run: (proxyUrl: string) => Promise<void>
+): Promise<void> {
+  const api = https.createServer({ key: TEST_KEY, cert: TEST_CERT }, (req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => handler({ path: req.url || '', body: Buffer.concat(chunks).toString('utf8') }, res))
+  })
+  const sockets = new Set<net.Socket>()
+  const proxy = net.createServer((socket) => {
+    sockets.add(socket)
+    socket.once('data', () => {
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n', () => api.emit('connection', socket))
+    })
+  })
+  await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+  try {
+    await run(`http://127.0.0.1:${(proxy.address() as net.AddressInfo).port}`)
+  } finally {
+    if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls
+    for (const s of sockets) s.destroy()
+    proxy.close()
+    api.close()
+  }
+}
+
+test('a proxy that accepts TCP but never answers CONNECT times out', { timeout: 5000 }, async () => {
+  const sockets = new Set<net.Socket>()
+  const proxy = net.createServer((socket) => sockets.add(socket))
+  await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  try {
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as net.AddressInfo).port}`
+    await assert.rejects(
+      client.getUpdates(TOKEN, { offset: 1, timeoutSec: 0 }, { proxyUrl, timeoutMs: 200 }),
+      (err: unknown) => err instanceof TelegramApiError && /CONNECT timed out/.test(err.message)
+    )
+  } finally {
+    for (const s of sockets) s.destroy()
+    proxy.close()
+  }
+})
+
+test('a connection dropped mid-body rejects instead of hanging', { timeout: 5000 }, async () => {
+  await withFakeTelegram(
+    (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '1000' })
+      res.write('{"ok":true,"result":', () => res.socket?.destroy())
+    },
+    async (proxyUrl) => {
+      await assert.rejects(client.getMe(TOKEN, { proxyUrl, timeoutMs: 3000 }), TelegramApiError)
+      await assert.rejects(client.downloadFile(TOKEN, 'photos/a.jpg', { proxyUrl, timeoutMs: 3000 }), TelegramApiError)
+    }
+  )
+})
+
+test('sendMessage waits out a short 429 and sends again, keeping the reply when the original is gone', { timeout: 5000 }, async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      if (requests.length === 1) {
+        res.statusCode = 429
+        res.end(JSON.stringify({ ok: false, error_code: 429, description: 'Too Many Requests', parameters: { retry_after: 0 } }))
+        return
+      }
+      res.end(JSON.stringify({ ok: true, result: { message_id: 9, date: 1, chat: { id: 5, type: 'private' } } }))
+    },
+    async (proxyUrl) => {
+      const message = await client.sendMessage(TOKEN, { chatId: 5, text: 'hi', replyToMessageId: 42 }, { proxyUrl })
+      assert.equal(message.message_id, 9)
+    }
+  )
+  assert.equal(requests.length, 2)
+  const body = JSON.parse(requests[1].body) as Record<string, unknown>
+  assert.deepEqual(body.reply_parameters, { message_id: 42, allow_sending_without_reply: true })
+})
+
+test('sendMessage does not block on a long flood wait', { timeout: 5000 }, async () => {
+  let calls = 0
+  await withFakeTelegram(
+    (_req, res) => {
+      calls++
+      res.statusCode = 429
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: false, error_code: 429, description: 'Too Many Requests', parameters: { retry_after: 120 } }))
+    },
+    async (proxyUrl) => {
+      await assert.rejects(
+        client.sendMessage(TOKEN, { chatId: 5, text: 'hi' }, { proxyUrl }),
+        (err: unknown) => err instanceof TelegramApiError && err.statusCode === 429 && err.retryAfterSec === 120
+      )
+    }
+  )
+  assert.equal(calls, 1)
+})
+
+test('an https:// proxy URL fails with a clear message', async () => {
+  await assert.rejects(
+    client.getMe(TOKEN, { proxyUrl: 'https://127.0.0.1:1', timeoutMs: 1000 }),
+    /only http:\/\/ proxies are supported/
+  )
+})
+
+test('splitTelegramMessage never splits an emoji into lone surrogates', () => {
+  const text = 'a'.repeat(3999) + '😀' + 'b'.repeat(100)
+  const chunks = splitTelegramMessage(text)
+  assert.ok(chunks.length > 1)
+  const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+  for (const chunk of chunks) {
+    assert.ok(!loneSurrogate.test(chunk), `chunk has a lone surrogate: ${JSON.stringify(chunk.slice(-2))}`)
+  }
+  assert.equal(chunks.join(''), text)
+})

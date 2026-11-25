@@ -30,7 +30,7 @@ Current manifest already includes:
 - `"engines": { "orca": ">=1.4.248" }`
 - `"license": "MIT"` (matching `./LICENSE`)
 - `"icon": "assets/icon.png"` (256×256 static PNG)
-- Minimal capabilities: `storage:own`, `secrets:own`, `settings:own`, `notifications:show`
+- Minimal capabilities: `storage:own`, `secrets:own`, `settings:own`
 
 Before tagging on GitHub, update/add these fields in `orca-plugin.json`:
 

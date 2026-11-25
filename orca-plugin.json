@@ -5,12 +5,12 @@
   "version": "0.1.1",
   "description": "Two-way Telegram bot bridge that routes messages to your Orca bots and sends replies back.",
   "license": "MIT",
-  "repository": "https://github.com/henryma96/orca-telegram-bridge",
-  "homepage": "https://github.com/henryma96/orca-telegram-bridge",
-  "publisher": "henryma96",
+  "repository": "https://github.com/drecchia/orca-telegram-bridge",
+  "homepage": "https://github.com/drecchia/orca-telegram-bridge",
+  "publisher": "drecchia",
   "author": {
-    "name": "henryma96",
-    "url": "https://github.com/henryma96"
+    "name": "drecchia",
+    "url": "https://github.com/drecchia"
   },
   "icon": "assets/icon.png",
   "engines": {
@@ -60,7 +60,7 @@
       {
         "key": "defaultBot",
         "title": "Default Orca Bot",
-        "description": "Default Orca bot name to route Telegram messages to (leave blank to use the first available bot).",
+        "description": "Default Orca bot name to route Telegram messages to (leave blank for auto: use the first available bot).",
         "type": "string",
         "default": "",
         "placeholder": "e.g. Assistant"
@@ -108,9 +108,6 @@
     },
     {
       "kind": "settings:own"
-    },
-    {
-      "kind": "notifications:show"
     }
   ]
 }

@@ -49,6 +49,8 @@ const STORAGE_LAST_BLOCKED = 'tg.lastBlockedUserId'
 const STORAGE_SYNC_CURSORS = 'tg.syncCursors'
 const STATUS_BAR_ID = 'telegram-status'
 const MAX_LOGS = 60
+const MAX_DETAIL_CHARS = 500
+const BLOCK_LOG_INTERVAL_MS = 60_000
 
 type SyncCursor = {
   tailHashes: string[]
@@ -83,11 +85,18 @@ export type BridgeDeps = {
 
 type IncomingTelegramImage = {
   fileId: string
-  mimeType?: string
-  preferredExt?: string
+  ext: string
 }
 
 const ALLOWED_IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'])
+const IMAGE_EXT_BY_MIME: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/bmp': '.bmp'
+}
 
 function extractIncomingImage(msg: TelegramMessage): IncomingTelegramImage | null {
   if (msg.photo && msg.photo.length > 0) {
@@ -96,35 +105,24 @@ function extractIncomingImage(msg: TelegramMessage): IncomingTelegramImage | nul
       const itemScore = item.file_size ?? item.width * item.height
       return itemScore >= bestScore ? item : best
     })
-    return { fileId: largest.file_id, preferredExt: '.jpg' }
+    return { fileId: largest.file_id, ext: '.jpg' }
   }
   if (msg.document && msg.document.mime_type?.toLowerCase().startsWith('image/')) {
     const docExt = msg.document.file_name
       ? path.extname(msg.document.file_name).toLowerCase()
       : ''
-    return {
-      fileId: msg.document.file_id,
-      mimeType: msg.document.mime_type,
-      preferredExt: ALLOWED_IMAGE_EXTS.has(docExt) ? docExt : undefined
-    }
+    const ext = ALLOWED_IMAGE_EXTS.has(docExt)
+      ? docExt
+      : IMAGE_EXT_BY_MIME[msg.document.mime_type?.toLowerCase() ?? '']
+    // Other image types (SVG, HEIC, ...) are refused: saved under a wrong extension the agent cannot read them.
+    return ext ? { fileId: msg.document.file_id, ext } : null
   }
   return null
 }
 
-function resolveSafeImageExt(
-  filePath?: string,
-  mimeType?: string,
-  preferredExt?: string
-): string {
+function resolveSafeImageExt(filePath: string | undefined, fallbackExt: string): string {
   const fromPath = filePath ? path.extname(filePath).toLowerCase() : ''
-  if (ALLOWED_IMAGE_EXTS.has(fromPath)) return fromPath
-  if (preferredExt && ALLOWED_IMAGE_EXTS.has(preferredExt)) return preferredExt
-  const mime = mimeType?.toLowerCase()
-  if (mime === 'image/png') return '.png'
-  if (mime === 'image/webp') return '.webp'
-  if (mime === 'image/gif') return '.gif'
-  if (mime === 'image/bmp') return '.bmp'
-  return '.jpg'
+  return ALLOWED_IMAGE_EXTS.has(fromPath) ? fromPath : fallbackExt
 }
 
 function parseAllowedIds(raw: string): Set<string> {
@@ -141,6 +139,10 @@ function formatSenderLabel(msg: TelegramMessage): string {
   if (!from) return `chat:${msg.chat.id}`
   if (from.username) return `@${from.username}`
   return `${from.first_name} (${from.id})`
+}
+
+function truncateText(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -187,16 +189,22 @@ export class TelegramBridgeController {
   }
 
   private cachedToken: string | null = null
+  // The token that updateOffset, botUsername and commandsRegistered belong to.
+  private identityToken: string | null = null
   private commandsRegistered = false
   private pollAbort: AbortController | null = null
   private pollLoopPromise: Promise<void> | null = null
   private outboundLoopPromise: Promise<void> | null = null
+  private outboundLoopAbort: AbortController | null = null
   private readonly chatQueues = new Map<string, Promise<void>>()
   private readonly activeTelegramTgChats = new Set<string>()
   private readonly activeTelegramOrcaChats = new Set<string>()
+  private readonly blockedLoggedAt = new Map<string, number>()
   private outboundSyncRunning = false
   private disposed = false
+  private botsRefresh: Promise<void> | null = null
   private backgroundBotsRefresh: Promise<void> | null = null
+  private configOp: Promise<unknown> = Promise.resolve()
 
   constructor(orca: OrcaWorkerApi, deps: BridgeDeps) {
     this.orca = orca
@@ -204,7 +212,9 @@ export class TelegramBridgeController {
   }
 
   async init(): Promise<void> {
-    await this.loadPersistedState()
+    await this.loadConfig()
+    await this.loadRuntimeState()
+    this.identityToken = this.cachedToken
     this.updateInitialStatus()
     this.emitState()
     if (this.config.hasToken && this.config.enabled) {
@@ -234,12 +244,28 @@ export class TelegramBridgeController {
     }
   }
 
-  async reloadFromSettingsAndSecrets(): Promise<void> {
+  // saveConfig's own settings.set calls fire onDidChange reloads. Running both through one chain
+  // makes those reloads start after the save, so a settings snapshot taken mid-save cannot roll it back.
+  private runConfigOp<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.configOp.then(op)
+    this.configOp = run.catch(() => {})
+    return run
+  }
+
+  reloadFromSettingsAndSecrets(): Promise<void> {
+    return this.runConfigOp(() => this.reloadConfigNow())
+  }
+
+  private async reloadConfigNow(): Promise<void> {
     const prevSync = this.config.syncOrcaOutbound
-    await this.loadPersistedState()
+    await this.loadConfig()
     this.refreshBotsInBackground()
     if (!prevSync && this.config.syncOrcaOutbound) {
       await this.resetSyncCursors()
+    }
+    if (this.cachedToken !== this.identityToken) {
+      await this.stopPolling()
+      await this.adoptToken(this.cachedToken)
     }
     if (!this.config.hasToken) {
       await this.stopPolling()
@@ -258,15 +284,19 @@ export class TelegramBridgeController {
     if (!this.pollAbort) {
       this.startPolling()
     } else {
-      if (this.config.syncOrcaOutbound && !this.outboundLoopPromise) {
+      if (this.config.syncOrcaOutbound) {
         this.ensureOutboundLoopStarted(this.pollAbort)
       }
       this.emitState()
     }
   }
 
-  async saveConfig(input: SaveConfigInput): Promise<BridgeState> {
-    const prevSync = this.config.syncOrcaOutbound
+  saveConfig(input: SaveConfigInput): Promise<BridgeState> {
+    return this.runConfigOp(() => this.saveConfigNow(input))
+  }
+
+  private async saveConfigNow(input: SaveConfigInput): Promise<BridgeState> {
+    const prev = { ...this.config }
     if (input.clearToken) {
       try {
         await this.orca.secrets.delete(SECRET_BOT_TOKEN)
@@ -300,22 +330,27 @@ export class TelegramBridgeController {
       replyTimeoutSec: timeout,
       syncOrcaOutbound
     }
-    if (!prevSync && syncOrcaOutbound) {
+    if (!prev.syncOrcaOutbound && syncOrcaOutbound) {
       await this.resetSyncCursors()
     }
     this.lastError = null
-    await this.refreshBots()
+    this.refreshBotsInBackground()
     await this.appendLog('info', 'Configuration saved.')
 
-    await this.stopPolling()
+    const tokenChanged = this.cachedToken !== this.identityToken
+    // Restarting aborts in-flight replies, so restart only when the Telegram connection itself changes.
+    if (tokenChanged || prev.proxyUrl !== this.config.proxyUrl || prev.enabled !== this.config.enabled) {
+      await this.stopPolling()
+    }
+    await this.adoptToken(this.cachedToken)
     if (!this.config.hasToken) {
       this.status = 'needs_token'
-      this.botUsername = null
-      this.botDisplayName = null
-    } else if (this.config.enabled) {
-      this.startPolling()
-    } else {
+    } else if (!this.config.enabled) {
       this.status = 'stopped'
+    } else if (!this.pollAbort) {
+      this.startPolling()
+    } else if (this.config.syncOrcaOutbound) {
+      this.ensureOutboundLoopStarted(this.pollAbort)
     }
     this.emitState()
     return this.getState()
@@ -348,7 +383,10 @@ export class TelegramBridgeController {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       this.lastError = message
-      this.status = 'error'
+      // While paused a failed test is not a polling failure; lastError alone reports it.
+      if (this.pollAbort) {
+        this.status = 'error'
+      }
       await this.appendLog('error', `Telegram connection test failed: ${message}`)
       this.emitState()
       return { ok: false, error: message, state: this.getState() }
@@ -399,11 +437,17 @@ export class TelegramBridgeController {
   }
 
   async resetBinding(tgChatId: string): Promise<BridgeState> {
-    this.bindings = this.bindings.filter((b) => b.tgChatId !== tgChatId)
-    await this.orca.storage.set(STORAGE_BINDINGS, this.bindings)
-    await this.pruneUnusedSyncCursors()
-    await this.appendLog('info', `Reset Orca chat binding for Telegram chat ${tgChatId}.`)
-    this.emitState()
+    // Queued behind a running reply, which would otherwise write the binding back when it ends.
+    // The panel request does not wait for that reply; the state post after the reset updates it.
+    const busy = this.chatQueues.has(tgChatId)
+    const done = this.enqueueChatWork(tgChatId, async () => {
+      this.bindings = this.bindings.filter((b) => b.tgChatId !== tgChatId)
+      await this.orca.storage.set(STORAGE_BINDINGS, this.bindings)
+      await this.pruneUnusedSyncCursors()
+      await this.appendLog('info', `Reset Orca chat binding for Telegram chat ${tgChatId}.`)
+      this.emitState()
+    })
+    if (!busy) await done
     return this.getState()
   }
 
@@ -415,31 +459,42 @@ export class TelegramBridgeController {
   }
 
   async handleIncomingUpdate(update: TelegramUpdate): Promise<void> {
+    const accepted = await this.acceptIncomingUpdate(update, this.pollAbort?.signal)
+    await accepted?.done
+  }
+
+  // The ordered part of an update: offset, allowlist, then enqueue on the chat's queue. The queued
+  // work is returned, not awaited, so the poll loop keeps serving other chats during a slow reply.
+  private async acceptIncomingUpdate(
+    update: TelegramUpdate,
+    signal?: AbortSignal
+  ): Promise<{ done: Promise<void> } | null> {
     if (update.update_id >= this.updateOffset) {
       this.updateOffset = update.update_id + 1
       await this.orca.storage.set(STORAGE_OFFSET, this.updateOffset)
     }
 
     if (update.callback_query) {
-      await this.handleIncomingCallbackQuery(update.callback_query)
-      return
+      return this.acceptCallbackQuery(update.callback_query)
     }
 
     const msg = update.message
-    if (!msg) return
+    if (!msg) return null
     const text = (msg.text ?? msg.caption ?? '').trim()
     const image = extractIncomingImage(msg)
-    if (!text && !image) return
+    const unsupportedImage =
+      !image && Boolean(msg.document?.mime_type?.toLowerCase().startsWith('image/'))
+    if (!text && !image && !unsupportedImage) return null
 
     const tgChatId = String(msg.chat.id)
     const fromId = msg.from ? String(msg.from.id) : tgChatId
     const allowed = parseAllowedIds(this.config.allowedUserIds)
 
     if (!allowed.has(fromId) && !allowed.has(tgChatId)) {
-      this.lastBlockedUserId = fromId
-      await this.orca.storage.set(STORAGE_LAST_BLOCKED, fromId)
-      await this.appendLog('warn', `Blocked unauthorized Telegram user ${fromId} (${formatSenderLabel(msg)}).`)
-      this.emitState()
+      await this.recordBlockedUser(
+        fromId,
+        `Blocked unauthorized Telegram user ${fromId} (${formatSenderLabel(msg)}).`
+      )
 
       const token = await this.readToken()
       if (token && allowed.size === 0) {
@@ -450,44 +505,87 @@ export class TelegramBridgeController {
           msg.message_id
         )
       }
-      return
+      return null
     }
 
-    await this.enqueueChatWork(tgChatId, () => this.processAuthorizedMessage(msg, text, image))
+    const done = this.enqueueChatWork(tgChatId, async () => {
+      try {
+        if (unsupportedImage) {
+          const token = await this.readToken()
+          if (token) {
+            await this.safeSendTelegram(
+              token,
+              msg.chat.id,
+              '暂不支持该图片格式，请发送 JPG、PNG、WEBP、GIF 或 BMP 图片。',
+              msg.message_id
+            )
+          }
+          return
+        }
+        await this.processAuthorizedMessage(msg, text, image, signal)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await this.appendLog('error', `Failed handling Telegram message in chat ${tgChatId}: ${message}`)
+        this.emitState()
+        const token = await this.readToken()
+        if (token) {
+          await this.safeSendTelegram(
+            token,
+            msg.chat.id,
+            `处理失败：${truncateText(message, MAX_DETAIL_CHARS)}`,
+            msg.message_id
+          )
+        }
+      }
+    })
+    return { done }
   }
 
-  private async handleIncomingCallbackQuery(cq: TelegramCallbackQuery): Promise<void> {
+  private async acceptCallbackQuery(
+    cq: TelegramCallbackQuery
+  ): Promise<{ done: Promise<void> } | null> {
     const fromId = String(cq.from.id)
     const tgChatId = cq.message ? String(cq.message.chat.id) : fromId
     const allowed = parseAllowedIds(this.config.allowedUserIds)
     const token = await this.readToken()
 
     if (!allowed.has(fromId) && !allowed.has(tgChatId)) {
-      this.lastBlockedUserId = fromId
-      await this.orca.storage.set(STORAGE_LAST_BLOCKED, fromId)
-      await this.appendLog('warn', `Blocked unauthorized Telegram callback from ${fromId}.`)
-      this.emitState()
+      await this.recordBlockedUser(fromId, `Blocked unauthorized Telegram callback from ${fromId}.`)
       if (token) {
         await this.safeAnswerCallbackQuery(token, cq.id, '未授权访问，请先加入白名单。', true)
       }
-      return
+      return null
     }
 
     if (!token || !cq.message || !cq.data) {
       if (token) {
         await this.safeAnswerCallbackQuery(token, cq.id)
       }
-      return
+      return null
     }
 
-    await this.enqueueChatWork(tgChatId, () => this.processCallbackQuery(token, cq))
+    const done = this.enqueueChatWork(tgChatId, async () => {
+      try {
+        await this.processCallbackQuery(token, cq)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        await this.appendLog('error', `Failed handling Telegram button in chat ${tgChatId}: ${message}`)
+        this.emitState()
+        await this.safeAnswerCallbackQuery(token, cq.id, `操作失败：${message.slice(0, 120)}`, true)
+      }
+    })
+    return { done }
   }
 
   private enqueueChatWork(tgChatId: string, work: () => Promise<void>): Promise<void> {
     const prev = this.chatQueues.get(tgChatId) ?? Promise.resolve()
     const next = prev
-      .catch(() => {})
       .then(work)
+      // The work runs detached from the poll loop, so a rejection must end here.
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err)
+        this.orca.log(`[error] Telegram chat ${tgChatId} work failed: ${message}`)
+      })
       .finally(() => {
         if (this.chatQueues.get(tgChatId) === next) {
           this.chatQueues.delete(tgChatId)
@@ -497,15 +595,31 @@ export class TelegramBridgeController {
     return next
   }
 
+  // Any stranger can flood the bot; log and post each blocked id at most once a minute.
+  private async recordBlockedUser(fromId: string, logMessage: string): Promise<void> {
+    const now = Date.now()
+    for (const [id, at] of this.blockedLoggedAt) {
+      if (now - at >= BLOCK_LOG_INTERVAL_MS) this.blockedLoggedAt.delete(id)
+    }
+    if (this.blockedLoggedAt.has(fromId)) return
+    this.blockedLoggedAt.set(fromId, now)
+    this.lastBlockedUserId = fromId
+    await this.orca.storage.set(STORAGE_LAST_BLOCKED, fromId)
+    await this.appendLog('warn', logMessage)
+    this.emitState()
+  }
+
   private async processAuthorizedMessage(
     msg: TelegramMessage,
     text: string,
-    image: IncomingTelegramImage | null = null
+    image: IncomingTelegramImage | null,
+    signal: AbortSignal | undefined
   ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
 
     const tgChatId = String(msg.chat.id)
+    const fromId = msg.from ? String(msg.from.id) : tgChatId
     const senderLabel = formatSenderLabel(msg)
 
     if (!image && text.startsWith('/')) {
@@ -513,7 +627,7 @@ export class TelegramBridgeController {
       if (handled) return
     }
 
-    const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId))
+    const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId, fromId))
     if (!binding.botName) {
       await this.appendLog('error', 'No Orca bots found to route incoming Telegram message.')
       this.emitState()
@@ -550,7 +664,7 @@ export class TelegramBridgeController {
         } catch {
           // Non-fatal typing failure.
         }
-        const savedPath = await this.downloadTelegramImage(token, image, msg.message_id)
+        const savedPath = await this.downloadTelegramImage(token, image, msg.message_id, signal)
         imagePaths.push(savedPath)
       }
 
@@ -563,7 +677,7 @@ export class TelegramBridgeController {
         imagePaths,
         timeoutMs: this.config.replyTimeoutSec * 1000,
         pollIntervalMs: this.deps.pollIntervalMs,
-        signal: this.pollAbort?.signal,
+        signal,
         onChatBound: async (chatId, title) => {
           boundOrcaChatId = chatId
           this.activeTelegramOrcaChats.add(chatId)
@@ -632,7 +746,7 @@ export class TelegramBridgeController {
       await this.safeSendTelegram(
         token,
         msg.chat.id,
-        `处理失败：${message}`,
+        `处理失败：${truncateText(message, MAX_DETAIL_CHARS)}`,
         msg.message_id
       )
     } finally {
@@ -646,12 +760,13 @@ export class TelegramBridgeController {
   private async downloadTelegramImage(
     token: string,
     image: IncomingTelegramImage,
-    messageId: number
+    messageId: number,
+    signal: AbortSignal | undefined
   ): Promise<string> {
     const fileMeta = await this.deps.telegram.getFile(token, image.fileId, {
       proxyUrl: this.config.proxyUrl,
       timeoutMs: 15_000,
-      signal: this.pollAbort?.signal
+      signal
     })
     if (!fileMeta.file_path) {
       throw new Error('Telegram did not return a downloadable file_path for this image.')
@@ -659,14 +774,14 @@ export class TelegramBridgeController {
     const bytes = await this.deps.telegram.downloadFile(token, fileMeta.file_path, {
       proxyUrl: this.config.proxyUrl,
       timeoutMs: 30_000,
-      signal: this.pollAbort?.signal
+      signal
     })
 
     const dir = this.deps.downloadDir ?? path.join(os.tmpdir(), 'orca-telegram-bridge', 'images')
-    await fs.mkdir(dir, { recursive: true })
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 })
     await this.cleanupOldDownloadedImages(dir)
 
-    const ext = resolveSafeImageExt(fileMeta.file_path, image.mimeType, image.preferredExt)
+    const ext = resolveSafeImageExt(fileMeta.file_path, image.ext)
     const filename = `tg-${Date.now()}-${messageId}-${Math.random().toString(36).slice(2, 6)}${ext}`
     const targetPath = path.join(dir, filename)
     await fs.writeFile(targetPath, bytes)
@@ -754,7 +869,8 @@ export class TelegramBridgeController {
     const cmd = rawCmd.split('@')[0].toLowerCase()
     const arg = rest.join(' ').trim()
     const tgChatId = String(msg.chat.id)
-    const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId))
+    const fromId = msg.from ? String(msg.from.id) : tgChatId
+    const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId, fromId))
 
     if (cmd === '/start' || cmd === '/help') {
       const helpText = [
@@ -795,12 +911,11 @@ export class TelegramBridgeController {
           }))
         )
       }
-      await this.safeSendTelegram(
+      await this.safeSendTelegramChunks(
         token,
         msg.chat.id,
         lines.join('\n'),
         msg.message_id,
-        false,
         keyboardRows.length > 0 ? { inline_keyboard: keyboardRows } : undefined
       )
       return true
@@ -815,7 +930,7 @@ export class TelegramBridgeController {
       const match = this.bots.find((b) => b.name.toLowerCase() === arg.toLowerCase())
       if (!match) {
         const names = this.bots.map((b) => b.name).join('、') || '无'
-        await this.safeSendTelegram(
+        await this.safeSendTelegramChunks(
           token,
           msg.chat.id,
           `未找到名为 "${arg}" 的 Bot。可用 Bot：${names}`,
@@ -951,7 +1066,12 @@ export class TelegramBridgeController {
         await this.safeSendTelegram(token, msg.chat.id, `已将当前会话重命名为：${arg}`, msg.message_id)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        await this.safeSendTelegram(token, msg.chat.id, `重命名失败：${message}`, msg.message_id)
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          `重命名失败：${truncateText(message, MAX_DETAIL_CHARS)}`,
+          msg.message_id
+        )
       }
       return true
     }
@@ -1025,7 +1145,12 @@ export class TelegramBridgeController {
         )
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        await this.safeSendTelegram(token, msg.chat.id, `获取自动化任务失败：${message}`, msg.message_id)
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          `获取自动化任务失败：${truncateText(message, MAX_DETAIL_CHARS)}`,
+          msg.message_id
+        )
       }
       return true
     }
@@ -1047,7 +1172,12 @@ export class TelegramBridgeController {
         await this.safeSendTelegram(token, msg.chat.id, `已触发自动化任务：${arg}`, msg.message_id)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        await this.safeSendTelegram(token, msg.chat.id, `触发失败：${message}`, msg.message_id)
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          `触发失败：${truncateText(message, MAX_DETAIL_CHARS)}`,
+          msg.message_id
+        )
       }
       return true
     }
@@ -1072,7 +1202,9 @@ export class TelegramBridgeController {
     const data = cq.data || ''
     if (!msg) return
     const tgChatId = String(msg.chat.id)
-    const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId))
+    const binding = await this.resolveBindingBot(
+      await this.getOrCreateBinding(tgChatId, String(cq.from.id))
+    )
 
     if (data.startsWith('u:')) {
       const botId = data.slice(2)
@@ -1233,7 +1365,7 @@ export class TelegramBridgeController {
     if (!prev && enabled) {
       await this.resetSyncCursors()
     }
-    if (enabled && this.pollAbort && !this.outboundLoopPromise) {
+    if (enabled && this.pollAbort) {
       this.ensureOutboundLoopStarted(this.pollAbort)
     }
     await this.appendLog(
@@ -1295,6 +1427,27 @@ export class TelegramBridgeController {
     }
   }
 
+  // Plain text over Telegram's 4096-char limit is rejected, so long lists go out in chunks.
+  private async safeSendTelegramChunks(
+    token: string,
+    chatId: number | string,
+    text: string,
+    replyToMessageId?: number,
+    replyMarkup?: TelegramInlineKeyboardMarkup
+  ): Promise<void> {
+    const chunks = splitTelegramMessage(text, 3500)
+    for (let i = 0; i < chunks.length; i++) {
+      await this.safeSendTelegram(
+        token,
+        chatId,
+        chunks[i],
+        i === 0 ? replyToMessageId : undefined,
+        false,
+        i === chunks.length - 1 ? replyMarkup : undefined
+      )
+    }
+  }
+
   private async safeSendTelegramPhoto(
     token: string,
     chatId: number | string,
@@ -1338,12 +1491,17 @@ export class TelegramBridgeController {
     this.lastError = null
     this.emitState()
 
-    this.pollLoopPromise = this.runPollLoop(abort).finally(() => {
+    const loop = this.runPollLoop(abort).finally(() => {
+      // The loop also ends on its own (401, no token); abort so the outbound loop and queued replies stop.
+      abort.abort()
       if (this.pollAbort === abort) {
         this.pollAbort = null
       }
-      this.pollLoopPromise = null
+      if (this.pollLoopPromise === loop) {
+        this.pollLoopPromise = null
+      }
     })
+    this.pollLoopPromise = loop
 
     if (this.config.syncOrcaOutbound) {
       this.ensureOutboundLoopStarted(abort)
@@ -1351,23 +1509,29 @@ export class TelegramBridgeController {
   }
 
   private ensureOutboundLoopStarted(abort: AbortController): void {
-    if (this.disposed || this.outboundLoopPromise) return
-    this.outboundLoopPromise = this.runOutboundSyncLoop(abort).finally(() => {
-      this.outboundLoopPromise = null
-    })
+    if (this.disposed || this.outboundLoopAbort === abort) return
+    // The loop of an aborted controller may still be finishing a tick; run the new loop after it.
+    const prev = this.outboundLoopPromise ?? Promise.resolve()
+    const loop = prev
+      .then(() => this.runOutboundSyncLoop(abort))
+      .finally(() => {
+        if (this.outboundLoopPromise === loop) {
+          this.outboundLoopPromise = null
+          this.outboundLoopAbort = null
+        }
+      })
+    this.outboundLoopAbort = abort
+    this.outboundLoopPromise = loop
   }
 
   private async stopPolling(): Promise<void> {
-    if (this.pollAbort) {
-      this.pollAbort.abort()
-      this.pollAbort = null
-    }
-    if (this.pollLoopPromise) {
-      await this.pollLoopPromise
-    }
-    if (this.outboundLoopPromise) {
-      await this.outboundLoopPromise
-    }
+    // Read the loops before awaiting: loops of a restart during the wait are not ours to wait for.
+    const loops = [this.pollLoopPromise, this.outboundLoopPromise]
+    this.pollAbort?.abort()
+    this.pollAbort = null
+    await Promise.all(loops)
+    // Replies still running in chat queues got the aborted poll signal; wait for them to settle.
+    await Promise.all(this.chatQueues.values())
   }
 
   private async runOutboundSyncLoop(abort: AbortController): Promise<void> {
@@ -1393,14 +1557,20 @@ export class TelegramBridgeController {
     const allowed = parseAllowedIds(this.config.allowedUserIds)
     if (allowed.size === 0) return
 
-    const boundList = this.bindings.filter((b) => Boolean(b.orcaChatId))
+    // Sync only to chats whose Telegram user is still on the allowlist.
+    const boundList = this.bindings.filter(
+      (b) =>
+        Boolean(b.orcaChatId) &&
+        (allowed.has(b.tgChatId) || (b.ownerUserId !== undefined && allowed.has(b.ownerUserId)))
+    )
     if (boundList.length === 0) return
 
     this.outboundSyncRunning = true
     try {
+      await this.refreshBots()
       const byBot = new Map<string, ChatBinding[]>()
       for (const rawBinding of boundList) {
-        const binding = await this.resolveBindingBot(rawBinding)
+        const binding = await this.resolveBindingFromCachedBots(rawBinding)
         if (!binding.orcaChatId || !binding.botName) continue
         if (
           this.activeTelegramTgChats.has(binding.tgChatId) ||
@@ -1622,6 +1792,21 @@ export class TelegramBridgeController {
 
         await this.ensureCommandsRegistered(token, abort.signal)
 
+        // While not yet connected, a short poll confirms the connection right away instead of
+        // leaving the status on "connecting" for a whole 25s long poll.
+        const updates = await this.deps.telegram.getUpdates(
+          token,
+          {
+            offset: this.updateOffset || undefined,
+            timeoutSec: this.status === 'connected' ? 25 : 0
+          },
+          { proxyUrl: this.config.proxyUrl, signal: abort.signal }
+        )
+
+        this.lastPollAt = Date.now()
+        backoffMs = this.deps.retryBackoffMs ?? 2000
+
+        // Only a successful getUpdates proves the connection (a second poller gets 409 here).
         if (this.status !== 'connected') {
           this.status = 'connected'
           this.lastError = null
@@ -1632,18 +1817,9 @@ export class TelegramBridgeController {
           this.emitState()
         }
 
-        const updates = await this.deps.telegram.getUpdates(
-          token,
-          { offset: this.updateOffset || undefined, timeoutSec: 25 },
-          { proxyUrl: this.config.proxyUrl, signal: abort.signal }
-        )
-
-        this.lastPollAt = Date.now()
-        backoffMs = this.deps.retryBackoffMs ?? 2000
-
         for (const update of updates) {
           if (abort.signal.aborted || this.disposed) break
-          await this.handleIncomingUpdate(update)
+          await this.acceptIncomingUpdate(update, abort.signal)
         }
       } catch (err) {
         if (abort.signal.aborted || this.disposed) break
@@ -1663,7 +1839,7 @@ export class TelegramBridgeController {
     }
   }
 
-  private async loadPersistedState(): Promise<void> {
+  private async loadConfig(): Promise<void> {
     this.cachedToken = await this.readToken()
     const settings = await this.orca.settings.get()
 
@@ -1683,7 +1859,10 @@ export class TelegramBridgeController {
       syncOrcaOutbound:
         typeof settings.syncOrcaOutbound === 'boolean' ? settings.syncOrcaOutbound : false
     }
+  }
 
+  // Runtime state is read once at init; afterwards memory owns it and storage is write-through.
+  private async loadRuntimeState(): Promise<void> {
     const savedOffset = await this.orca.storage.get(STORAGE_OFFSET)
     this.updateOffset = typeof savedOffset === 'number' ? savedOffset : 0
 
@@ -1713,7 +1892,28 @@ export class TelegramBridgeController {
     }
   }
 
-  private async refreshBots(): Promise<void> {
+  // updateOffset, the @username and the command menu belong to one bot; a new token starts them over.
+  private async adoptToken(token: string | null): Promise<void> {
+    if (token === this.identityToken) return
+    this.identityToken = token
+    this.updateOffset = 0
+    this.botUsername = null
+    this.botDisplayName = null
+    this.commandsRegistered = false
+    await this.orca.storage.set(STORAGE_OFFSET, 0)
+  }
+
+  // One shared `orca bot list` call for every caller: sync ticks, messages and panel loads.
+  private refreshBots(): Promise<void> {
+    if (!this.botsRefresh) {
+      this.botsRefresh = this.loadBots().finally(() => {
+        this.botsRefresh = null
+      })
+    }
+    return this.botsRefresh
+  }
+
+  private async loadBots(): Promise<void> {
     try {
       this.bots = await this.deps.orcaCli.listBots()
       if (
@@ -1741,6 +1941,10 @@ export class TelegramBridgeController {
 
   private async resolveBindingBot(binding: ChatBinding): Promise<ChatBinding> {
     await this.refreshBots()
+    return this.resolveBindingFromCachedBots(binding)
+  }
+
+  private async resolveBindingFromCachedBots(binding: ChatBinding): Promise<ChatBinding> {
     if (this.bots.length === 0) return binding
 
     const byName = this.bots.find((b) => b.name === binding.botName)
@@ -1774,12 +1978,18 @@ export class TelegramBridgeController {
     return binding
   }
 
-  private async getOrCreateBinding(tgChatId: string): Promise<ChatBinding> {
+  private async getOrCreateBinding(tgChatId: string, ownerUserId: string): Promise<ChatBinding> {
     const existing = this.bindings.find((b) => b.tgChatId === tgChatId)
-    if (existing) return existing
+    if (existing) {
+      if (existing.ownerUserId === ownerUserId) return existing
+      const owned: ChatBinding = { ...existing, ownerUserId }
+      await this.upsertBinding(owned)
+      return owned
+    }
     const defaultMatch = this.bots.find((b) => b.name === this.config.defaultBot) || this.bots[0]
     const created: ChatBinding = {
       tgChatId,
+      ownerUserId,
       botId: defaultMatch?.id,
       botName: defaultMatch?.name || this.config.defaultBot || '',
       orcaChatId: null,
@@ -1792,7 +2002,9 @@ export class TelegramBridgeController {
   private async upsertBinding(binding: ChatBinding): Promise<void> {
     const idx = this.bindings.findIndex((b) => b.tgChatId === binding.tgChatId)
     if (idx >= 0) {
-      this.bindings[idx] = binding
+      // Callers rebuild bindings field by field; keep the owner unless they set a new one.
+      const ownerUserId = binding.ownerUserId ?? this.bindings[idx].ownerUserId
+      this.bindings[idx] = ownerUserId === undefined ? binding : { ...binding, ownerUserId }
     } else {
       this.bindings.push(binding)
     }
@@ -1804,10 +2016,10 @@ export class TelegramBridgeController {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       at: Date.now(),
       level,
-      message
+      message: truncateText(message, MAX_DETAIL_CHARS)
     }
     this.logs = [entry, ...this.logs].slice(0, MAX_LOGS)
-    this.orca.log(`[${level}] ${message}`)
+    this.orca.log(`[${level}] ${entry.message}`)
     try {
       await this.orca.storage.set(STORAGE_LOGS, this.logs)
     } catch {

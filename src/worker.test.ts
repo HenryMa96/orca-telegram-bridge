@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import { setImmediate as nextTurn } from 'node:timers/promises'
+import { assert, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
   computeTailHashes,
@@ -15,12 +16,14 @@ import { extractTablesFromMarkdown } from './table-render'
 import {
   markdownToTelegramHtml,
   splitTelegramMessage,
+  TelegramApiError,
   type TelegramBotCommand,
   type TelegramClient,
-  type TelegramInlineKeyboardMarkup
+  type TelegramInlineKeyboardMarkup,
+  type TelegramUpdate
 } from './telegram-api'
 import * as main from './worker'
-import { TelegramBridgeController } from './worker'
+import { TelegramBridgeController, type BridgeDeps } from './worker'
 
 function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; orcaCli: Partial<OrcaCliRunner> }> = {}) {
   const sentMessages: {
@@ -205,6 +208,72 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     sentToBots,
     renamedChats,
     triggeredAutomations
+  }
+}
+
+const CAPABILITIES = ['storage:own', 'secrets:own', 'settings:own', 'notifications:show']
+
+async function mountController(host: MockHost, deps: BridgeDeps) {
+  let controller!: TelegramBridgeController
+  const worker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        controller = new TelegramBridgeController(orca, deps)
+        await controller.init()
+      }
+    },
+    { host }
+  )
+  return { controller, worker }
+}
+
+// A regression that deadlocks fails the test instead of hanging it (the same guard as the activation test).
+async function within<T>(promise: Promise<T>, label: string, ms = 2000): Promise<T> {
+  const timeout = Promise.withResolvers<never>()
+  const timer = setTimeout(() => timeout.reject(new Error(`Timed out waiting for ${label}`)), ms)
+  try {
+    return await Promise.race([promise, timeout.promise])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// Yields whole event-loop turns (no clock wait) so in-memory host calls settle between checks.
+async function until(ready: () => boolean, label: string): Promise<void> {
+  for (let i = 0; i < 2000; i++) {
+    if (ready()) return
+    await nextTurn()
+  }
+  throw new Error(`Gave up waiting for ${label}`)
+}
+
+// Returns each batch once, then long-polls until the poll loop aborts, like Telegram with no new updates.
+function scriptedGetUpdates(
+  batches: TelegramUpdate[][],
+  onPoll?: (token: string, offset: number | undefined) => void
+): TelegramClient['getUpdates'] {
+  let call = 0
+  return async (token, params, options) => {
+    onPoll?.(token, params.offset)
+    const batch = batches[call++]
+    if (batch) return batch
+    const aborted = Promise.withResolvers<void>()
+    options?.signal?.addEventListener('abort', () => aborted.resolve(), { once: true })
+    if (!options?.signal?.aborted) await aborted.promise
+    return []
+  }
+}
+
+function textUpdate(updateId: number, userId: number, text: string): TelegramUpdate {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: 100 + updateId,
+      from: { id: userId, is_bot: false, first_name: 'User' },
+      chat: { id: userId, type: 'private' },
+      date: 1000,
+      text
+    }
   }
 }
 
@@ -898,4 +967,449 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
   assert.deepEqual(capturedWorker.refusals, [])
   await controller.dispose()
   await capturedWorker.deactivate()
+})
+
+test('a slow bot reply in one Telegram chat does not hold up another chat', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '111, 222', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({
+    telegram: {
+      getUpdates: scriptedGetUpdates([[textUpdate(1, 111, 'slow question'), textUpdate(2, 222, 'quick question')]])
+    }
+  })
+  const releaseA = Promise.withResolvers<void>()
+  const replyA = Promise.withResolvers<void>()
+  const replyB = Promise.withResolvers<void>()
+  const baseSendToBot = deps.orcaCli.sendToBot
+  deps.orcaCli.sendToBot = async (params) => {
+    if (params.body.includes('chat 111')) await releaseA.promise
+    return baseSendToBot(params)
+  }
+  const baseSendMessage = deps.telegram.sendMessage
+  deps.telegram.sendMessage = async (token, params, options) => {
+    const sent = await baseSendMessage(token, params, options)
+    if (String(params.chatId) === '111') replyA.resolve()
+    if (String(params.chatId) === '222') replyB.resolve()
+    return sent
+  }
+
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1,
+    retryBackoffMs: 1
+  })
+  try {
+    await within(replyB.promise, 'chat 222 reply while chat 111 is still waiting')
+    assert.ok(!deps.sentMessages.some((m) => String(m.chatId) === '111'))
+
+    releaseA.resolve()
+    await within(replyA.promise, 'chat 111 reply after its bot finishes')
+    assert.equal(deps.sentMessages.find((m) => String(m.chatId) === '111')?.text, 'Reply #1 from Assistant')
+    assert.equal(deps.sentMessages.find((m) => String(m.chatId) === '222')?.text, 'Reply #1 from Assistant')
+  } finally {
+    releaseA.resolve()
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('pausing after Telegram rejects the token (401) does not hang while outbound sync is on', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:BAD_TOKEN' },
+    settings: {
+      enabled: true,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
+    }
+  })
+  const deps = makeMockDeps({
+    telegram: {
+      async getMe() {
+        throw new TelegramApiError('Unauthorized', 401)
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    outboundPollIntervalMs: 1,
+    retryBackoffMs: 1
+  })
+  try {
+    // The poll loop must have ended on its own before the pause, or stopPolling would abort it itself.
+    await until(() => !controller.getState().polling, 'poll loop to exit after 401')
+    assert.equal(controller.getState().status, 'error')
+
+    const paused = await within(controller.togglePolling(), 'togglePolling after a 401')
+    assert.equal(paused.status, 'stopped')
+    assert.equal(paused.config.enabled, false)
+  } finally {
+    await within(controller.dispose(), 'dispose after a 401')
+    await worker.deactivate()
+  }
+})
+
+test('status turns connected without waiting out a full long poll', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({
+    telegram: {
+      // Like Telegram with no new updates: a long poll holds until the loop aborts, a short poll answers.
+      async getUpdates(_token, params, options) {
+        if ((params.timeoutSec ?? 0) > 0) {
+          const aborted = Promise.withResolvers<void>()
+          options?.signal?.addEventListener('abort', () => aborted.resolve(), { once: true })
+          if (!options?.signal?.aborted) await aborted.promise
+        }
+        return []
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await until(() => controller.getState().status === 'connected', 'status connected after the first poll')
+  } finally {
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+})
+
+test('switching to a new bot token polls the new bot from offset 0 and reads its own @username', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '111:OLD_BOT' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 },
+    storage: { 'tg.updateOffset': 50 }
+  })
+  const polls: { token: string; offset: number | undefined }[] = []
+  const polledOld = Promise.withResolvers<void>()
+  const polledNew = Promise.withResolvers<void>()
+  const deps = makeMockDeps({
+    telegram: {
+      async getMe(token) {
+        const isNew = token.startsWith('222:')
+        return { id: isNew ? 222 : 111, is_bot: true, first_name: 'Bot', username: isNew ? 'new_bot' : 'old_bot' }
+      },
+      getUpdates: scriptedGetUpdates([], (token, offset) => {
+        polls.push({ token, offset })
+        if (token === '111:OLD_BOT') polledOld.resolve()
+        if (token === '222:NEW_BOT') polledNew.resolve()
+      })
+    }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await within(polledOld.promise, 'first poll with the old token')
+    assert.equal(polls[0].offset, 50)
+
+    await within(
+      controller.saveConfig({
+        botToken: '222:NEW_BOT',
+        enabled: true,
+        defaultBot: 'Assistant',
+        allowedUserIds: '777888',
+        proxyUrl: '',
+        replyTimeoutSec: 300,
+        syncOrcaOutbound: false
+      }),
+      'saveConfig with a new token'
+    )
+    await within(polledNew.promise, 'first poll with the new token')
+
+    // The old bot's offset would make Telegram confirm, and so drop, the new bot's pending updates.
+    const newPolls = polls.filter((p) => p.token === '222:NEW_BOT')
+    assert.ok(newPolls.every((p) => p.offset === undefined))
+    assert.equal(controller.getState().botUsername, 'new_bot')
+    assert.equal(deps.registeredCommands.length, 2)
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('saving settings that do not touch the connection keeps an in-flight reply running', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({
+    telegram: { getUpdates: scriptedGetUpdates([[textUpdate(1, 777888, 'long task')]]) }
+  })
+  const entered = Promise.withResolvers<AbortSignal | undefined>()
+  const release = Promise.withResolvers<void>()
+  const replied = Promise.withResolvers<void>()
+  const baseSendToBot = deps.orcaCli.sendToBot
+  deps.orcaCli.sendToBot = async (params) => {
+    entered.resolve(params.signal)
+    await release.promise
+    return baseSendToBot(params)
+  }
+  const baseSendMessage = deps.telegram.sendMessage
+  deps.telegram.sendMessage = async (token, params, options) => {
+    const sent = await baseSendMessage(token, params, options)
+    if (String(params.chatId) === '777888') replied.resolve()
+    return sent
+  }
+
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    const signal = await within(entered.promise, 'the reply to reach the Orca bot')
+    const saved = await within(
+      controller.saveConfig({
+        enabled: true,
+        defaultBot: 'Assistant',
+        allowedUserIds: '777888, 42',
+        proxyUrl: '',
+        replyTimeoutSec: 600,
+        syncOrcaOutbound: true
+      }),
+      'saveConfig while a reply is running'
+    )
+    assert.equal(saved.config.replyTimeoutSec, 600)
+    assert.equal(signal?.aborted, false)
+
+    release.resolve()
+    await within(replied.promise, 'the reply to reach Telegram')
+    assert.equal(deps.sentMessages[0].text, 'Reply #1 from Assistant')
+    assert.ok(!deps.sentMessages.some((m) => m.text.startsWith('处理失败')))
+  } finally {
+    release.resolve()
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('an Orca CLI failure in /home or a Home button answers the user and keeps polling healthy', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({
+    telegram: { getUpdates: scriptedGetUpdates([[textUpdate(1, 777888, '/home')]]) },
+    orcaCli: {
+      async listBotChats() {
+        throw new Error('orca bot chats failed: exit 1')
+      }
+    }
+  })
+  const replied = Promise.withResolvers<void>()
+  const baseSendMessage = deps.telegram.sendMessage
+  deps.telegram.sendMessage = async (token, params, options) => {
+    const sent = await baseSendMessage(token, params, options)
+    replied.resolve()
+    return sent
+  }
+
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await within(replied.promise, 'an error reply to /home')
+    assert.match(deps.sentMessages[0].text, /处理失败：orca bot chats failed/)
+    assert.equal(controller.getState().status, 'connected')
+    assert.equal(controller.getState().lastError, null)
+
+    await controller.handleIncomingUpdate({
+      update_id: 2,
+      callback_query: {
+        id: 'cb-home',
+        from: { id: 777888, is_bot: false, first_name: 'Demo' },
+        message: { message_id: 900, chat: { id: 777888, type: 'private' }, date: 1001 },
+        data: 'c:home'
+      }
+    })
+    const answer = deps.answeredCallbacks[deps.answeredCallbacks.length - 1]
+    assert.equal(answer?.callbackQueryId, 'cb-home')
+    assert.equal(answer?.showAlert, true)
+    assert.equal(controller.getState().status, 'connected')
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('outbound sync stops for a chat whose Telegram user was removed from the allowlist', async () => {
+  const activity: Record<string, number> = { 'orca-group': 1000, 'orca-private': 1000 }
+  const sessions: Record<string, OrcaSessionRead> = {
+    // Sync needs earlier history to anchor on; an empty baseline only re-baselines.
+    'orca-group': {
+      orcaSessionId: 'orca-group',
+      state: 'done',
+      entries: [{ kind: 'message', role: 'assistant', text: 'Group history' }]
+    },
+    'orca-private': {
+      orcaSessionId: 'orca-private',
+      state: 'done',
+      entries: [{ kind: 'message', role: 'assistant', text: 'Private history' }]
+    }
+  }
+  const addTurn = (orcaChatId: string, text: string) => {
+    activity[orcaChatId] += 1000
+    sessions[orcaChatId].entries.push({ kind: 'message', role: 'user', text })
+    sessions[orcaChatId].entries.push({ kind: 'message', role: 'assistant', text: `Answer to ${text}` })
+  }
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '555, 777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
+    },
+    storage: {
+      'tg.bindings': [
+        // A group chat id is never on the allowlist; the user who used it last is.
+        { tgChatId: '-100500', ownerUserId: '555', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-group', updatedAt: 1000 },
+        { tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-private', updatedAt: 1000 }
+      ]
+    }
+  })
+  const deps = makeMockDeps({
+    orcaCli: {
+      async listBotChats() {
+        return Object.keys(sessions).map((id) => ({
+          id,
+          title: id,
+          lastActivityAt: activity[id],
+          lastAsked: null,
+          lastSaid: null,
+          home: false,
+          self: false,
+          closed: false
+        }))
+      },
+      async readSession(sessionId) {
+        const s = sessions[sessionId]
+        return { ...s, entries: [...s.entries] }
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(deps.sentMessages.length, 0)
+
+    addTurn('orca-group', 'group turn 1')
+    addTurn('orca-private', 'private turn 1')
+    await controller.syncOrcaBoundChatsOnce()
+    assert.ok(deps.sentMessages.some((m) => String(m.chatId) === '-100500'))
+    assert.ok(deps.sentMessages.some((m) => String(m.chatId) === '777888'))
+
+    await controller.saveConfig({
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
+    })
+    deps.sentMessages.length = 0
+    addTurn('orca-group', 'group turn 2')
+    addTurn('orca-private', 'private turn 2')
+    await controller.syncOrcaBoundChatsOnce()
+    assert.ok(!deps.sentMessages.some((m) => String(m.chatId) === '-100500'))
+    assert.ok(deps.sentMessages.some((m) => /private turn 2/.test(m.text)))
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('an SVG image document is refused instead of being handed to the bot as .jpg', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({
+    telegram: {
+      async getFile() {
+        throw new Error('getFile must not be called for an unsupported image')
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await controller.handleIncomingUpdate({
+      update_id: 1,
+      message: {
+        message_id: 40,
+        from: { id: 777888, is_bot: false, first_name: 'Demo' },
+        chat: { id: 777888, type: 'private' },
+        date: 1000,
+        caption: 'What is in this diagram?',
+        document: {
+          file_id: 'doc-svg',
+          file_unique_id: 'svg1',
+          file_name: 'diagram.svg',
+          mime_type: 'image/svg+xml',
+          file_size: 512
+        }
+      }
+    })
+    assert.equal(deps.sentToBots.length, 0)
+    assert.match(deps.sentMessages[0].text, /暂不支持该图片格式/)
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('settings reloads fired by saveConfig own writes do not roll the saved config back', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({ telegram: { getUpdates: scriptedGetUpdates([]) } })
+  const worker = await mountWorker(
+    {
+      default: (orca: OrcaWorkerApi) => main.activateWithDeps(orca, deps).then(() => undefined),
+      deactivate: main.deactivate
+    },
+    { host }
+  )
+  try {
+    await worker.request('bridge.saveConfig', {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: 'http://127.0.0.1:8080',
+      replyTimeoutSec: 120,
+      syncOrcaOutbound: true
+    })
+    // Let the onDidChange reloads from the six settings writes run, then read through the panel path.
+    for (let i = 0; i < 20; i++) await nextTurn()
+    const state = (await worker.request('bridge.getState')) as {
+      status: string
+      polling: boolean
+      config: { enabled: boolean; proxyUrl: string; replyTimeoutSec: number; syncOrcaOutbound: boolean }
+    }
+    assert.equal(state.config.enabled, false)
+    assert.equal(state.config.proxyUrl, 'http://127.0.0.1:8080')
+    assert.equal(state.config.replyTimeoutSec, 120)
+    assert.equal(state.config.syncOrcaOutbound, true)
+    assert.equal(state.status, 'stopped')
+    assert.equal(state.polling, false)
+  } finally {
+    await worker.deactivate()
+  }
 })

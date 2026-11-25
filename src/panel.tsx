@@ -22,6 +22,7 @@ import {
   Tab,
   Tabs,
   Text,
+  type Atom,
   type PanelContext
 } from 'orca'
 import type { BridgeConnectionStatus, BridgeState, SaveConfigInput } from './protocol'
@@ -39,16 +40,36 @@ const syncOrcaOutboundDraft = atom(false)
 const busy = atom(false)
 const feedback = atom<{ tone: 'success' | 'danger' | 'accent'; text: string } | null>(null)
 const formHydrated = atom(false)
+// Set by any form edit; worker refreshes must not overwrite unsaved drafts.
+const formDirty = atom(false)
+
+// Select option values must be non-empty; '' (auto) is stored as this sentinel in the draft.
+const AUTO_BOT = '__auto__'
+const MAX_LABEL = 500
+
+function clip(text: string): string {
+  return text.length > MAX_LABEL ? `${text.slice(0, MAX_LABEL)}…` : text
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function edit<T>(draft: Atom<T>, value: T): void {
+  set(draft, value)
+  set(formDirty, true)
+}
 
 function hydrateForm(state: BridgeState, force = false): void {
   if (!force && read(formHydrated)) return
   set(enabledDraft, state.config.enabled)
-  set(defaultBotDraft, state.config.defaultBot)
+  set(defaultBotDraft, state.config.defaultBot || AUTO_BOT)
   set(allowedIdsDraft, state.config.allowedUserIds)
   set(proxyUrlDraft, state.config.proxyUrl)
   set(timeoutDraft, String(state.config.replyTimeoutSec))
   set(syncOrcaOutboundDraft, state.config.syncOrcaOutbound)
   set(formHydrated, true)
+  set(formDirty, false)
 }
 
 function statusMeta(status: BridgeConnectionStatus): {
@@ -70,9 +91,13 @@ function statusMeta(status: BridgeConnectionStatus): {
 }
 
 async function refresh(): Promise<void> {
-  const next = await plugin.request('bridge.getState')
-  set(bridgeState, next)
-  hydrateForm(next, true)
+  try {
+    const next = await plugin.request('bridge.getState')
+    set(bridgeState, next)
+    hydrateForm(next, !read(formDirty))
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
+  }
 }
 
 async function saveConfig(): Promise<void> {
@@ -83,7 +108,7 @@ async function saveConfig(): Promise<void> {
     const cleanToken = read(tokenDraft).trim()
     const payload: SaveConfigInput = {
       enabled: read(enabledDraft),
-      defaultBot: read(defaultBotDraft).trim(),
+      defaultBot: read(defaultBotDraft) === AUTO_BOT ? '' : read(defaultBotDraft).trim(),
       allowedUserIds: read(allowedIdsDraft).trim(),
       proxyUrl: read(proxyUrlDraft).trim(),
       replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
@@ -98,7 +123,7 @@ async function saveConfig(): Promise<void> {
   } catch (err) {
     set(feedback, {
       tone: 'danger',
-      text: err instanceof Error ? err.message : String(err)
+      text: errorText(err)
     })
   } finally {
     set(busy, false)
@@ -135,7 +160,9 @@ async function togglePolling(): Promise<void> {
   try {
     const next = await plugin.request('bridge.togglePolling')
     set(bridgeState, next)
-    hydrateForm(next, true)
+    hydrateForm(next, !read(formDirty))
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
   } finally {
     set(busy, false)
   }
@@ -146,21 +173,32 @@ async function allowBlockedUser(userId: string): Promise<void> {
   try {
     const next = await plugin.request('bridge.allowUserId', { userId })
     set(bridgeState, next)
-    hydrateForm(next, true)
+    if (read(formDirty)) set(allowedIdsDraft, next.config.allowedUserIds)
+    else hydrateForm(next, true)
     set(feedback, { tone: 'success', text: `Allowed Telegram ID ${userId}` })
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
   } finally {
     set(busy, false)
   }
 }
 
 async function resetBinding(tgChatId: string): Promise<void> {
-  const next = await plugin.request('bridge.resetBinding', { tgChatId })
-  set(bridgeState, next)
+  try {
+    const next = await plugin.request('bridge.resetBinding', { tgChatId })
+    set(bridgeState, next)
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
+  }
 }
 
 async function clearLogs(): Promise<void> {
-  const next = await plugin.request('bridge.clearLogs')
-  set(bridgeState, next)
+  try {
+    const next = await plugin.request('bridge.clearLogs')
+    set(bridgeState, next)
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
+  }
 }
 
 export function setup(ctx: PanelContext): void {
@@ -180,6 +218,13 @@ export default function Panel() {
   const notice = read(feedback)
 
   if (!state) {
+    if (notice) {
+      return (
+        <Callout tone="danger" title="Telegram Bridge failed to load">
+          <Text size="xs">{notice.text}</Text>
+        </Callout>
+      )
+    }
     return (
       <Stack gap="md">
         <Row gap="sm" align="center">
@@ -191,17 +236,19 @@ export default function Panel() {
   }
 
   const badge = statusMeta(state.status)
-  const botOptions = state.bots.length
-    ? state.bots.map((b) => ({
+  const botOptions = [
+    { value: AUTO_BOT, label: '(Auto-select first Orca bot)' },
+    ...state.bots
+      .filter((b) => b.name)
+      .map((b) => ({
         value: b.name,
-        label: b.specialty ? `${b.name} — ${b.specialty}` : b.name
+        label: clip(b.specialty ? `${b.name} — ${b.specialty}` : b.name)
       }))
-    : [
-        {
-          value: state.config.defaultBot || '',
-          label: state.config.defaultBot || '(Auto-select first Orca bot)'
-        }
-      ]
+  ]
+  const draftBot = read(defaultBotDraft)
+  if (draftBot !== AUTO_BOT && !botOptions.some((o) => o.value === draftBot)) {
+    botOptions.push({ value: draftBot, label: clip(draftBot) })
+  }
 
   const targetDisplay = state.config.defaultBot || 'auto'
 
@@ -245,7 +292,7 @@ export default function Panel() {
       )}
 
       {notice && (
-        <Callout tone={notice.tone} title={notice.text} />
+        <Callout tone={notice.tone} title={clip(notice.text)} />
       )}
 
       <Row gap="xs" wrap>
@@ -291,41 +338,41 @@ export default function Panel() {
                   type="password"
                   value={read(tokenDraft)}
                   placeholder={state.config.hasToken ? '•••••••••••••••• (saved)' : '123456:ABC...'}
-                  onChange={(v) => set(tokenDraft, v)}
+                  onChange={(v) => edit(tokenDraft, v)}
                 />
                 <Select
                   label="Default Orca Bot"
                   value={read(defaultBotDraft)}
                   options={botOptions}
-                  onChange={(v) => set(defaultBotDraft, v)}
+                  onChange={(v) => edit(defaultBotDraft, v)}
                 />
                 <Input
                   label="Allowed Telegram User IDs"
                   value={read(allowedIdsDraft)}
                   placeholder="Comma-separated numeric IDs, e.g. 123456789"
-                  onChange={(v) => set(allowedIdsDraft, v)}
+                  onChange={(v) => edit(allowedIdsDraft, v)}
                 />
                 <Input
                   label="HTTP Proxy URL (optional)"
                   value={read(proxyUrlDraft)}
                   placeholder="http://127.0.0.1:7890"
-                  onChange={(v) => set(proxyUrlDraft, v)}
+                  onChange={(v) => edit(proxyUrlDraft, v)}
                 />
                 <Input
                   label="Reply Timeout (seconds)"
                   value={read(timeoutDraft)}
                   placeholder="300"
-                  onChange={(v) => set(timeoutDraft, v)}
+                  onChange={(v) => edit(timeoutDraft, v)}
                 />
                 <Switch
                   label="Enable automatic polling"
                   checked={read(enabledDraft)}
-                  onChange={(v) => set(enabledDraft, v)}
+                  onChange={(v) => edit(enabledDraft, v)}
                 />
                 <Switch
                   label="Sync Orca-side messages to Telegram"
                   checked={read(syncOrcaOutboundDraft)}
-                  onChange={(v) => set(syncOrcaOutboundDraft, v)}
+                  onChange={(v) => edit(syncOrcaOutboundDraft, v)}
                 />
                 <Row gap="xs">
                   <Button size="sm" disabled={isBusy} onPress={saveConfig}>
@@ -350,7 +397,7 @@ export default function Panel() {
                 <ListItem
                   key={b.tgChatId}
                   icon="bot"
-                  title={`TG ${b.tgChatId} -> ${b.botName}`}
+                  title={clip(`TG ${b.tgChatId} -> ${b.botName}`)}
                   description={b.orcaChatId ? `Orca chat: ${b.orcaChatId}` : 'Next message opens new chat'}
                 >
                   <Row gap="xs" align="center">
@@ -390,7 +437,7 @@ export default function Panel() {
                   <ListItem
                     key={entry.id}
                     icon={entry.level === 'error' ? 'error' : entry.level === 'warn' ? 'warning' : 'info'}
-                    title={entry.message}
+                    title={clip(entry.message)}
                   >
                     <RelativeTime at={entry.at} muted />
                   </ListItem>

@@ -155,6 +155,8 @@ table_w = sum(col_widths)
 table_h = header_h + sum(row_heights)
 img_w = table_w + outer_pad * 2
 img_h = table_h + outer_pad * 2
+if img_w + img_h > 10000 or max(img_w, img_h) > 20 * min(img_w, img_h):
+    sys.exit(3)
 
 img = Image.new("RGB", (img_w, img_h), "#F8FAFC")
 draw = ImageDraw.Draw(img)
@@ -196,8 +198,26 @@ draw.rounded_rectangle([x0, y0, x0 + table_w, y0 + table_h], radius=14, outline=
 
 buf = io.BytesIO()
 img.save(buf, format="PNG", optimize=True)
+if buf.tell() > 10 * 1024 * 1024:
+    sys.exit(3)
 sys.stdout.buffer.write(buf.getvalue())
 `
+
+// Telegram sendPhoto rejects width + height > 10000, a side ratio > 20 or > 10 MB; the script exits
+// with this code when the measured image breaks those limits.
+const PHOTO_LIMIT_EXIT_CODE = 3
+
+/**
+ * Lower bounds of the script's layout (row >= 66 px, column 100..488 px, 18 px outer padding): true
+ * when Telegram would reject the image for certain, so Python need not run.
+ */
+export function exceedsTelegramPhotoLimits(table: ExtractedTable): boolean {
+  const cols = table.headers.length
+  const minHeight = 66 * (table.rows.length + 1) + 36
+  const minWidth = 100 * cols + 36
+  const maxWidth = 488 * cols + 36
+  return minWidth + minHeight > 10000 || minHeight > 20 * maxWidth
+}
 
 function getPythonCandidates(): { cmd: string; prefixArgs: string[] }[] {
   if (process.platform !== 'win32') {
@@ -216,8 +236,8 @@ function getPythonCandidates(): { cmd: string; prefixArgs: string[] }[] {
   return candidates
 }
 
-function runPythonRender(cmd: string, prefixArgs: string[], jsonInput: string): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
+function runPythonRender(cmd: string, prefixArgs: string[], jsonInput: string): Promise<Buffer | null> {
+  return new Promise<Buffer | null>((resolve, reject) => {
     const child = spawn(cmd, [...prefixArgs, '-c', PYTHON_RENDER_SCRIPT], {
       env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
       windowsHide: true,
@@ -241,16 +261,21 @@ function runPythonRender(cmd: string, prefixArgs: string[], jsonInput: string): 
       const out = Buffer.concat(stdout)
       if (code === 0 && out.length > 0) {
         resolve(out)
+      } else if (code === PHOTO_LIMIT_EXIT_CODE) {
+        resolve(null)
       } else {
         reject(new Error(Buffer.concat(stderr).toString('utf8') || `exit ${code}`))
       }
     })
+    // Python without Pillow exits before reading a large payload; that EPIPE must not crash the worker.
+    child.stdin.on('error', () => {})
     child.stdin.write(jsonInput, 'utf8')
     child.stdin.end()
   })
 }
 
 export async function renderTableToPng(table: ExtractedTable): Promise<Buffer | null> {
+  if (exceedsTelegramPhotoLimits(table)) return null
   const payload = JSON.stringify(table)
   for (const { cmd, prefixArgs } of getPythonCandidates()) {
     try {

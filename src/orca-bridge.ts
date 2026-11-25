@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -20,6 +20,7 @@ export type OrcaSessionEntry = {
   kind: string
   role?: 'user' | 'assistant' | 'system'
   text?: string
+  shortened?: boolean
 }
 
 export type OrcaSessionRead = {
@@ -55,35 +56,51 @@ export interface OrcaCliRunner {
   }): Promise<void>
 }
 
-function getOrcaBinary(): string {
-  if (process.env.ORCA_CLI && fs.existsSync(process.env.ORCA_CLI)) {
-    return process.env.ORCA_CLI
+// Mirrors Orca's AGENT_READ_MAX_LIMIT: `agent read --limit` accepts at most 100 newest entries.
+const AGENT_READ_MAX_LIMIT = 100
+
+// Orca's Linux CLI is `orca-ide` because GNOME's screen reader owns /usr/bin/orca.
+export function getOrcaBinary(
+  platform: NodeJS.Platform = process.platform,
+  execPath: string = process.execPath,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (file: string) => boolean = fs.existsSync
+): string {
+  if (env.ORCA_CLI && exists(env.ORCA_CLI)) {
+    return env.ORCA_CLI
   }
 
-  const exeDir = path.dirname(process.execPath)
+  const p = platform === 'win32' ? path.win32 : path.posix
+  const exeDir = p.dirname(execPath)
   const home = os.homedir()
-  const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local')
-  const candidates =
-    process.platform === 'win32'
-      ? [
-          path.join(exeDir, 'resources', 'bin', 'orca.exe'),
-          path.join(exeDir, '..', 'bin', 'orca.exe'),
-          path.join(exeDir, '..', '..', 'resources', 'bin', 'orca.exe'),
-          path.join(localAppData, 'Programs', 'orca', 'resources', 'bin', 'orca.exe')
-        ]
-      : [
-          path.join(exeDir, 'resources', 'bin', 'orca'),
-          path.join(exeDir, '..', 'Resources', 'bin', 'orca'),
-          '/Applications/Orca.app/Contents/Resources/bin/orca',
-          '/usr/local/bin/orca'
-        ]
+  let candidates: string[]
+  let fallback = 'orca'
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA || p.join(home, 'AppData', 'Local')
+    candidates = [
+      p.join(exeDir, 'resources', 'bin', 'orca.exe'),
+      p.join(exeDir, '..', 'bin', 'orca.exe'),
+      p.join(exeDir, '..', '..', 'resources', 'bin', 'orca.exe'),
+      p.join(localAppData, 'Programs', 'orca', 'resources', 'bin', 'orca.exe')
+    ]
+  } else if (platform === 'linux') {
+    fallback = 'orca-ide'
+    candidates = [p.join(exeDir, 'resources', 'bin', 'orca-ide')]
+  } else {
+    candidates = [
+      p.join(exeDir, 'resources', 'bin', 'orca'),
+      p.join(exeDir, '..', 'Resources', 'bin', 'orca'),
+      '/Applications/Orca.app/Contents/Resources/bin/orca',
+      '/usr/local/bin/orca'
+    ]
+  }
 
   for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) {
+    if (exists(candidate)) {
       return candidate
     }
   }
-  return 'orca'
+  return fallback
 }
 
 function cleanOrcaEnv(): NodeJS.ProcessEnv {
@@ -94,6 +111,15 @@ function cleanOrcaEnv(): NodeJS.ProcessEnv {
   delete env.ORCA_DISPATCH_ID
   delete env.ORCA_TASK_ID
   delete env.ORCA_TERMINAL_HANDLE
+  // Caller identity the CLI reads (agent-session-caller-env.ts, terminal-identity.ts). Inherited from an
+  // agent terminal, these make `orchestration send --from plugin:...` fail as `consumer_fenced`.
+  delete env.ORCA_AGENT_SESSION_ID
+  delete env.ORCA_AGENT_SESSION_SPAWN_TOKEN
+  delete env.ORCA_AGENT_SESSION_TOOL_TOKEN
+  delete env.ORCA_BOT_TOOLS_TOKEN
+  delete env.ORCA_MCP_TOKEN
+  delete env.ORCA_PANE_KEY
+  delete env.ORCA_STRUCTURED_SESSION
 
   const home = os.homedir()
   if (!env.HOME) env.HOME = home
@@ -105,6 +131,19 @@ function cleanOrcaEnv(): NodeJS.ProcessEnv {
   return env
 }
 
+// On Windows `orca.exe` is a launcher that runs Orca.exe as its own child; child.kill() would orphan it.
+function killProcessTree(child: ChildProcess): void {
+  if (process.platform === 'win32' && child.pid !== undefined) {
+    const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+      windowsHide: true,
+      stdio: 'ignore'
+    })
+    killer.on('error', () => child.kill())
+    return
+  }
+  child.kill()
+}
+
 export async function runOrcaJson<T>(
   args: string[],
   options: { stdinText?: string; timeoutMs?: number; signal?: AbortSignal } = {}
@@ -113,6 +152,11 @@ export async function runOrcaJson<T>(
   const timeoutMs = options.timeoutMs ?? 30_000
 
   return new Promise<T>((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new Error('Orca CLI command aborted'))
+      return
+    }
+
     const child = spawn(bin, args, {
       env: cleanOrcaEnv(),
       windowsHide: true,
@@ -133,26 +177,22 @@ export async function runOrcaJson<T>(
     }
 
     const onAbort = () => {
-      child.kill()
+      killProcessTree(child)
       finish(new Error('Orca CLI command aborted'))
     }
 
-    if (options.signal) {
-      if (options.signal.aborted) {
-        onAbort()
-        return
-      }
-      options.signal.addEventListener('abort', onAbort, { once: true })
-    }
+    options.signal?.addEventListener('abort', onAbort, { once: true })
 
     const timer = setTimeout(() => {
-      child.kill()
+      killProcessTree(child)
       finish(new Error(`Orca CLI timed out after ${timeoutMs}ms: orca ${args.join(' ')}`))
     }, timeoutMs)
 
     child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
     child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
     child.on('error', (err) => finish(err))
+    // A CLI that exits before reading all of stdin raises EPIPE/EOF here; the exit code reports the failure.
+    child.stdin.on('error', () => {})
 
     child.on('close', (code) => {
       const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim()
@@ -340,7 +380,8 @@ export function computeTailHashes(items: OrcaMessageItem[], limit = TAIL_HASH_LI
 }
 
 export function isTelegramOriginatedUserMessage(text: string): boolean {
-  return /^Telegram message from owner \([^)]+\) \[tg:[^:\]]+:\d+\]\./.test(text.trim())
+  // Greedy `.*` so sender labels such as `Ann (123)` still match.
+  return /^Telegram message from owner \(.*, chat [^)]*\) \[tg:[^:\]]+:\d+\]\./.test(text.trim())
 }
 
 /**
@@ -388,30 +429,36 @@ export function findUnsyncedTail(
   return { matched: false, unsynced: [] }
 }
 
-function extractMessagePairs(entries: OrcaSessionEntry[]): {
-  userMessages: string[]
-  lastUserIndex: number
-  assistantAfterLastUser: string[]
-} {
-  const userMessages: string[] = []
+const SHORTENED_REPLY_NOTE = '（回复过长已截断，请在 Orca 中查看完整内容）'
+
+/**
+ * Assistant messages after the user entry that carries `requestMarker`, or `null` when that turn is
+ * not in this read. `anyLatestUser` accepts the latest user turn (a chat we just created holds only
+ * ours). `markerLeftWindow` accepts a window with no user entry at all: a tool-heavy turn can push our
+ * message out of the newest-entries window after an earlier read showed it.
+ */
+function findRequestReply(
+  entries: OrcaSessionEntry[],
+  requestMarker: string,
+  fallback: { anyLatestUser: boolean; markerLeftWindow: boolean }
+): OrcaSessionEntry[] | null {
+  let markerIndex = -1
   let lastUserIndex = -1
   for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i]
-    if (entry.kind === 'message' && entry.role === 'user') {
-      userMessages.push(entry.text || '')
-      lastUserIndex = i
-    }
+    if (entries[i].kind !== 'message' || entries[i].role !== 'user') continue
+    lastUserIndex = i
+    if ((entries[i].text || '').includes(requestMarker)) markerIndex = i
   }
-  const assistantAfterLastUser: string[] = []
-  if (lastUserIndex >= 0) {
-    for (let i = lastUserIndex + 1; i < entries.length; i++) {
-      const entry = entries[i]
-      if (entry.kind === 'message' && entry.role === 'assistant' && entry.text?.trim()) {
-        assistantAfterLastUser.push(entry.text.trim())
-      }
-    }
-  }
-  return { userMessages, lastUserIndex, assistantAfterLastUser }
+
+  let start: number
+  if (markerIndex >= 0) start = markerIndex + 1
+  else if (fallback.anyLatestUser && lastUserIndex >= 0) start = lastUserIndex + 1
+  else if (fallback.markerLeftWindow && lastUserIndex < 0) start = 0
+  else return null
+
+  return entries
+    .slice(start)
+    .filter((e) => e.kind === 'message' && e.role === 'assistant' && e.text?.trim())
 }
 
 export async function dispatchToOrcaBotAndWait(
@@ -444,22 +491,6 @@ export async function dispatchToOrcaBotAndWait(
     }
   }
 
-  let baselineAssistantTail = ''
-  let baselineLastUserText = ''
-  let baselineEntrySignature = ''
-
-  if (targetChatId !== 'new') {
-    try {
-      const snap = await runner.readSession(targetChatId, 40)
-      const parsed = extractMessagePairs(snap.entries)
-      baselineLastUserText = parsed.userMessages[parsed.userMessages.length - 1] || ''
-      baselineAssistantTail = parsed.assistantAfterLastUser.join('\n\n')
-      baselineEntrySignature = `${snap.entries.length}:${baselineLastUserText.slice(0, 80)}:${baselineAssistantTail.slice(-80)}`
-    } catch {
-      // Fresh or unreadable transcript: proceed with empty baseline.
-    }
-  }
-
   const cleanText = params.userText.trim()
   const imagePaths = (params.imagePaths ?? []).filter(Boolean)
   const previewBase = cleanText || (imagePaths.length > 0 ? '[Image]' : 'Telegram message')
@@ -483,6 +514,7 @@ export async function dispatchToOrcaBotAndWait(
   )
   const body = bodyParts.join('\n')
 
+  params.signal?.throwIfAborted()
   await runner.sendToBot({
     botName: params.botName,
     chatId: targetChatId,
@@ -497,6 +529,7 @@ export async function dispatchToOrcaBotAndWait(
     const beforeIds = new Set(chatsBefore.map((c) => c.id))
     const deadlineNew = Date.now() + 15_000
     while (!activeChatId && Date.now() < deadlineNew) {
+      params.signal?.throwIfAborted()
       const chatsAfter = await runner.listBotChats(params.botName)
       const created =
         chatsAfter.find((c) => !beforeIds.has(c.id) && !c.home && !c.closed) ||
@@ -517,36 +550,37 @@ export async function dispatchToOrcaBotAndWait(
 
   const deadline = Date.now() + params.timeoutMs
   let lastTickAt = 0
-  let sawWorkingOrNewTurn = targetChatId === 'new'
+  let sawRequest = false
+  let previousSignature = ''
 
   while (Date.now() < deadline) {
+    params.signal?.throwIfAborted()
     if (Date.now() - lastTickAt >= 4500) {
       lastTickAt = Date.now()
       await params.onWorkingTick?.()
     }
 
-    const session = await runner.readSession(activeChatId, 40)
-    const parsed = extractMessagePairs(session.entries)
-    const latestUser = parsed.userMessages[parsed.userMessages.length - 1] || ''
-    const latestAssistant = parsed.assistantAfterLastUser.join('\n\n')
-    const currentSignature = `${session.entries.length}:${latestUser.slice(0, 80)}:${latestAssistant.slice(-80)}`
+    const session = await runner.readSession(activeChatId, AGENT_READ_MAX_LIMIT)
+    const reply = findRequestReply(session.entries, requestMarker, {
+      anyLatestUser: targetChatId === 'new',
+      markerLeftWindow: sawRequest
+    })
+    if (reply) sawRequest = true
+    const replyText = (reply ?? []).map((e) => (e.text || '').trim()).join('\n\n')
+    const signature = `${session.entries.length}:${replyText}`
+    // `state` absent means unknown, never done: accept it only once the reply stopped changing.
+    const finished =
+      session.state === 'done' || (!session.state && signature === previousSignature)
+    previousSignature = signature
 
-    if (
-      session.state === 'working' ||
-      latestUser.includes(requestMarker) ||
-      currentSignature !== baselineEntrySignature
-    ) {
-      sawWorkingOrNewTurn = true
-    }
-
-    if (sawWorkingOrNewTurn && session.state !== 'working') {
-      if (latestAssistant && (targetChatId === 'new' || latestUser.includes(requestMarker) || latestAssistant !== baselineAssistantTail)) {
-        return {
-          chatId: activeChatId,
-          title: resolvedTitle,
-          replyText: latestAssistant,
-          tailHashes: computeTailHashes(extractMessageItems(session.entries))
-        }
+    if (reply && replyText && finished) {
+      return {
+        chatId: activeChatId,
+        title: resolvedTitle,
+        replyText: reply.some((e) => e.shortened)
+          ? `${replyText}\n\n${SHORTENED_REPLY_NOTE}`
+          : replyText,
+        tailHashes: computeTailHashes(extractMessageItems(session.entries))
       }
     }
 

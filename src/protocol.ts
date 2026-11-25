@@ -10,6 +10,8 @@ export type BridgeConnectionStatus =
 
 export type ChatBinding = {
   tgChatId: string
+  // Telegram user who last used this binding; outbound sync stops once they leave the allowlist.
+  ownerUserId?: string
   botId?: string
   botName: string
   orcaChatId: string | null
