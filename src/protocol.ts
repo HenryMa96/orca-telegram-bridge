@@ -46,6 +46,10 @@ export type BotSummary = {
 // In a group: only messages for the bot (commands for it, replies to it, @mentions), or every message.
 export type GroupMode = 'addressed' | 'all'
 
+// With groupMode 'all', what the bot does with a message not addressed to it: stay silent (the
+// message only gives it context), or answer when it can clearly help (else NO_REPLY).
+export type GroupReply = 'mentioned' | 'helpful'
+
 // Where voice messages are transcribed; both speak OpenAI's /audio/transcriptions API.
 export type VoiceProvider = 'openrouter' | 'openai'
 
@@ -66,6 +70,7 @@ export type BridgeConfig = {
   allowGroups: boolean
   // 'all' takes effect only with a restricted allowedUserIds; while open it acts as 'addressed'.
   groupMode: GroupMode
+  groupReply: GroupReply
   // Voice messages and audio files are transcribed, then sent to the Orca bot as text.
   voiceEnabled: boolean
   voiceProvider: VoiceProvider
@@ -107,7 +112,8 @@ export type BridgeState = {
 
 export type SaveConfigInput = {
   bridgeId: string
-  name: string
+  // Absent keeps the saved name; the panel no longer edits it and shows the bot's @username.
+  name?: string
   botToken?: string
   clearToken?: boolean
   // Absent keeps the current state; the panel switches a bridge with `bridge.setEnabled`.
@@ -121,6 +127,7 @@ export type SaveConfigInput = {
   // Absent keeps the current value.
   allowGroups?: boolean
   groupMode?: GroupMode
+  groupReply?: GroupReply
   voiceEnabled?: boolean
   voiceProvider?: VoiceProvider
   voiceModel?: string

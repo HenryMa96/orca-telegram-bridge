@@ -4,10 +4,6 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects Telegram bo
 
 Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-telegram-bridge).
 
-<p align="center">
-  <img src="docs/images/setup-card.png" alt="The Telegram panel in Orca: a bridge card showing the Telegram bot and its Orca bot, the Bot active switch, Connected status, group mode and voice provider" width="560">
-</p>
-
 **Talk to your Orca bots from Telegram, from your phone, anywhere.**
 
 - **As many bridges as you need.** Each bridge pairs one Telegram bot with one Orca bot, so `@ci_bot` can front your CI watcher and `@dev_bot` your coding assistant. Every bridge has its own token, access list, language, proxy, group and voice settings, and they all run at once: a bridge that fails never stops the others.
@@ -137,27 +133,23 @@ The upstream plugin has the key `henryma96.telegram-bridge`. This fork has a dif
 Do these steps after the plugin is installed and approved. Repeat steps 2–7 for each Telegram bot you want to connect.
 
 1. Open the **Telegram** sidebar panel in Orca. The **TG** item in Orca's status bar shows the bridges' state (`TG: 2/2` = 2 of 2 active bridges connected); click it to open this panel.
-2. In the Setup tab, click **Edit** on a bridge, or **Add bridge** for a new one. An update from 0.4.0 or older already has **Bridge 1** with your previous settings.
-3. Give the bridge a name and paste its `@BotFather` bot token. Each Telegram bot token can belong to one bridge only.
+2. In the Setup tab, click **Edit** on a bridge, or **Add bridge** for a new one. A bridge is shown by its Telegram bot's `@username` ("New Telegram bot" until its token is checked). An update from 0.4.0 or older already has one bridge with your previous settings.
+3. **Connection:** paste the `@BotFather` bot token. Each Telegram bot token can belong to one bridge only.
 4. Choose the **Orca bot** this Telegram bot talks to, or keep **(Auto-select first Orca bot)**. The list shows the bots on this computer (the folders in `~/.orca/bots`). The Telegram bot talks only to this Orca bot; `/use` cannot switch it.
-5. Choose the **Telegram reply language** (English, Português (Brasil) or 中文) for the bot's own replies and command menu. The Orca bot's answers keep the language the Orca bot writes in. Optional: an HTTP proxy (e.g. `http://127.0.0.1:7890`) and the reply timeout.
-6. Click **Save**, then **Test Connection**. The **Bot active** switch on the bridge's card turns it on or off at once; no Save needed.
-7. Decide who can use this bot. By default it is open to everyone. See [Who can talk to the bot](#who-can-talk-to-the-bot).
+5. **Who can talk:** choose **Only these people and groups** and type the IDs, or **Anyone on Telegram**. See [Who can talk to the bot](#who-can-talk-to-the-bot).
+6. Click **Save**, then **Test connection**. The **Active** switch on the bridge's card turns it on or off at once; no Save needed.
+7. Optional: **Groups** (see [Use the bot in a group](#use-the-bot-in-a-group)), **Features** (voice messages, Orca-side sync) and **Advanced**, closed by default: the **Telegram reply language** (English, Português (Brasil) or 中文) for the bot's own replies and command menu, the reply timeout, an HTTP proxy (e.g. `http://127.0.0.1:7890`) and the transcription model. The Orca bot's answers keep the language the Orca bot writes in.
 
-<p align="center">
-  <img src="docs/images/bridge-editor.png" alt="The bridge editor: name, bot token, pinned Orca bot, allowed Telegram IDs, proxy, reply timeout, reply language, Orca-side sync, group options and voice transcription settings" width="420">
-</p>
-
-To remove a bridge, click **Remove** on its card, then confirm. Orca forgets its token and its chats; its log entries stay in the Logs tab.
+To remove a bridge, open its editor, click **Remove**, then **Confirm remove**. Orca forgets its token and its chats; its log entries stay in the Logs tab.
 
 Why not a connector inside Orca's **Bot settings → Connectors**? A plugin cannot add connectors there: Orca's connectors (Slack, Linear, GitHub, Google, Webhook) are built in. A native Telegram connector is requested upstream in [stablyai/orca#45959](https://github.com/stablyai/orca/issues/45959).
 
 ## Who can talk to the bot
 
-Each bridge has its own **Allowed Telegram IDs** (Setup tab → the bridge's **Edit**). Access to one Telegram bot says nothing about another:
+Each bridge has its own **Who can talk** choice (Setup tab → the bridge's **Edit**). Access to one Telegram bot says nothing about another:
 
-- **Empty (default): open to everyone.** Any Telegram user who finds your bot, and any group it is in, can use it. The panel shows an **Open to everyone** warning while the list is empty.
-- **One or more IDs: restricted.** Only the listed IDs can use the bot. A user ID allows that person in private chats and in any group. A group ID (a negative number, e.g. `-1001234567890`) allows every member of that group.
+- **Anyone on Telegram: open to everyone.** Any Telegram user who finds your bot, and any group it is in, can use it. The panel shows an **Open to everyone** warning on the card.
+- **Only these people and groups: restricted.** Only the listed IDs can use the bot. A user ID allows that person in private chats and in any group. A group ID (a negative number, e.g. `-1001234567890`) allows every member of that group. Saving this choice needs at least one ID.
 
 Every person who can use the bot uses its Orca bot with your rights: they can chat with it, list and bind that Orca bot's existing chats (`/chats`, `/bind`) and run automations. Keep the bot open only if you accept that, or restrict it.
 
@@ -166,25 +158,28 @@ Every person who can use the bot uses its Orca bot with your rights: they can ch
 ### Restrict access
 
 1. Ask each person to send any message to the bot (in a group, mention the bot).
-2. While the list is still empty, the bot answers them. To restrict it, add at least one ID: your own first. Your ID: send a message to the bot, then read it in the panel's **Chats** tab (`TG <ID> -> …`), or ask a bot such as `@userinfobot`.
-3. Type the IDs in **Allowed Telegram IDs**, separated by commas or spaces, and click **Save Settings**.
+2. While the bot is open, it answers them. To restrict it, add at least one ID: your own first. Your ID: send a message to the bot, then read it in the panel's **Chats** tab (`TG <ID> -> …`), or ask a bot such as `@userinfobot`.
+3. Choose **Only these people and groups**, type the IDs separated by commas or spaces, and click **Save**.
 
 Once the list is restricted, an unknown person gets one short reply with their Telegram ID (at most once a minute), and the panel shows a banner: `User <ID> messaged your bot but is not in the allowlist.` Click **Allow \<ID\>** to add them. The banner shows only the latest unknown person.
 
-Removing an ID stops the bot from answering that person or group, and stops sync to their chats. Emptying the list opens the bot to everyone again.
+Removing an ID stops the bot from answering that person or group, and stops sync to their chats. Choosing **Anyone on Telegram** opens the bot to everyone again.
 
 ### Use the bot in a group
 
-Groups are off for a new bridge. Turn them on per bridge in the Setup tab → the bridge's **Edit**:
+Groups are off for a new bridge. Choose per bridge in the Setup tab → the bridge's **Edit** → **Groups**:
 
-- **Allow groups** off: the bot ignores group messages. If someone adds it to a group, it leaves the group at once and the Logs tab says so.
-- **Allow groups** on: one more option appears, **In groups, read**:
-  - **Only messages for the bot** (default): commands addressed to it (`/help@yourbot`), replies to its messages and, with privacy mode off, `@yourbot` mentions. The mention is removed before the text goes to the Orca bot. Normal conversation in the group is ignored.
-  - **All messages**: every message an allowed person writes in the group goes to the Orca bot, which answers each one. Use it for a group made for talking to the bot. It works only with a restricted **Allowed Telegram IDs** list; while the bridge is open to everyone, the bot reads only messages for it, so strangers in a busy group cannot start an Orca run with every line.
+- **Off**: the bot ignores group messages. If someone adds it to a group, it leaves the group at once and the Logs tab says so.
+- **Only messages for the bot**: commands addressed to it (`/help@yourbot`), replies to its messages and, with privacy mode off, `@yourbot` mentions. The mention is removed before the text goes to the Orca bot. Normal conversation in the group is ignored.
+- **All messages**: every message an allowed person writes in the group goes to the Orca bot, so it follows the whole conversation. One more choice appears, **Replies**:
+  - **Only when mentioned** (default): the bot answers only messages for it (mention, reply, command). Other messages only give it context; the bridge never posts an answer to them.
+  - **When it can help**: the bot may also answer a message not addressed to it, when it can clearly help; otherwise it stays silent (`NO_REPLY`).
 
-A bridge updated from 0.4.0 or older starts with **Allow groups** on and **Only messages for the bot**, the behavior it had before.
+  Each group message starts one Orca bot turn, so a busy group costs more. Messages not addressed to the bot never get a typing indicator or an error line in the group; problems go to the Logs tab. **All messages** works only with **Only these people and groups**; while the bridge is open to everyone, the bot reads only messages for it, so strangers in a busy group cannot start an Orca run with every line.
 
-Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; after the bot has connected once, the bridge's editor warns under **Allow groups** when one of them blocks the option you chose:
+A bridge updated from 0.4.0 or older starts with **Only messages for the bot**, the behavior it had before.
+
+Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; after the bot has connected once, the bridge's editor warns under **Groups** when one of them blocks the option you chose:
 
 - **Allow Groups?** (`/setjoingroups`): must be enabled, or Telegram refuses to add the bot to a group.
 - **Privacy mode** (`/setprivacy`; [Telegram: privacy mode](https://core.telegram.org/bots/features#privacy-mode)): on by default. While it is on, the bot receives only commands addressed to it and replies to its own messages: `@yourbot` mentions and **All messages** do not work. Choose **Disable**, then remove the bot from the group and add it again; Telegram applies the change only then. A bot that is a group admin receives every message either way.
@@ -192,8 +187,8 @@ Telegram decides two things that the plugin cannot change. Set them for the bot 
 Then:
 
 1. Add the bot to the group in Telegram (group menu → **Add members**).
-2. Talk to it as the **In groups, read** option allows.
-3. To restrict access to this group, add the group's ID to **Allowed Telegram IDs**. The group's ID appears in the **Chats** tab (`TG -100… -> …`) after the bot answers there once. In restricted mode, a blocked group message also logs it in the **Logs** tab: `Blocked unauthorized Telegram user <ID> (…) in group -100…`.
+2. Talk to it as the **Groups** option allows.
+3. To restrict access to this group, add the group's ID under **Only these people and groups**. The group's ID appears in the **Chats** tab (`TG -100… -> …`) after the bot answers there once. In restricted mode, a blocked group message also logs it in the **Logs** tab: `Blocked unauthorized Telegram user <ID> (…) in group -100…`.
 
 In a group, everyone sees the bot's replies, and the whole group shares one Orca chat: `/new`, `/bind` and `/home` change it for everyone in that group.
 
@@ -231,7 +226,7 @@ The plugin tells the Orca bot about this in every message, takes those lines out
 - Limits from Telegram: photos up to 10 MB (5 MB by link), documents up to 50 MB (20 MB by link).
 - A file that is missing, too large or not allowed is not sent; the chat gets one short line with the file name (never the full path) and the reason.
 
-**Files from your computer are sent only when the bridge is restricted** to [Allowed Telegram IDs](#who-can-talk-to-the-bot). While the bot is open to everyone, a file reference gets a short "only when restricted" line instead, so a stranger cannot ask the bot for your files; https links still work. The same rule already applies to Orca → Telegram sync and to group **All messages**.
+**Files from your computer are sent only when the bridge is restricted** to [Only these people and groups](#who-can-talk-to-the-bot). While the bot is open to everyone, a file reference gets a short "only when restricted" line instead, so a stranger cannot ask the bot for your files; https links still work. The same rule already applies to Orca → Telegram sync and to group **All messages**.
 
 Even when restricted, the Orca bot reads files with your rights, and an allowed person can ask it for one. The plugin always refuses files in credential folders (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.config/gcloud`) and `.env` files, even through a shortcut or link, and sends only the image and document types above. Allow only people you trust if the bot can see private documents.
 

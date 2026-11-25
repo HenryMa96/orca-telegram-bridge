@@ -37,12 +37,15 @@ import type {
   BridgeState,
   BridgeView,
   GroupMode,
+  GroupReply,
   SaveConfigInput,
   VoiceProvider
 } from './protocol'
 import type { ReplyLanguage } from './i18n'
 
 type LogFilter = 'all' | 'errors' | 'warnings' | 'debug'
+// Who can talk to the bot: only the listed Telegram IDs, or anyone (saved as an empty list).
+type AccessMode = 'restricted' | 'open'
 
 // Select option values must be non-empty: these stand for "every bridge" and "no bridge".
 const ALL_BRIDGES = 'all'
@@ -58,16 +61,19 @@ const editingBridgeId = atom<string | null>(null)
 // The bridge whose Remove was pressed once; a second press on Confirm remove removes it.
 const confirmRemoveId = atom<string | null>(null)
 
-const nameDraft = atom('')
 const tokenDraft = atom('')
 const orcaBotDraft = atom('')
+const accessModeDraft = atom<AccessMode>('restricted')
 const allowedIdsDraft = atom('')
+// Shown under the IDs field when Save is refused because the list has no valid ID.
+const allowedIdsError = atom<string | null>(null)
 const proxyUrlDraft = atom('')
 const timeoutDraft = atom('300')
 const syncOrcaOutboundDraft = atom(false)
 const replyLanguageDraft = atom<ReplyLanguage>('en')
 const allowGroupsDraft = atom(false)
 const groupModeDraft = atom<GroupMode>('addressed')
+const groupReplyDraft = atom<GroupReply>('mentioned')
 const voiceEnabledDraft = atom(false)
 const voiceProviderDraft = atom<VoiceProvider>('openrouter')
 const voiceModelDraft = atom('')
@@ -83,6 +89,9 @@ const formDirty = atom(false)
 const AUTO_BOT = '__auto__'
 const MAX_LABEL = 500
 const ORCA_BOT_LABEL = 'Orca bot (this Telegram bot talks only to it)'
+const NEW_BOT_LABEL = 'New Telegram bot'
+const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
+const ALL_NEEDS_IDS = 'All messages needs "Only these people and groups". While anyone can talk, the bot reads only messages for it.'
 
 const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
   { value: 'all', label: 'All levels' },
@@ -95,9 +104,19 @@ const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguage; label: string }> = [
   { value: 'pt-BR', label: 'Português (Brasil)' },
   { value: 'zh-CN', label: '中文' }
 ]
-const GROUP_MODE_OPTIONS: Array<{ value: GroupMode; label: string }> = [
+const ACCESS_OPTIONS: Array<{ value: AccessMode; label: string }> = [
+  { value: 'restricted', label: 'Only these people and groups' },
+  { value: 'open', label: 'Anyone on Telegram' }
+]
+// 'off' stands for allowGroups false; the other values are the group mode.
+const GROUP_OPTIONS: Array<{ value: 'off' | GroupMode; label: string }> = [
+  { value: 'off', label: 'Off' },
   { value: 'addressed', label: 'Only messages for the bot' },
   { value: 'all', label: 'All messages' }
+]
+const GROUP_REPLY_OPTIONS: Array<{ value: GroupReply; label: string }> = [
+  { value: 'mentioned', label: 'Only when mentioned' },
+  { value: 'helpful', label: 'When it can help' }
 ]
 const VOICE_PROVIDER_OPTIONS: Array<{ value: VoiceProvider; label: string }> = [
   { value: 'openrouter', label: 'OpenRouter' },
@@ -141,8 +160,9 @@ function hydrateForm(state: BridgeState, force = false): void {
   const bridge = findBridge(state, id)
   if (!bridge) return
   if (!force && read(hydratedFor) === id) return
-  set(nameDraft, bridge.name)
   set(orcaBotDraft, bridge.config.orcaBot || AUTO_BOT)
+  set(accessModeDraft, hasAllowedIds(bridge.config.allowedUserIds) ? 'restricted' : 'open')
+  set(allowedIdsError, null)
   set(allowedIdsDraft, bridge.config.allowedUserIds)
   set(proxyUrlDraft, bridge.config.proxyUrl)
   set(timeoutDraft, String(bridge.config.replyTimeoutSec))
@@ -150,6 +170,7 @@ function hydrateForm(state: BridgeState, force = false): void {
   set(replyLanguageDraft, bridge.config.replyLanguage)
   set(allowGroupsDraft, bridge.config.allowGroups)
   set(groupModeDraft, bridge.config.groupMode)
+  set(groupReplyDraft, bridge.config.groupReply)
   set(voiceEnabledDraft, bridge.config.voiceEnabled)
   set(voiceProviderDraft, bridge.config.voiceProvider)
   set(voiceModelDraft, bridge.config.voiceModel)
@@ -162,6 +183,7 @@ function openEditor(state: BridgeState, bridgeId: string): void {
   set(confirmRemoveId, null)
   set(tokenDraft, '')
   set(voiceKeyDraft, '')
+  set(allowedIdsError, null)
   hydrateForm(state, true)
 }
 
@@ -170,6 +192,7 @@ function closeEditor(): void {
   set(hydratedFor, null)
   set(tokenDraft, '')
   set(voiceKeyDraft, '')
+  set(allowedIdsError, null)
   set(formDirty, false)
 }
 
@@ -183,7 +206,7 @@ function statusMeta(status: BridgeConnectionStatus): {
     case 'connecting':
       return { label: 'Connecting', tone: 'accent' }
     case 'needs_token':
-      return { label: 'Needs Token', tone: 'warning' }
+      return { label: 'Needs token', tone: 'warning' }
     case 'error':
       return { label: 'Error', tone: 'danger' }
     case 'stopped':
@@ -191,9 +214,10 @@ function statusMeta(status: BridgeConnectionStatus): {
   }
 }
 
-function telegramHandle(bridge: BridgeView): string {
-  if (bridge.botUsername) return `@${bridge.botUsername}`
-  return bridge.config.hasToken ? 'Telegram bot not connected yet' : 'No bot token yet'
+// The bot's @username is the one name people see. It is unknown until the token is checked, so
+// lists where old bridges must stay apart pass the stored name as the fallback.
+function bridgeLabel(bridge: BridgeView, fallback = NEW_BOT_LABEL): string {
+  return bridge.botUsername ? `@${bridge.botUsername}` : fallback
 }
 
 async function refresh(): Promise<void> {
@@ -227,7 +251,7 @@ async function removeBridge(bridge: BridgeView): Promise<void> {
     const next = await plugin.request('bridge.remove', { bridgeId: bridge.id })
     set(bridgeState, next)
     if (read(editingBridgeId) === bridge.id) closeEditor()
-    set(feedback, { tone: 'success', text: `Removed ${bridge.name}.` })
+    set(feedback, { tone: 'success', text: `Removed ${bridgeLabel(bridge, bridge.name)}.` })
   } catch (err) {
     set(feedback, { tone: 'danger', text: errorText(err) })
   } finally {
@@ -237,6 +261,11 @@ async function removeBridge(bridge: BridgeView): Promise<void> {
 }
 
 async function saveConfig(bridge: BridgeView): Promise<void> {
+  const restricted = read(accessModeDraft) === 'restricted'
+  if (restricted && !hasAllowedIds(read(allowedIdsDraft))) {
+    set(allowedIdsError, NEEDS_ID)
+    return
+  }
   set(busy, true)
   set(feedback, null)
   try {
@@ -245,15 +274,16 @@ async function saveConfig(bridge: BridgeView): Promise<void> {
     const cleanVoiceKey = read(voiceKeyDraft).trim()
     const payload: SaveConfigInput = {
       bridgeId: bridge.id,
-      name: read(nameDraft).trim() || bridge.name,
       orcaBot: read(orcaBotDraft) === AUTO_BOT ? '' : read(orcaBotDraft).trim(),
-      allowedUserIds: read(allowedIdsDraft).trim(),
+      // An empty list is how the worker stores "anyone"; the typed IDs stay in the draft.
+      allowedUserIds: restricted ? read(allowedIdsDraft).trim() : '',
       proxyUrl: read(proxyUrlDraft).trim(),
       replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
       syncOrcaOutbound: read(syncOrcaOutboundDraft),
       replyLanguage: read(replyLanguageDraft),
       allowGroups: read(allowGroupsDraft),
       groupMode: read(groupModeDraft),
+      groupReply: read(groupReplyDraft),
       voiceEnabled: read(voiceEnabledDraft),
       voiceProvider: read(voiceProviderDraft),
       voiceModel: read(voiceModelDraft).trim(),
@@ -322,7 +352,11 @@ async function allowBlockedUser(bridgeId: string, userId: string): Promise<void>
     if (read(editingBridgeId) === bridgeId) {
       const bridge = findBridge(next, bridgeId)
       if (read(formDirty)) {
-        if (bridge) set(allowedIdsDraft, bridge.config.allowedUserIds)
+        if (bridge) {
+          set(allowedIdsDraft, bridge.config.allowedUserIds)
+          set(accessModeDraft, 'restricted')
+          set(allowedIdsError, null)
+        }
       } else hydrateForm(next, true)
     }
     set(feedback, { tone: 'success', text: `Allowed Telegram ID ${userId}` })
@@ -451,21 +485,33 @@ function hasAllowedIds(raw: string): boolean {
   return raw.split(/[\s,;]+/).some((id) => /^-?\d+$/.test(id))
 }
 
-function bridgeCard(bridge: BridgeView, isBusy: boolean, confirming: boolean) {
+// The card's plain-words line for groups. While the bot is open to everyone the worker reads
+// only messages for it, even with All messages saved.
+function groupsSummary(bridge: BridgeView, openToEveryone: boolean): string {
+  const { allowGroups, groupMode, groupReply } = bridge.config
+  if (!allowGroups) return 'Groups: off'
+  if (groupMode === 'addressed') return 'Groups: messages for the bot'
+  if (openToEveryone) return 'Groups: messages for the bot (all messages needs an ID list)'
+  return groupReply === 'helpful'
+    ? 'Groups: reads all, replies when it can help'
+    : 'Groups: reads all, replies when mentioned'
+}
+
+function bridgeCard(bridge: BridgeView, isBusy: boolean) {
   const badge = statusMeta(bridge.status)
   const openToEveryone = !hasAllowedIds(bridge.config.allowedUserIds)
   const blockedUserId = bridge.lastBlockedUserId
   return (
     <Card
       key={`bridge:${bridge.id}`}
-      title={clip(bridge.name)}
-      description={clip(`${telegramHandle(bridge)} → ${bridge.config.orcaBot || 'first Orca bot'}`)}
+      title={clip(bridgeLabel(bridge))}
+      description={clip(`→ ${bridge.config.orcaBot || 'first Orca bot'}`)}
     >
       <Stack gap="xs">
         <Row justify="between" align="center">
           <Switch
             key={`active:${bridge.id}`}
-            label="Bot active"
+            label="Active"
             checked={bridge.config.enabled}
             disabled={isBusy || !bridge.config.hasToken}
             onChange={(v) => void setEnabled(bridge.id, v)}
@@ -478,24 +524,20 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean, confirming: boolean) {
           </Text>
         )}
         <Text muted size="xs">
-          {!bridge.config.allowGroups
-            ? 'Groups: off'
-            : bridge.config.groupMode === 'addressed'
-              ? 'Groups: messages for the bot'
-              : `Groups: all messages${openToEveryone ? ' (open: messages for the bot)' : ''}`}
+          {groupsSummary(bridge, openToEveryone)}
         </Text>
         <Text muted size="xs">
           {!bridge.config.voiceEnabled
             ? 'Voice: off'
-            : `Voice: ${VOICE_PROVIDER_LABEL[bridge.config.voiceProvider]} (${bridge.config.voiceModel || 'default'})${bridge.config.hasVoiceKey ? '' : ' – no API key'}`}
+            : `Voice: ${VOICE_PROVIDER_LABEL[bridge.config.voiceProvider]}${bridge.config.hasVoiceKey ? '' : ' – no API key'}`}
         </Text>
         {bridge.lastError && (
-          <Callout tone="danger" title="Connection Error" icon="error">
+          <Callout tone="danger" title="Connection error" icon="error">
             <Text size="xs">{clip(bridge.lastError)}</Text>
           </Callout>
         )}
         {blockedUserId && (
-          <Callout tone="warning" title="Unauthorized Telegram User" icon="warning">
+          <Callout tone="warning" title="Unauthorized Telegram user" icon="warning">
             <Stack gap="xs">
               <Text size="xs">
                 User <Code>{blockedUserId}</Code> messaged this bot but is not in the allowlist.
@@ -516,20 +558,15 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean, confirming: boolean) {
           <Callout tone="warning" title="Open to everyone" icon="warning">
             <Text size="xs">
               {clip(
-                `Anyone who finds ${bridge.botUsername ? `@${bridge.botUsername}` : 'this bot'} on Telegram can chat with ${bridge.config.orcaBot || 'your first Orca bot'} and use its commands with your rights. Add Telegram IDs to restrict access.`
+                `Anyone who finds ${bridge.botUsername ? `@${bridge.botUsername}` : 'this bot'} on Telegram can chat with ${bridge.config.orcaBot || 'your first Orca bot'} and use its commands with your rights. To limit it, press Edit and choose Only these people and groups.`
               )}
             </Text>
           </Callout>
         )}
-        {confirming && (
-          <Text tone="danger" size="xs">
-            Removing stops this bot and deletes its token, chats and settings.
-          </Text>
-        )}
         <Row gap="xs">
           <Button
             key={`edit:${bridge.id}`}
-            size="xs"
+            size="sm"
             variant="outline"
             icon="edit"
             disabled={isBusy}
@@ -540,46 +577,13 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean, confirming: boolean) {
           >
             Edit
           </Button>
-          {confirming ? (
-            <Button
-              key={`confirm-remove:${bridge.id}`}
-              size="xs"
-              tone="danger"
-              disabled={isBusy}
-              onPress={() => void removeBridge(bridge)}
-            >
-              Confirm remove
-            </Button>
-          ) : (
-            <Button
-              key={`remove:${bridge.id}`}
-              size="xs"
-              variant="ghost"
-              tone="danger"
-              disabled={isBusy}
-              onPress={() => set(confirmRemoveId, bridge.id)}
-            >
-              Remove
-            </Button>
-          )}
-          {confirming && (
-            <Button
-              key={`keep:${bridge.id}`}
-              size="xs"
-              variant="ghost"
-              disabled={isBusy}
-              onPress={() => set(confirmRemoveId, null)}
-            >
-              Keep
-            </Button>
-          )}
         </Row>
       </Stack>
     </Card>
   )
 }
 
-function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean) {
+function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, confirming: boolean) {
   const botOptions = [
     { value: AUTO_BOT, label: '(Auto-select first Orca bot)' },
     ...state.bots
@@ -593,153 +597,277 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean) {
   if (draftBot !== AUTO_BOT && !botOptions.some((o) => o.value === draftBot)) {
     botOptions.push({ value: draftBot, label: clip(draftBot) })
   }
-  const openToEveryone = !hasAllowedIds(bridge.config.allowedUserIds)
+  const accessMode = read(accessModeDraft)
+  const idsError = read(allowedIdsError)
+  const groupChoice = read(allowGroupsDraft) ? read(groupModeDraft) : 'off'
+  const voiceOn = read(voiceEnabledDraft)
   const voiceProvider = read(voiceProviderDraft)
 
   return (
     <Card
       key={`editor:${bridge.id}`}
-      title={clip(`Edit ${bridge.name}`)}
+      title={clip(`Edit ${bridgeLabel(bridge)}`)}
       description={
         bridge.config.hasToken
-          ? 'Bot token is stored encrypted in OS keyring. Leave blank to keep existing token.'
-          : 'Paste your BotFather token to enable polling.'
+          ? 'The bot token is stored encrypted in the OS keyring. Leave the field empty to keep it.'
+          : 'Paste the token from @BotFather to connect the bot.'
       }
     >
-      <Stack gap="sm">
-        <Input label="Name" value={read(nameDraft)} onChange={(v) => edit(nameDraft, v)} />
-        <Input
-          label="Telegram Bot Token"
-          type="password"
-          value={read(tokenDraft)}
-          placeholder={bridge.config.hasToken ? '•••••••••••••••• (saved)' : '123456:ABC...'}
-          onChange={(v) => edit(tokenDraft, v)}
-        />
-        <Select
-          label={ORCA_BOT_LABEL}
-          value={draftBot}
-          options={botOptions}
-          onChange={(v) => edit(orcaBotDraft, v)}
-        />
-        <Input
-          label="Allowed Telegram IDs (empty = everyone)"
-          value={read(allowedIdsDraft)}
-          placeholder="Empty = open to everyone. Or user/group IDs, e.g. 123456789, -1001234567890"
-          onChange={(v) => edit(allowedIdsDraft, v)}
-        />
-        <Input
-          label="HTTP Proxy URL (optional)"
-          value={read(proxyUrlDraft)}
-          placeholder="http://127.0.0.1:7890"
-          onChange={(v) => edit(proxyUrlDraft, v)}
-        />
-        <Input
-          label="Reply Timeout (seconds)"
-          value={read(timeoutDraft)}
-          placeholder="300"
-          onChange={(v) => edit(timeoutDraft, v)}
-        />
-        <Select
-          label="Telegram reply language"
-          value={read(replyLanguageDraft)}
-          options={REPLY_LANGUAGE_OPTIONS}
-          onChange={(v) => edit(replyLanguageDraft, v as ReplyLanguage)}
-        />
-        <Switch
-          label="Sync Orca-side messages to Telegram"
-          checked={read(syncOrcaOutboundDraft)}
-          onChange={(v) => edit(syncOrcaOutboundDraft, v)}
-        />
-        {openToEveryone && bridge.config.syncOrcaOutbound && (
-          <Text muted size="xs">
-            Sync is paused while the bot is open to everyone. Add Telegram IDs to use it.
-          </Text>
-        )}
-        <Switch
-          label="Allow groups"
-          checked={read(allowGroupsDraft)}
-          onChange={(v) => edit(allowGroupsDraft, v)}
-        />
-        {read(allowGroupsDraft) && (
+      <Stack gap="lg">
+        <Stack gap="sm">
+          <Heading level={3}>Connection</Heading>
+          <Input
+            label="Telegram bot token"
+            type="password"
+            value={read(tokenDraft)}
+            placeholder={bridge.config.hasToken ? '•••••••••••••••• (saved)' : '123456:ABC...'}
+            onChange={(v) => edit(tokenDraft, v)}
+          />
+          <Select
+            label={ORCA_BOT_LABEL}
+            value={draftBot}
+            options={botOptions}
+            onChange={(v) => edit(orcaBotDraft, v)}
+          />
+        </Stack>
+
+        <Stack gap="sm">
+          <Heading level={3}>Who can talk</Heading>
           <RadioGroup
-            label="In groups, read"
-            value={read(groupModeDraft)}
-            options={GROUP_MODE_OPTIONS}
-            onChange={(v) => edit(groupModeDraft, v as GroupMode)}
+            label="Who can talk"
+            labelHidden
+            value={accessMode}
+            options={ACCESS_OPTIONS}
+            onChange={(v) => {
+              edit(accessModeDraft, v as AccessMode)
+              set(allowedIdsError, null)
+            }}
           />
-        )}
-        {bridge.config.allowGroups && bridge.config.groupMode === 'all' && openToEveryone && (
-          <Text muted size="xs">
-            All messages works only with Allowed Telegram IDs. While the bot is open to everyone it
-            reads only messages for it.
-          </Text>
-        )}
-        {bridge.config.allowGroups && bridge.telegramCaps?.canJoinGroups === false && (
-          <Callout
-            tone="warning"
-            icon="warning"
-            title="Telegram does not let this bot join groups. In @BotFather: /setjoingroups -> Enable."
+          {accessMode === 'restricted' ? (
+            <Stack gap="xs">
+              <Input
+                label="Telegram user and group IDs"
+                value={read(allowedIdsDraft)}
+                placeholder="e.g. 123456789, -1001234567890"
+                invalid={idsError !== null}
+                onChange={(v) => {
+                  edit(allowedIdsDraft, v)
+                  set(allowedIdsError, null)
+                }}
+              />
+              {idsError && (
+                <Text tone="danger" size="xs">
+                  {idsError}
+                </Text>
+              )}
+            </Stack>
+          ) : (
+            <Callout tone="warning" icon="warning" title="Anyone can use this bot">
+              <Text size="xs">
+                {clip(
+                  `Anyone who finds this bot can chat with ${draftBot === AUTO_BOT ? 'your first Orca bot' : draftBot} and use its commands with your rights.`
+                )}
+              </Text>
+            </Callout>
+          )}
+        </Stack>
+
+        <Stack gap="sm">
+          <Heading level={3}>Groups</Heading>
+          <RadioGroup
+            label="Group messages"
+            labelHidden
+            value={groupChoice}
+            options={GROUP_OPTIONS}
+            onChange={(v) => {
+              if (v === 'off') {
+                edit(allowGroupsDraft, false)
+                return
+              }
+              edit(allowGroupsDraft, true)
+              edit(groupModeDraft, v as GroupMode)
+            }}
           />
-        )}
-        {bridge.config.allowGroups && bridge.telegramCaps?.canReadAllGroupMessages === false && (
-          <Text muted size="xs">
-            {'Privacy mode is on: in groups the bot receives only commands and replies to its messages; @mentions and All messages need /setprivacy -> Disable in @BotFather, then add the bot to the group again.'}
-          </Text>
-        )}
-        <Switch
-          label="Voice messages"
-          checked={read(voiceEnabledDraft)}
-          onChange={(v) => edit(voiceEnabledDraft, v)}
-        />
-        {read(voiceEnabledDraft) && (
+          {groupChoice === 'all' && (
+            <Stack gap="xs">
+              <RadioGroup
+                label="Replies"
+                value={read(groupReplyDraft)}
+                options={GROUP_REPLY_OPTIONS}
+                onChange={(v) => edit(groupReplyDraft, v as GroupReply)}
+              />
+              <Text muted size="xs">
+                Each group message is sent to the Orca bot, so it uses a bot turn per message.
+              </Text>
+            </Stack>
+          )}
+          {groupChoice === 'all' && accessMode === 'open' && (
+            <Text muted size="xs">
+              {ALL_NEEDS_IDS}
+            </Text>
+          )}
+          {groupChoice !== 'off' && bridge.telegramCaps?.canJoinGroups === false && (
+            <Callout tone="warning" icon="warning" title="This bot cannot join groups">
+              <Text size="xs">In @BotFather, send /setjoingroups, pick this bot and choose Enable.</Text>
+            </Callout>
+          )}
+          {groupChoice !== 'off' && bridge.telegramCaps?.canReadAllGroupMessages === false && (
+            <Callout tone="warning" icon="warning" title="Privacy mode is on">
+              <Stack gap="xs">
+                <Text size="xs">
+                  In groups the bot gets only commands and replies to its messages. For @mentions
+                  and all messages:
+                </Text>
+                <Text size="xs">1. In @BotFather, send /setprivacy and pick this bot.</Text>
+                <Text size="xs">2. Choose Disable.</Text>
+                <Text size="xs">3. Add the bot to the group again.</Text>
+              </Stack>
+            </Callout>
+          )}
+        </Stack>
+
+        <Stack gap="sm">
+          <Heading level={3}>Features</Heading>
+          <Switch
+            label="Voice messages"
+            checked={voiceOn}
+            onChange={(v) => edit(voiceEnabledDraft, v)}
+          />
+          {voiceOn && (
+            <Stack gap="sm">
+              <Select
+                label="Transcription provider"
+                value={voiceProvider}
+                options={VOICE_PROVIDER_OPTIONS}
+                onChange={(v) => edit(voiceProviderDraft, v as VoiceProvider)}
+              />
+              <Input
+                label="Transcription API key"
+                type="password"
+                value={read(voiceKeyDraft)}
+                placeholder={
+                  bridge.config.hasVoiceKey ? '•••• (saved)' : VOICE_KEY_PLACEHOLDER[voiceProvider]
+                }
+                onChange={(v) => edit(voiceKeyDraft, v)}
+              />
+              <Text muted size="xs">
+                {`Voice messages and audio files are sent to ${VOICE_PROVIDER_LABEL[voiceProvider]} to be transcribed, then the text goes to the Orca bot. The provider charges per minute of audio.`}
+              </Text>
+              {!bridge.config.hasVoiceKey && !read(voiceKeyDraft).trim() && (
+                <Text muted size="xs">
+                  {'Add an API key, or voice messages get a "not enabled" reply.'}
+                </Text>
+              )}
+            </Stack>
+          )}
+          <Switch
+            label="Sync Orca-side messages to Telegram"
+            checked={read(syncOrcaOutboundDraft)}
+            onChange={(v) => edit(syncOrcaOutboundDraft, v)}
+          />
+          {accessMode === 'open' && read(syncOrcaOutboundDraft) && (
+            <Text muted size="xs">
+              Sync is paused while the bot is open to everyone. Choose Only these people and groups
+              to use it.
+            </Text>
+          )}
+        </Stack>
+
+        <Collapsible key={`advanced:${bridge.id}`} title="Advanced">
           <Stack gap="sm">
             <Select
-              label="Transcription provider"
-              value={voiceProvider}
-              options={VOICE_PROVIDER_OPTIONS}
-              onChange={(v) => edit(voiceProviderDraft, v as VoiceProvider)}
+              label="Telegram reply language"
+              value={read(replyLanguageDraft)}
+              options={REPLY_LANGUAGE_OPTIONS}
+              onChange={(v) => edit(replyLanguageDraft, v as ReplyLanguage)}
             />
             <Input
-              label="Transcription model"
-              value={read(voiceModelDraft)}
-              placeholder={VOICE_DEFAULT_MODEL[voiceProvider]}
-              onChange={(v) => edit(voiceModelDraft, v)}
+              label="Reply timeout (seconds)"
+              value={read(timeoutDraft)}
+              placeholder="300"
+              onChange={(v) => edit(timeoutDraft, v)}
             />
-            <Input
-              label="Transcription API key"
-              type="password"
-              value={read(voiceKeyDraft)}
-              placeholder={
-                bridge.config.hasVoiceKey ? '•••• (saved)' : VOICE_KEY_PLACEHOLDER[voiceProvider]
-              }
-              onChange={(v) => edit(voiceKeyDraft, v)}
-            />
-            <Text muted size="xs">
-              {`Voice messages and audio files are sent to ${VOICE_PROVIDER_LABEL[voiceProvider]} to be transcribed, then the text goes to the Orca bot. The provider charges per minute of audio.`}
-            </Text>
-            {!bridge.config.hasVoiceKey && !read(voiceKeyDraft).trim() && (
+            <Stack gap="xs">
+              <Input
+                label="HTTP proxy URL"
+                value={read(proxyUrlDraft)}
+                onChange={(v) => edit(proxyUrlDraft, v)}
+              />
               <Text muted size="xs">
-                {'Add an API key, or voice messages get a "not enabled" reply.'}
+                Leave empty unless you need a proxy.
               </Text>
+            </Stack>
+            {voiceOn && (
+              <Input
+                label="Transcription model"
+                value={read(voiceModelDraft)}
+                placeholder={VOICE_DEFAULT_MODEL[voiceProvider]}
+                onChange={(v) => edit(voiceModelDraft, v)}
+              />
             )}
           </Stack>
-        )}
-        <Row gap="xs" wrap>
-          <Button size="sm" disabled={isBusy} onPress={() => saveConfig(bridge)}>
-            Save Settings
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={isBusy || !bridge.config.hasToken}
-            onPress={() => testConnection(bridge.id)}
-          >
-            Test Connection
-          </Button>
-          <Button size="sm" variant="ghost" disabled={isBusy} onPress={closeEditor}>
-            Cancel
-          </Button>
-        </Row>
+        </Collapsible>
+
+        <Stack gap="xs">
+          {confirming && (
+            <Text tone="danger" size="xs">
+              Removing stops this bot and deletes its token, chats and settings.
+            </Text>
+          )}
+          <Row gap="xs" justify="between" wrap>
+            <Row gap="xs">
+              <Button size="sm" disabled={isBusy} onPress={() => saveConfig(bridge)}>
+                Save
+              </Button>
+              <Button size="sm" variant="ghost" disabled={isBusy} onPress={closeEditor}>
+                Cancel
+              </Button>
+            </Row>
+            <Row gap="xs">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={isBusy || !bridge.config.hasToken}
+                onPress={() => testConnection(bridge.id)}
+              >
+                Test connection
+              </Button>
+              {confirming ? (
+                <Button
+                  key={`confirm-remove:${bridge.id}`}
+                  size="sm"
+                  tone="danger"
+                  disabled={isBusy}
+                  onPress={() => void removeBridge(bridge)}
+                >
+                  Confirm remove
+                </Button>
+              ) : (
+                <Button
+                  key={`remove:${bridge.id}`}
+                  size="sm"
+                  variant="ghost"
+                  tone="danger"
+                  disabled={isBusy}
+                  onPress={() => set(confirmRemoveId, bridge.id)}
+                >
+                  Remove
+                </Button>
+              )}
+              {confirming && (
+                <Button
+                  key={`keep:${bridge.id}`}
+                  size="sm"
+                  variant="ghost"
+                  disabled={isBusy}
+                  onPress={() => set(confirmRemoveId, null)}
+                >
+                  Keep
+                </Button>
+              )}
+            </Row>
+          </Row>
+        </Stack>
       </Stack>
     </Card>
   )
@@ -772,11 +900,11 @@ export default function Panel() {
 
   const editing = findBridge(state, read(editingBridgeId))
   const confirming = read(confirmRemoveId)
-  const bridgeNames = new Map(state.bridges.map((b) => [b.id, b.name]))
+  const bridgeNames = new Map(state.bridges.map((b) => [b.id, bridgeLabel(b, b.name)]))
   const bridgeFilterOptions = [
     { value: ALL_BRIDGES, label: 'All bridges' },
     { value: PLUGIN_LOGS, label: 'Plugin' },
-    ...state.bridges.map((b) => ({ value: b.id, label: clip(b.name) }))
+    ...state.bridges.map((b) => ({ value: b.id, label: clip(bridgeLabel(b, b.name)) }))
   ]
   // A persisted filter may name a bridge that was removed since.
   const storedBridgeFilter = read(logBridgeFilter)
@@ -827,8 +955,10 @@ export default function Panel() {
               />
             )}
             {state.bridges.flatMap((bridge) => [
-              bridgeCard(bridge, isBusy, confirming === bridge.id),
-              ...(editing && editing.id === bridge.id ? [bridgeEditor(bridge, state, isBusy)] : [])
+              bridgeCard(bridge, isBusy),
+              ...(editing && editing.id === bridge.id
+                ? [bridgeEditor(bridge, state, isBusy, confirming === bridge.id)]
+                : [])
             ])}
             <Row gap="xs">
               <Button size="sm" variant="outline" icon="add" disabled={isBusy} onPress={addBridge}>
@@ -849,14 +979,17 @@ export default function Panel() {
             <Stack gap="sm">
               {state.bridges.flatMap((bridge) => [
                 <Heading key={`chats-title:${bridge.id}`} level={3}>
-                  {clip(bridge.name)}
+                  {clip(bridgeLabel(bridge, bridge.name))}
                 </Heading>,
                 bridge.bindings.length === 0 ? (
                   <Text key={`chats-empty:${bridge.id}`} muted size="xs">
                     No chats yet.
                   </Text>
                 ) : (
-                  <List key={`chats:${bridge.id}`} label={clip(`${bridge.name} chat bindings`)}>
+                  <List
+                    key={`chats:${bridge.id}`}
+                    label={clip(`${bridgeLabel(bridge, bridge.name)} chat bindings`)}
+                  >
                     {bridge.bindings.map((b) => (
                       <ListItem
                         key={b.tgChatId}
@@ -910,7 +1043,7 @@ export default function Panel() {
             <Row gap="xs" justify="end">
               {state.logs.length > 0 && (
                 <Button size="xs" variant="ghost" onPress={clearLogs}>
-                  Clear Logs
+                  Clear logs
                 </Button>
               )}
               <Button

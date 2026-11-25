@@ -2520,6 +2520,7 @@ test('a 0.4.0 setup becomes "Bridge 1" with its token, settings, chats and offse
       // 0.4.0 answered in groups; the update keeps that.
       allowGroups: true,
       groupMode: 'addressed',
+      groupReply: 'mentioned',
       // Voice did not exist in 0.4.0: off, provider default, no key.
       voiceEnabled: false,
       voiceProvider: 'openrouter',
@@ -3026,6 +3027,86 @@ test("'all' with an open allowlist acts as 'addressed': a plain group line start
   })
 })
 
+const SILENT_LINE =
+  'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.'
+const HELPFUL_LINE =
+  'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.'
+
+function groupMessages(deps: ReturnType<typeof makeMockDeps>) {
+  return deps.sentMessages.filter((m) => m.chatId === GROUP_ID)
+}
+
+function typed(deps: ReturnType<typeof makeMockDeps>): boolean {
+  return deps.sentActions.some((a) => a.action === 'typing')
+}
+
+// No groupReply stored: the default, 'mentioned'.
+test("'all' + reply only when mentioned: an unaddressed line reaches the bot as context, and its answer stays out of the group", async () => {
+  await withGroupBridge({ allowGroups: true, groupMode: 'all', allowedUserIds: '777888' }, async (controller, deps, manager) => {
+    await within(controller.handleIncomingUpdate(groupUpdate(1, 777888, 'the deploy failed again')), 'unaddressed line')
+    assert.equal(deps.sentToBots.length, 1)
+    assert.ok(deps.sentToBots[0].body.includes(SILENT_LINE))
+    assert.equal(deps.sentToBots[0].body.includes(HELPFUL_LINE), false)
+    assert.equal(lastBodyLine(deps), 'the deploy failed again')
+    // The mock bot answered "Reply #1 from Assistant" (23 chars); the bridge keeps it out of the group.
+    assert.deepEqual(groupMessages(deps), [])
+    assert.equal(typed(deps), false)
+    const entry = manager.getState().logs.find((e) => e.message.includes("in 'mentioned' mode"))
+    assert.match(entry?.message ?? '', /Unaddressed group message in 'mentioned' mode: reply of 23 chars not sent\.$/)
+    assert.equal(entry?.level, 'info')
+    assert.equal(manager.getState().logs.some((e) => e.message.includes('Reply #1')), false)
+  })
+})
+
+test("'all' + reply when it can help: an unaddressed answer goes to the group, NO_REPLY sends nothing", async () => {
+  await withGroupBridge(
+    { allowGroups: true, groupMode: 'all', groupReply: 'helpful', allowedUserIds: '777888' },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(groupUpdate(1, 777888, 'how do I restart the worker?')), 'helpful answer')
+      assert.equal(deps.sentToBots.length, 1)
+      assert.ok(deps.sentToBots[0].body.includes(HELPFUL_LINE))
+      assert.equal(deps.sentToBots[0].body.includes(SILENT_LINE), false)
+      assert.equal(groupMessages(deps).at(-1)?.text, 'Reply #1 from Assistant')
+      assert.equal(groupMessages(deps).at(-1)?.replyToMessageId, 101)
+      assert.equal(typed(deps), false)
+
+      const readSession = deps.orcaCli.readSession
+      deps.orcaCli.readSession = async (sessionId, limit) => {
+        const session = await readSession(sessionId, limit)
+        return {
+          ...session,
+          entries: session.entries.map((e) =>
+            e.kind === 'message' && e.role === 'assistant' ? { ...e, text: 'NO_REPLY' } : e
+          )
+        }
+      }
+      const before = groupMessages(deps).length
+      await within(controller.handleIncomingUpdate(groupUpdate(2, 777888, 'lunch at noon?')), 'quiet answer')
+      assert.equal(deps.sentToBots.length, 2)
+      assert.equal(groupMessages(deps).length, before)
+    }
+  )
+})
+
+test("'all': a message addressed to the bot is answered as before, in both reply modes", async () => {
+  for (const groupReply of ['mentioned', 'helpful']) {
+    await withGroupBridge(
+      { allowGroups: true, groupMode: 'all', groupReply, allowedUserIds: '777888' },
+      async (controller, deps) => {
+        await within(
+          controller.handleIncomingUpdate(groupUpdate(1, 777888, '@demo_orca_bot what is due today?')),
+          `addressed in ${groupReply}`
+        )
+        assert.equal(deps.sentToBots.length, 1)
+        assert.equal(deps.sentToBots[0].body.includes('was not addressed to you'), false)
+        assert.equal(lastBodyLine(deps), 'what is due today?')
+        assert.equal(groupMessages(deps).at(-1)?.text, 'Reply #1 from Assistant')
+        assert.ok(typed(deps), `no typing action in ${groupReply}`)
+      }
+    )
+  }
+})
+
 test('Telegram caps come from getMe, are null before it, and reset with a new token', async () => {
   const host = bridgesHost([{ id: 'b-caps0001', token: '123456:TEST_TOKEN' }])
   const deps = makeMockDeps({
@@ -3065,6 +3146,34 @@ test('a bridge stored without group options keeps groups on, and a save without 
     assert.equal(controller.view().config.groupMode, 'all')
     const stored = (host.data().storage.bridges as { allowGroups: boolean; groupMode: string }[])[0]
     assert.deepEqual([stored.allowGroups, stored.groupMode], [true, 'all'])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+// The panel no longer sends a name: the bridge keeps the one it has.
+test('a save without a name keeps it; groupReply defaults to mentioned, round-trips, and a save without it keeps it', async () => {
+  const host = bridgesHost([{ id: 'b-reply001', token: '123456:TEST_TOKEN', config: { name: 'Team bot' } }])
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    assert.equal(controller.view().config.groupReply, 'mentioned')
+
+    const { name: _name, ...withoutName } = saveInput(controller, { groupMode: 'all', groupReply: 'helpful' })
+    const saved = (await worker.request('bridge.saveConfig', withoutName)) as BridgeState
+    assert.equal(saved.bridges[0].name, 'Team bot')
+    assert.equal(saved.bridges[0].config.groupReply, 'helpful')
+
+    // A blank name and no groupReply keep both.
+    await worker.request('bridge.saveConfig', saveInput(controller, { name: '  ' }))
+    assert.equal(controller.view().config.name, 'Team bot')
+    assert.equal(controller.view().config.groupReply, 'helpful')
+    const stored = (host.data().storage.bridges as { name: string; groupReply: string }[])[0]
+    assert.deepEqual([stored.name, stored.groupReply], ['Team bot', 'helpful'])
+
+    await worker.request('bridge.saveConfig', saveInput(controller, { groupReply: 'mentioned' }))
+    assert.equal(controller.view().config.groupReply, 'mentioned')
+    assert.deepEqual(worker.refusals, [])
   } finally {
     await worker.deactivate()
   }

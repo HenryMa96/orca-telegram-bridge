@@ -1,0 +1,41 @@
+# SPEC: Setup panel redesign + group reply policy
+
+**Date:** 2026-11-25
+**Status:** approved (UX review in chat; user: "the bridge name makes no sense, the bot name is the reference"; "in groups, even while reading every message, it must be optional whether it answers only when mentioned or when it thinks it can help")
+
+## Goal
+1. A calm, low-effort setup panel: one identity (the Telegram bot's `@username`), sections, rare options behind a disclosure, an explicit "who can talk" choice.
+2. In groups with **All messages**, a per-bridge reply policy: **only when mentioned** (default) or **when it can help**.
+
+## Contract (src/protocol.ts)
+- `GroupReply = 'mentioned' | 'helpful'`; `BridgeConfig.groupReply`; `SaveConfigInput.groupReply?` (absent keeps).
+- `SaveConfigInput.name?` is optional; absent keeps the saved name. The panel stops sending it.
+- Internal keys stay the stable bridge `id`. `@username` is a display label only (it can change, and is unknown until the token is checked).
+
+## Group reply behavior (worker)
+- Applies only to messages that `groupMessageText` returns with `addressed: false` (group, groupMode `all`, restricted allowlist). Addressed messages (mention, reply to the bot, command for it) are unchanged.
+- Each unaddressed message is still sent to the Orca bot (it "reads everything"); the handoff body gets one extra line:
+  - `mentioned`: `This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.`
+  - `helpful`: `This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.`
+- `mentioned` is enforced by the bridge: whatever the bot answers to an unaddressed message is not sent to Telegram (logged at info with its length only).
+- Unaddressed messages are quiet: no typing action, and no user-facing error or notice lines in the group (processing failure, unsupported image, voice not enabled / transcription failure); those are logged only.
+- Default `groupReply` for new and existing bridges: `mentioned`.
+
+## Panel (src/panel.tsx)
+- Card: title `@username` (fallback: "New Telegram bot" before the token is checked), description `→ <Orca bot>`. One switch row with the status badge. Summary lines in plain words. Actions: **Edit** only; **Remove** moves to the editor footer with the existing confirm step.
+- Editor sections (Heading + spacing): **Connection** (token, Orca bot) · **Who can talk** (radio: "Only these people and groups" with the IDs field / "Anyone on Telegram" with a warning Callout) · **Groups** (radio: Off / Only messages for the bot / All messages; with All messages a second radio: "Reply only when mentioned" / "Reply when it can help"; privacy-mode Callout with numbered steps) · **Features** (voice switch + provider + key; sync switch) · **Advanced** Collapsible, closed (reply language, reply timeout, HTTP proxy, transcription model).
+- Name field removed. Chats tab and log filter label bridges by `@username` (fallback to the stored name).
+- Footer: Save (primary), Cancel (ghost); Test connection (outline) and Remove (ghost, danger) after them.
+- Sentence case for every label and button.
+
+## Acceptance Criteria
+1. [ ] A bridge saved without `name` keeps its name; `groupReply` round-trips and defaults to `mentioned`.
+2. [ ] Unaddressed group message, `mentioned`: handoff has the silent line; nothing is sent to the group even if the bot answers text; no typing action.
+3. [ ] Unaddressed group message, `helpful`: handoff has the helpful line; a text answer is sent; `NO_REPLY` sends nothing.
+4. [ ] Addressed group messages and private chats behave as before.
+5. [ ] Panel: no Name field; card title is `@username`; "Anyone on Telegram" saves an empty allowlist; "Only these people" with no ID is refused with a clear message; reply policy is shown only with All messages; Advanced is closed by default.
+6. [ ] `orca plugin test`, `orca plugin check` pass; tsc shows no new error.
+
+## Out of Scope
+- Buffering unaddressed messages as context for a later mention.
+- Changing how addressed messages are detected.

@@ -230,6 +230,33 @@ test('bridge-sent message is recognised when the sender label contains parenthes
   )
 })
 
+test('the not-addressed line is in the body only for an unaddressed group message, after the attachment line', async () => {
+  const bodyFor = async (unaddressedGroupReply?: 'mentioned' | 'helpful') => {
+    const { runner, sentBodies } = makeRunner({
+      afterSend: (_poll, ourUser) => ({ orcaSessionId: BOUND_CHAT.id, state: 'done', entries: [ourUser, assistant('ok')] })
+    })
+    await dispatchToOrcaBotAndWait(runner, { ...dispatchParams, unaddressedGroupReply })
+    return sentBodies[0]
+  }
+  const plain = await bodyFor()
+  assert.equal(/not addressed to you/.test(plain), false)
+
+  const silent = (await bodyFor('mentioned')).split('\n')
+  assert.equal(
+    silent[3],
+    'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.'
+  )
+  assert.match(silent[2], /^To send an image or file/)
+  assert.equal(isTelegramOriginatedUserMessage(silent.join('\n')), true)
+  assert.equal(silent.at(-1), 'status?')
+
+  const helpful = (await bodyFor('helpful')).split('\n')
+  assert.equal(
+    helpful[3],
+    'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.'
+  )
+})
+
 test('getOrcaBinary uses orca-ide on Linux, never the GNOME screen reader', () => {
   const env: NodeJS.ProcessEnv = {}
   const bundled = '/opt/Orca/resources/bin/orca-ide'

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import type { BotSummary } from './protocol'
+import type { BotSummary, GroupReply } from './protocol'
 
 export type OrcaChatSummary = {
   id: string
@@ -716,6 +716,14 @@ function findRequestReply(
     .filter((e) => e.kind === 'message' && e.role === 'assistant' && e.text?.trim())
 }
 
+// The extra handoff line for a group message not addressed to the bot (groupMode 'all').
+const UNADDRESSED_GROUP_LINES: Record<GroupReply, string> = {
+  mentioned:
+    'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.',
+  helpful:
+    'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.'
+}
+
 export async function dispatchToOrcaBotAndWait(
   runner: OrcaCliRunner,
   params: {
@@ -725,6 +733,8 @@ export async function dispatchToOrcaBotAndWait(
     senderLabel: string
     userText: string
     imagePaths?: string[]
+    // Set only for a group message not addressed to the bot: the group's reply policy.
+    unaddressedGroupReply?: GroupReply
     timeoutMs: number
     pollIntervalMs?: number
     signal?: AbortSignal
@@ -759,6 +769,9 @@ export async function dispatchToOrcaBotAndWait(
     'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).',
     'To send an image or file to the Telegram user, put it on its own line as Markdown ![short caption](absolute local path or https URL); wrap a path with spaces in <>. Images: PNG, JPEG, GIF, WEBP (up to 10 MB). Documents: PDF, CSV, TSV, TXT, MD and Office/OpenDocument files (up to 50 MB).'
   ]
+  if (params.unaddressedGroupReply) {
+    bodyParts.push(UNADDRESSED_GROUP_LINES[params.unaddressedGroupReply])
+  }
   if (imagePaths.length > 0) {
     bodyParts.push(
       '',

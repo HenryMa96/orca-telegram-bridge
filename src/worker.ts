@@ -420,6 +420,7 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
     replyLanguage: normalizeLanguage(raw.replyLanguage),
     allowGroups: typeof raw.allowGroups === 'boolean' ? raw.allowGroups : true,
     groupMode: raw.groupMode === 'all' ? 'all' : 'addressed',
+    groupReply: raw.groupReply === 'helpful' ? 'helpful' : 'mentioned',
     voiceEnabled: typeof raw.voiceEnabled === 'boolean' ? raw.voiceEnabled : false,
     voiceProvider: raw.voiceProvider === 'openai' ? 'openai' : 'openrouter',
     voiceModel: text(raw.voiceModel)
@@ -775,7 +776,7 @@ export class BridgeRuntime {
       input.replyLanguage === undefined ? prev.replyLanguage : normalizeLanguage(input.replyLanguage)
     this.config = {
       id: this.id,
-      name: input.name.trim() || prev.name,
+      name: input.name?.trim() || prev.name,
       hasToken: Boolean(this.cachedToken),
       enabled: input.enabled ?? prev.enabled,
       orcaBot: input.orcaBot.trim(),
@@ -786,6 +787,8 @@ export class BridgeRuntime {
       replyLanguage,
       allowGroups: input.allowGroups ?? prev.allowGroups,
       groupMode: input.groupMode === undefined ? prev.groupMode : input.groupMode === 'all' ? 'all' : 'addressed',
+      groupReply:
+        input.groupReply === undefined ? prev.groupReply : input.groupReply === 'helpful' ? 'helpful' : 'mentioned',
       voiceEnabled: input.voiceEnabled ?? prev.voiceEnabled,
       voiceProvider:
         input.voiceProvider === undefined ? prev.voiceProvider : input.voiceProvider === 'openai' ? 'openai' : 'openrouter',
@@ -1025,9 +1028,19 @@ export class BridgeRuntime {
       return null
     }
 
+    // A group line not addressed to the bot is handled quietly: no typing, no notices in the group.
+    const unaddressed = group?.addressed === false
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
         if (unsupportedImage) {
+          if (unaddressed) {
+            await this.appendLog(
+              'info',
+              'bridge',
+              `Unsupported image ${msg.message_id} in group ${tgChatId} was not addressed to the bot: no notice sent.`
+            )
+            return
+          }
           const token = await this.readToken()
           if (token) {
             await this.safeSendTelegram(
@@ -1040,10 +1053,10 @@ export class BridgeRuntime {
           return
         }
         if (voice) {
-          await this.processVoiceMessage(msg, voice, text, signal, update.update_id)
+          await this.processVoiceMessage(msg, voice, text, signal, update.update_id, unaddressed)
           return
         }
-        await this.processAuthorizedMessage(msg, text, image, signal, update.update_id)
+        await this.processAuthorizedMessage(msg, text, image, signal, update.update_id, false, unaddressed)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         await this.appendLog(
@@ -1053,6 +1066,7 @@ export class BridgeRuntime {
           describeError(err, { tgChatId, updateId: update.update_id, messageId: msg.message_id })
         )
         this.emitState()
+        if (unaddressed) return
         const token = await this.readToken()
         if (token) {
           await this.safeSendTelegram(
@@ -1214,7 +1228,9 @@ export class BridgeRuntime {
     signal: AbortSignal | undefined,
     updateId: number,
     // A transcript is sent as is, even when it starts with '/'.
-    fromVoice = false
+    fromVoice = false,
+    // A group message not addressed to the bot (groupMode 'all'): quiet, and the reply policy applies.
+    unaddressed = false
   ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
@@ -1232,6 +1248,7 @@ export class BridgeRuntime {
     if (!binding.botName) {
       await this.appendLog('error', 'dispatch', 'No Orca bots found to route incoming Telegram message.')
       this.emitState()
+      if (unaddressed) return
       await this.safeSendTelegram(
         token,
         msg.chat.id,
@@ -1258,7 +1275,7 @@ export class BridgeRuntime {
     try {
       const imagePaths: string[] = []
       if (image) {
-        await this.sendTypingAction(token, msg.chat.id)
+        if (!unaddressed) await this.sendTypingAction(token, msg.chat.id)
         const savedPath = await this.downloadTelegramImage(token, image, msg.message_id, signal)
         imagePaths.push(savedPath)
       }
@@ -1270,6 +1287,7 @@ export class BridgeRuntime {
         senderLabel,
         userText: text,
         imagePaths,
+        unaddressedGroupReply: unaddressed ? this.config.groupReply : undefined,
         timeoutMs: this.config.replyTimeoutSec * 1000,
         pollIntervalMs: this.deps.pollIntervalMs,
         signal,
@@ -1286,7 +1304,7 @@ export class BridgeRuntime {
           })
           this.emitState()
         },
-        onWorkingTick: () => this.sendTypingAction(token, msg.chat.id)
+        onWorkingTick: unaddressed ? undefined : () => this.sendTypingAction(token, msg.chat.id)
       })
 
       boundOrcaChatId = result.chatId
@@ -1302,8 +1320,10 @@ export class BridgeRuntime {
 
       // Orca's NO_REPLY: the bot has nothing to report, so Telegram gets nothing either.
       const replyWords = withoutQuietMarker(result.replyText)
+      // 'mentioned' is enforced here too: the bot may answer an unaddressed line anyway.
+      const withheld = unaddressed && this.config.groupReply === 'mentioned' && replyWords !== null
       const delivery =
-        replyWords === null
+        replyWords === null || withheld
           ? { messageCount: 0, imageCount: 0, attachmentCount: 0 }
           : await this.sendFormattedReplyToTelegram(
               token,
@@ -1327,6 +1347,8 @@ export class BridgeRuntime {
         'dispatch',
         replyWords === null
           ? `[${binding.botName} -> TG ${tgChatId}] Answered NO_REPLY: nothing sent.`
+          : withheld
+          ? `[${binding.botName} -> TG ${tgChatId}] Unaddressed group message in 'mentioned' mode: reply of ${replyWords.length} chars not sent.`
           : `[${binding.botName} -> TG ${tgChatId}] Sent ${delivery.messageCount} message(s)${
               delivery.imageCount > 0 ? ` + ${delivery.imageCount} table image(s)` : ''
             }${delivery.attachmentCount > 0 ? ` + ${delivery.attachmentCount} attachment(s)` : ''}.`
@@ -1349,12 +1371,14 @@ export class BridgeRuntime {
         })
       )
       this.emitState()
-      await this.safeSendTelegram(
-        token,
-        msg.chat.id,
-        this.i18n.processingFailed(truncateText(this.redact(message), MAX_DETAIL_CHARS)),
-        msg.message_id
-      )
+      if (!unaddressed) {
+        await this.safeSendTelegram(
+          token,
+          msg.chat.id,
+          this.i18n.processingFailed(truncateText(this.redact(message), MAX_DETAIL_CHARS)),
+          msg.message_id
+        )
+      }
     } finally {
       this.activeTelegramTgChats.delete(tgChatId)
       if (boundOrcaChatId) {
@@ -1364,13 +1388,15 @@ export class BridgeRuntime {
   }
 
   // A voice note or audio file is transcribed, then handled like the text the sender would have
-  // typed. Voice off, no API key or a failed transcription: the sender is told; nothing is dispatched.
+  // typed. Voice off, no API key or a failed transcription: the sender is told (only logged for an
+  // unaddressed group message); nothing is dispatched.
   private async processVoiceMessage(
     msg: TelegramMessage,
     voice: TelegramAudio,
     caption: string,
     signal: AbortSignal | undefined,
-    updateId: number
+    updateId: number,
+    unaddressed = false
   ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
@@ -1384,7 +1410,7 @@ export class BridgeRuntime {
           this.config.voiceEnabled ? 'on but have no API key' : 'off'
         }.`
       )
-      await this.safeSendTelegram(token, msg.chat.id, this.i18n.voiceDisabled, msg.message_id)
+      if (!unaddressed) await this.safeSendTelegram(token, msg.chat.id, this.i18n.voiceDisabled, msg.message_id)
       return
     }
 
@@ -1403,7 +1429,7 @@ export class BridgeRuntime {
       replyReason = this.i18n.voiceTooLarge
     } else {
       try {
-        await this.sendTypingAction(token, msg.chat.id)
+        if (!unaddressed) await this.sendTypingAction(token, msg.chat.id)
         const fileMeta = await this.deps.telegram.getFile(token, voice.file_id, {
           proxyUrl: this.config.proxyUrl,
           timeoutMs: 15_000,
@@ -1464,7 +1490,9 @@ export class BridgeRuntime {
         })
       )
       this.emitState()
-      await this.safeSendTelegram(token, msg.chat.id, this.i18n.voiceFailed(replyReason), msg.message_id)
+      if (!unaddressed) {
+        await this.safeSendTelegram(token, msg.chat.id, this.i18n.voiceFailed(replyReason), msg.message_id)
+      }
       return
     }
 
@@ -1475,7 +1503,7 @@ export class BridgeRuntime {
       `Transcribed voice message ${msg.message_id} in chat ${tgChatId}: ${voice.duration} s, ${bytes} bytes, ${provider} ${model}, ${Date.now() - startedAt} ms.`
     )
     const text = `${caption ? `${caption}\n` : ''}${VOICE_PREFIX} ${transcript}`
-    await this.processAuthorizedMessage(msg, text, null, signal, updateId, true)
+    await this.processAuthorizedMessage(msg, text, null, signal, updateId, true, unaddressed)
   }
 
   private async sendTypingAction(token: string, chatId: number): Promise<void> {

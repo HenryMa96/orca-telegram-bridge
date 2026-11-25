@@ -45,6 +45,7 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
       replyLanguage: 'en',
       allowGroups: false,
       groupMode: 'addressed',
+      groupReply: 'mentioned',
       voiceEnabled: false,
       voiceProvider: 'openrouter',
       voiceModel: '',
@@ -111,6 +112,10 @@ async function openEditor(view: TestPanel, bridgeId: string): Promise<void> {
   await view.press({ testId: `edit:${bridgeId}` })
 }
 
+async function openAdvanced(view: TestPanel): Promise<void> {
+  await view.toggle({ type: 'Collapsible', label: 'Advanced' })
+}
+
 test('renders bridge status, allows saving config, and handles unauthorized user banner', async () => {
   let currentState = makeState({ bridges: [makeBridge('b1', { lastBlockedUserId: '999000' })] })
   const allowed: Array<{ bridgeId: string; userId: string }> = []
@@ -150,7 +155,7 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   assert.equal(view.find({ text: 'Allow 999000' }), null)
 
   await openEditor(view, 'b1')
-  await view.press({ text: 'Save Settings' })
+  await view.press({ text: 'Save' })
   assert.equal(saved.length, 1)
   assert.equal(saved[0].bridgeId, 'b1')
   assert.equal('botToken' in saved[0], false)
@@ -158,7 +163,7 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   assert.equal('enabled' in saved[0], false)
   assert.ok(view.find({ text: 'Settings saved.' }))
 
-  await view.press({ text: 'Test Connection' })
+  await view.press({ text: 'Test connection' })
   assert.deepEqual(tested, [{ bridgeId: 'b1' }])
   assert.ok(view.find({ text: /Connected to @demo_orca_bot/ }))
 
@@ -167,7 +172,7 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   await view.unmount()
 })
 
-test('two bridges render one card each with name, @username and pinned Orca bot', async () => {
+test('two bridges render one card each titled by @username with the pinned Orca bot', async () => {
   const host = mockHost({
     requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) }
   })
@@ -175,19 +180,21 @@ test('two bridges render one card each with name, @username and pinned Orca bot'
   const cards = view.findAll({ type: 'Card' })
   assert.deepEqual(
     cards.map((c) => c.label),
-    ['CI', 'Dev']
+    ['@ci_bot', '@dev_bot']
   )
   assert.deepEqual(
     cards.map((c) => c.props.description),
-    ['@ci_bot → CIWatcher', '@dev_bot → first Orca bot']
+    ['→ CIWatcher', '→ first Orca bot']
   )
-  assert.equal(view.findAll({ label: 'Bot active' }).length, 2)
+  assert.equal(view.findAll({ label: 'Active' }).length, 2)
+  // the card offers only Edit; Remove lives in the editor
+  assert.equal(view.find({ testId: 'remove:ci' }), null)
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
   await view.unmount()
 })
 
-test('Bot active on one bridge switches only that bridge', async () => {
+test('Active on one bridge switches only that bridge', async () => {
   let current = makeState({ bridges: twoBridges() })
   const sent: Array<{ bridgeId: string; enabled: boolean }> = []
   const host = mockHost({
@@ -239,17 +246,18 @@ test('Add bridge asks the worker and opens the new bridge in the editor', async 
   const view = await mount(panel, { host })
   await view.press({ text: 'Add bridge' })
   assert.equal(added.length, 1)
-  assert.ok(view.find({ type: 'Card', label: 'Bridge 3' }))
-  assert.ok(view.find({ type: 'Card', label: 'Edit Bridge 3' }))
-  assert.equal(view.valueOf({ label: 'Name' }), 'Bridge 3')
+  // before the token is checked the bot has no @username, so the card says what it is
+  assert.ok(view.find({ type: 'Card', label: 'New Telegram bot' }))
+  assert.ok(view.find({ type: 'Card', label: 'Edit New Telegram bot' }))
+  assert.equal(view.find({ label: 'Name' }), null)
   // a new bridge has no token yet, so it cannot be tested or switched on
-  assert.equal(view.find({ text: 'Test Connection' })!.disabled, true)
+  assert.equal(view.find({ text: 'Test connection' })!.disabled, true)
   assert.equal(view.find({ testId: 'active:b3' })!.props.disabled, true)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
-test('Save sends the edited bridge id and never the on/off state', async () => {
+test('Save sends the edited bridge id and never the on/off state or a name', async () => {
   const state = makeState({ bridges: twoBridges() })
   const saved: SaveConfigInput[] = []
   const host = mockHost({
@@ -263,14 +271,13 @@ test('Save sends the edited bridge id and never the on/off state', async () => {
   })
   const view = await mount(panel, { host })
   await openEditor(view, 'dev')
-  assert.equal(view.valueOf({ label: 'Name' }), 'Dev')
-  await view.type({ label: 'Name' }, 'Dev box', { replace: true })
+  // the bot's @username names it; there is no Name field and no name in the payload
+  assert.equal(view.find({ label: 'Name' }), null)
   await view.select({ label: ORCA_BOT_LABEL }, 'DevHelper')
-  await view.press({ text: 'Save Settings' })
+  await view.press({ text: 'Save' })
   assert.deepEqual(saved, [
     {
       bridgeId: 'dev',
-      name: 'Dev box',
       orcaBot: 'DevHelper',
       allowedUserIds: '',
       proxyUrl: 'http://127.0.0.1:7890',
@@ -279,6 +286,7 @@ test('Save sends the edited bridge id and never the on/off state', async () => {
       replyLanguage: 'en',
       allowGroups: false,
       groupMode: 'addressed',
+      groupReply: 'mentioned',
       voiceEnabled: false,
       voiceProvider: 'openrouter',
       voiceModel: ''
@@ -300,18 +308,18 @@ test('a duplicate token refused by the worker shows in feedback and keeps the ed
   })
   const view = await mount(panel, { host })
   await openEditor(view, 'dev')
-  await view.type({ label: 'Telegram Bot Token' }, '123456:DUPLICATE')
-  await view.press({ text: 'Save Settings' })
+  await view.type({ label: 'Telegram bot token' }, '123456:DUPLICATE')
+  await view.press({ text: 'Save' })
   assert.ok(view.find({ text: /already used by bridge "CI"/ }))
   assert.equal(view.find({ text: 'Settings saved.' }), null)
-  assert.ok(view.find({ type: 'Card', label: 'Edit Dev' }))
+  assert.ok(view.find({ type: 'Card', label: 'Edit @dev_bot' }))
   // the typed token stays so the user can fix it
-  assert.equal(view.valueOf({ label: 'Telegram Bot Token' }), '123456:DUPLICATE')
+  assert.equal(view.valueOf({ label: 'Telegram bot token' }), '123456:DUPLICATE')
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
-test('Remove needs a second press on Confirm remove before asking the worker', async () => {
+test('Remove sits in the editor and needs a second press on Confirm remove', async () => {
   let current = makeState({ bridges: twoBridges() })
   const removed: Array<{ bridgeId: string }> = []
   const host = mockHost({
@@ -326,19 +334,22 @@ test('Remove needs a second press on Confirm remove before asking the worker', a
   })
   const view = await mount(panel, { host })
 
+  await openEditor(view, 'ci')
   await view.press({ testId: 'remove:ci' })
   assert.ok(view.find({ testId: 'confirm-remove:ci' }))
   await view.press({ testId: 'keep:ci' })
   assert.equal(view.find({ testId: 'confirm-remove:ci' }), null)
 
+  await openEditor(view, 'dev')
   await view.press({ testId: 'remove:dev' })
   assert.deepEqual(removed, [])
   assert.equal(view.find({ testId: 'confirm-remove:dev' })!.text, 'Confirm remove')
   await view.press({ testId: 'confirm-remove:dev' })
   assert.deepEqual(removed, [{ bridgeId: 'dev' }])
-  assert.equal(view.find({ type: 'Card', label: 'Dev' }), null)
-  assert.ok(view.find({ type: 'Card', label: 'CI' }))
-  assert.ok(view.find({ text: 'Removed Dev.' }))
+  assert.equal(view.find({ type: 'Card', label: '@dev_bot' }), null)
+  assert.equal(view.find({ type: 'Card', label: 'Edit @dev_bot' }), null)
+  assert.ok(view.find({ type: 'Card', label: '@ci_bot' }))
+  assert.ok(view.find({ text: 'Removed @dev_bot.' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -361,7 +372,7 @@ test('Chats tab groups bindings under each bridge and resets on the right bridge
     .findAll({ type: 'Heading' })
     .filter((h) => h.props.level === 3)
     .map((h) => h.text)
-  assert.deepEqual(headings, ['CI', 'Dev'])
+  assert.deepEqual(headings, ['@ci_bot', '@dev_bot'])
   assert.ok(view.find({ label: 'TG 222 -> Assistant' }))
   assert.ok(view.find({ label: 'TG 111 -> CIWatcher' }))
 
@@ -390,7 +401,7 @@ test('logs bridge filter shows one bridge, or plugin entries without a bridge', 
   const view = await mount(panel, { host })
   await view.select({ label: 'Telegram Bridge sections' }, 'logs')
   assert.ok(view.find({ text: 'Showing 3 of 3 entries' }))
-  assert.equal(view.find({ label: 'Dev polled' })!.props.description, 'INFO · telegram · Dev')
+  assert.equal(view.find({ label: 'Dev polled' })!.props.description, 'INFO · telegram · @dev_bot')
 
   await view.select({ label: 'Bridge' }, 'dev')
   assert.ok(view.find({ label: 'Dev polled' }))
@@ -431,7 +442,7 @@ test('default bot select offers auto with a non-empty value and saves it as empt
 
   await view.select({ label: ORCA_BOT_LABEL }, 'Assistant')
   await view.select({ label: ORCA_BOT_LABEL }, '__auto__')
-  await view.press({ text: 'Save Settings' })
+  await view.press({ text: 'Save' })
   assert.equal(saved[0].orcaBot, '')
   assert.deepEqual(view.errors, [])
   await view.unmount()
@@ -451,10 +462,11 @@ test('the reply language select shows the saved language and saves the chosen on
   })
   const view = await mount(panel, { host })
   await openEditor(view, 'b1')
+  await openAdvanced(view)
   assert.equal(view.valueOf({ label: 'Telegram reply language' }), 'zh-CN')
 
   await view.select({ label: 'Telegram reply language' }, 'pt-BR')
-  await view.press({ text: 'Save Settings' })
+  await view.press({ text: 'Save' })
   assert.equal(saved[0].replyLanguage, 'pt-BR')
   assert.deepEqual(view.errors, [])
   await view.unmount()
@@ -488,6 +500,9 @@ test('voice options are hidden while off and shown after turning Voice messages 
   assert.equal(view.find({ label: 'Transcription API key' }), null)
   await view.toggle({ label: 'Voice messages' })
   assert.equal(view.valueOf({ label: 'Transcription provider' }), 'openrouter')
+  // the model is a rare option, so it sits under Advanced
+  assert.equal(view.find({ label: 'Transcription model' }), null)
+  await openAdvanced(view)
   assert.ok(view.find({ label: 'Transcription model' }))
   assert.ok(view.find({ text: /sent to OpenRouter to be transcribed/ }))
   assert.ok(view.find({ text: /Add an API key/ }))
@@ -503,9 +518,10 @@ test('Save sends the voice fields and the typed key, then clears the key field',
   await openEditor(view, 'b1')
   await view.toggle({ label: 'Voice messages' })
   await view.select({ label: 'Transcription provider' }, 'openai')
+  await openAdvanced(view)
   await view.type({ label: 'Transcription model' }, 'whisper-1')
   await view.type({ label: 'Transcription API key' }, '  sk-secret  ')
-  await view.press({ text: 'Save Settings' })
+  await view.press({ text: 'Save' })
   assert.equal(saved[0].voiceEnabled, true)
   assert.equal(saved[0].voiceProvider, 'openai')
   assert.equal(saved[0].voiceModel, 'whisper-1')
@@ -522,7 +538,7 @@ test('Save leaves out the voice key when the key field is empty', async () => {
   })
   const view = await mount(panel, { host: savingHost(state, saved) })
   await openEditor(view, 'b1')
-  await view.press({ text: 'Save Settings' })
+  await view.press({ text: 'Save' })
   assert.equal(saved[0].voiceEnabled, true)
   assert.equal('voiceApiKey' in saved[0], false)
   assert.deepEqual(view.errors, [])
@@ -533,6 +549,7 @@ test('switching the provider changes the model and key placeholders', async () =
   const state = makeState({ bridges: [makeBridge('b1', { config: { voiceEnabled: true } })] })
   const view = await mount(panel, { host: savingHost(state, []) })
   await openEditor(view, 'b1')
+  await openAdvanced(view)
   assert.equal(view.find({ label: 'Transcription model' })!.props.placeholder, 'openai/whisper-large-v3')
   assert.equal(view.find({ label: 'Transcription API key' })!.props.placeholder, 'OpenRouter key sk-or-…')
   await view.select({ label: 'Transcription provider' }, 'openai')
@@ -553,7 +570,7 @@ test('the key placeholder says saved when a voice key is stored', async () => {
   await view.unmount()
 })
 
-test('the bridge card shows the voice provider, model and the no-key hint', async () => {
+test('the bridge card shows the voice provider and the no-key hint', async () => {
   const state = makeState({
     bridges: [
       makeBridge('a', { name: 'A' }),
@@ -563,8 +580,8 @@ test('the bridge card shows the voice provider, model and the no-key hint', asyn
   })
   const view = await mount(panel, { host: savingHost(state, []) })
   assert.ok(view.find({ text: 'Voice: off' }))
-  assert.ok(view.find({ text: 'Voice: OpenAI (whisper-1)' }))
-  assert.ok(view.find({ text: 'Voice: OpenRouter (default) – no API key' }))
+  assert.ok(view.find({ text: 'Voice: OpenAI' }))
+  assert.ok(view.find({ text: 'Voice: OpenRouter – no API key' }))
   await view.unmount()
 })
 
@@ -581,22 +598,23 @@ test('failing worker request shows feedback and refresh keeps unsaved edits', as
   })
   const view = await mount(panel, { host })
   await openEditor(view, 'b1')
-  await view.type({ label: 'HTTP Proxy URL (optional)' }, 'http://10.0.0.1:8080', { replace: true })
+  await openAdvanced(view)
+  await view.type({ label: 'HTTP proxy URL' }, 'http://10.0.0.1:8080', { replace: true })
 
-  await view.toggle({ label: 'Bot active' })
+  await view.toggle({ label: 'Active' })
   assert.ok(view.find({ text: /worker exploded/ }))
   // the switch shows the worker's state, so a failed request leaves it on
-  assert.equal(view.valueOf({ label: 'Bot active' }), true)
+  assert.equal(view.valueOf({ label: 'Active' }), true)
   // busy must be released so controls stay usable after the failure
-  assert.equal(view.find({ label: 'Bot active' })!.props.disabled, false)
+  assert.equal(view.find({ label: 'Active' })!.props.disabled, false)
   failSetEnabled = false
   await view.press({ text: 'Refresh' })
-  assert.equal(view.valueOf({ label: 'HTTP Proxy URL (optional)' }), 'http://10.0.0.1:8080')
+  assert.equal(view.valueOf({ label: 'HTTP proxy URL' }), 'http://10.0.0.1:8080')
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
-test('turning Bot active off asks the worker at once and shows the paused state', async () => {
+test('turning Active off asks the worker at once and shows the paused state', async () => {
   let current = makeState()
   const sent: Array<{ bridgeId: string; enabled: boolean }> = []
   const host = mockHost({
@@ -614,12 +632,12 @@ test('turning Bot active off asks the worker at once and shows the paused state'
     }
   })
   const view = await mount(panel, { host })
-  assert.equal(view.valueOf({ label: 'Bot active' }), true)
+  assert.equal(view.valueOf({ label: 'Active' }), true)
   assert.ok(view.find({ text: 'Connected' }))
 
-  await view.toggle({ label: 'Bot active' })
+  await view.toggle({ label: 'Active' })
   assert.deepEqual(sent, [{ bridgeId: 'b1', enabled: false }])
-  assert.equal(view.valueOf({ label: 'Bot active' }), false)
+  assert.equal(view.valueOf({ label: 'Active' }), false)
   assert.ok(view.find({ text: 'Paused' }))
   assert.equal(view.find({ text: 'Connected' }), null)
   // the old header toggle must not come back as 'Start Polling' once paused
@@ -637,11 +655,11 @@ test('bot on/off has one control per bridge: no polling button and no switch in 
   assert.equal(view.find({ text: 'Pause Polling' }), null)
   assert.equal(view.find({ text: 'Start Polling' }), null)
   assert.equal(view.find({ label: 'Enable automatic polling' }), null)
-  assert.equal(view.findAll({ label: 'Bot active' }).length, 2)
+  assert.equal(view.findAll({ label: 'Active' }).length, 2)
   await view.unmount()
 })
 
-test('without a saved token the Bot active switch is disabled and says why', async () => {
+test('without a saved token the Active switch is disabled and says why', async () => {
   const state = makeState({
     bridges: [
       makeBridge('b1', {
@@ -654,7 +672,7 @@ test('without a saved token the Bot active switch is disabled and says why', asy
   })
   const host = mockHost({ requests: { 'bridge.getState': () => state } })
   const view = await mount(panel, { host })
-  assert.equal(view.find({ label: 'Bot active' })!.props.disabled, true)
+  assert.equal(view.find({ label: 'Active' })!.props.disabled, true)
   assert.ok(view.find({ text: 'Save a bot token first.' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
@@ -839,8 +857,12 @@ async function mountWithAllowed(allowedUserIds: string, syncOrcaOutbound = false
 }
 
 // A Callout's title is a prop, not part of the text the finders match.
+function calloutsTitled(view: TestPanel, title: string) {
+  return view.findAll({ type: 'Callout' }).filter((c) => c.props.title === title)
+}
+
 function openWarnings(view: TestPanel) {
-  return view.findAll({ type: 'Callout' }).filter((c) => c.props.title === 'Open to everyone')
+  return calloutsTitled(view, 'Open to everyone')
 }
 
 test('an empty allowlist shows the open to everyone warning naming the bot', async () => {
@@ -890,10 +912,100 @@ test('sync on with an open allowlist says sync is paused, restricted list does n
   await syncOff.unmount()
 })
 
-const ALL_NOTE = /All messages works only with Allowed Telegram IDs/
-const PRIVACY_NOTE = /Privacy mode is on: in groups the bot receives only commands/
-const JOIN_WARNING =
-  'Telegram does not let this bot join groups. In @BotFather: /setjoingroups -> Enable.'
+function savedInputs(state: BridgeState, saved: SaveConfigInput[]) {
+  return mockHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': (input: SaveConfigInput) => {
+        saved.push(input)
+        return state
+      }
+    }
+  })
+}
+
+const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
+
+test('Anyone on Telegram saves an empty allowlist', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: savedInputs(makeState(), saved) })
+  await openEditor(view, 'b1')
+  assert.equal(view.valueOf({ label: 'Who can talk' }), 'restricted')
+  assert.equal(view.valueOf({ label: 'Telegram user and group IDs' }), '123456')
+
+  await view.select({ label: 'Who can talk' }, 'open')
+  assert.equal(view.find({ label: 'Telegram user and group IDs' }), null)
+  assert.equal(calloutsTitled(view, 'Anyone can use this bot').length, 1)
+  // going back shows the IDs typed before
+  await view.select({ label: 'Who can talk' }, 'restricted')
+  assert.equal(view.valueOf({ label: 'Telegram user and group IDs' }), '123456')
+  assert.equal(calloutsTitled(view, 'Anyone can use this bot').length, 0)
+
+  await view.select({ label: 'Who can talk' }, 'open')
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].allowedUserIds, '')
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('Only these people and groups without a valid ID is refused with a message', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: savedInputs(makeState({ bridges: twoBridges() }), saved) })
+  await openEditor(view, 'dev')
+  // an empty list means anyone, so the open bridge starts on Anyone on Telegram
+  assert.equal(view.valueOf({ label: 'Who can talk' }), 'open')
+
+  await view.select({ label: 'Who can talk' }, 'restricted')
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 0)
+  assert.ok(view.find({ text: NEEDS_ID }))
+  assert.equal(view.find({ label: 'Telegram user and group IDs' })!.props.invalid, true)
+
+  await view.type({ label: 'Telegram user and group IDs' }, 'abc')
+  assert.equal(view.find({ text: NEEDS_ID }), null)
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 0)
+  assert.ok(view.find({ text: NEEDS_ID }))
+
+  await view.type({ label: 'Telegram user and group IDs' }, '42', { replace: true })
+  assert.equal(view.find({ text: NEEDS_ID }), null)
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].allowedUserIds, '42')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('the editor has sections and keeps the rare options in a closed Advanced', async () => {
+  const view = await mountWithAllowed('123456')
+  const headings = view
+    .findAll({ type: 'Heading' })
+    .filter((h) => h.props.level === 3)
+    .map((h) => h.text)
+  assert.deepEqual(headings, ['Connection', 'Who can talk', 'Groups', 'Features'])
+
+  assert.ok(view.find({ type: 'Collapsible', label: 'Advanced' }))
+  assert.equal(view.find({ label: 'Telegram reply language' }), null)
+  assert.equal(view.find({ label: 'Reply timeout (seconds)' }), null)
+  assert.equal(view.find({ label: 'HTTP proxy URL' }), null)
+
+  await openAdvanced(view)
+  assert.ok(view.find({ label: 'Telegram reply language' }))
+  assert.equal(view.valueOf({ label: 'Reply timeout (seconds)' }), '300')
+  assert.equal(view.find({ label: 'HTTP proxy URL' })!.props.placeholder, undefined)
+  assert.ok(view.find({ text: 'Leave empty unless you need a proxy.' }))
+  // the transcription model shows only while voice is on
+  assert.equal(view.find({ label: 'Transcription model' }), null)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+const ALL_NOTE = /All messages needs "Only these people and groups"/
+const PRIVACY_TITLE = 'Privacy mode is on'
+const JOIN_TITLE = 'This bot cannot join groups'
 
 async function mountGroups(
   config: Partial<BridgeConfig>,
@@ -906,11 +1018,7 @@ async function mountGroups(
   return view
 }
 
-function joinWarnings(view: TestPanel) {
-  return view.findAll({ type: 'Callout' }).filter((c) => c.props.title === JOIN_WARNING)
-}
-
-test('In groups, read shows only while Allow groups is on, and Save sends both', async () => {
+test('the reply policy shows only with All messages, and Save sends the group choice', async () => {
   const state = makeState()
   const saved: SaveConfigInput[] = []
   const host = mockHost({
@@ -920,27 +1028,41 @@ test('In groups, read shows only while Allow groups is on, and Save sends both',
         saved.push(input)
         // Answer like the worker: the state after the save, so the editor keeps the saved values.
         const bridge = state.bridges.find((b) => b.id === input.bridgeId)!
-        bridge.config = { ...bridge.config, allowGroups: input.allowGroups!, groupMode: input.groupMode! }
+        bridge.config = {
+          ...bridge.config,
+          allowGroups: input.allowGroups!,
+          groupMode: input.groupMode!,
+          groupReply: input.groupReply!
+        }
         return state
       }
     }
   })
   const view = await mount(panel, { host })
   await openEditor(view, 'b1')
-  assert.equal(view.valueOf({ label: 'Allow groups' }), false)
-  assert.equal(view.find({ label: 'In groups, read' }), null)
+  assert.equal(view.valueOf({ label: 'Group messages' }), 'off')
+  assert.equal(view.find({ label: 'Replies' }), null)
 
-  await view.toggle({ label: 'Allow groups' })
-  assert.equal(view.valueOf({ label: 'In groups, read' }), 'addressed')
-  await view.select({ label: 'In groups, read' }, 'all')
-  await view.press({ text: 'Save Settings' })
+  await view.select({ label: 'Group messages' }, 'addressed')
+  assert.equal(view.find({ label: 'Replies' }), null)
+
+  await view.select({ label: 'Group messages' }, 'all')
+  assert.equal(view.valueOf({ label: 'Replies' }), 'mentioned')
+  assert.ok(view.find({ text: /uses a bot turn per message/ }))
+  await view.select({ label: 'Replies' }, 'helpful')
+  await view.press({ text: 'Save' })
   assert.equal(saved[0].allowGroups, true)
   assert.equal(saved[0].groupMode, 'all')
+  assert.equal(saved[0].groupReply, 'helpful')
+  assert.equal(view.valueOf({ label: 'Replies' }), 'helpful')
 
-  await view.toggle({ label: 'Allow groups' })
-  assert.equal(view.find({ label: 'In groups, read' }), null)
-  await view.press({ text: 'Save Settings' })
+  await view.select({ label: 'Group messages' }, 'off')
+  assert.equal(view.find({ label: 'Replies' }), null)
+  await view.press({ text: 'Save' })
   assert.equal(saved[1].allowGroups, false)
+  // Off keeps the mode and reply policy for the next time groups are turned on
+  assert.equal(saved[1].groupMode, 'all')
+  assert.equal(saved[1].groupReply, 'helpful')
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
   await view.unmount()
@@ -952,6 +1074,10 @@ test('each bridge card says how it reads groups', async () => {
       makeBridge('off', { name: 'Off' }),
       makeBridge('addr', { name: 'Addressed', config: { allowGroups: true } }),
       makeBridge('all', { name: 'All', config: { allowGroups: true, groupMode: 'all' } }),
+      makeBridge('help', {
+        name: 'Help',
+        config: { allowGroups: true, groupMode: 'all', groupReply: 'helpful' }
+      }),
       makeBridge('open', {
         name: 'Open',
         config: { allowGroups: true, groupMode: 'all', allowedUserIds: '' }
@@ -962,8 +1088,9 @@ test('each bridge card says how it reads groups', async () => {
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: 'Groups: off' }))
   assert.ok(view.find({ text: 'Groups: messages for the bot' }))
-  assert.ok(view.find({ text: 'Groups: all messages' }))
-  assert.ok(view.find({ text: 'Groups: all messages (open: messages for the bot)' }))
+  assert.ok(view.find({ text: 'Groups: reads all, replies when mentioned' }))
+  assert.ok(view.find({ text: 'Groups: reads all, replies when it can help' }))
+  assert.ok(view.find({ text: 'Groups: messages for the bot (all messages needs an ID list)' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -978,13 +1105,16 @@ test('All messages with an open list says it reads only messages for the bot', a
   await restricted.unmount()
 })
 
-test('privacy mode on shows the BotFather privacy note', async () => {
+test('privacy mode on shows the BotFather steps', async () => {
   const view = await mountGroups(
     { allowGroups: true },
     { canJoinGroups: true, canReadAllGroupMessages: false }
   )
-  assert.ok(view.find({ text: PRIVACY_NOTE }))
-  assert.equal(joinWarnings(view).length, 0)
+  assert.equal(calloutsTitled(view, PRIVACY_TITLE).length, 1)
+  assert.ok(view.find({ text: '1. In @BotFather, send /setprivacy and pick this bot.' }))
+  assert.ok(view.find({ text: '2. Choose Disable.' }))
+  assert.ok(view.find({ text: '3. Add the bot to the group again.' }))
+  assert.equal(calloutsTitled(view, JOIN_TITLE).length, 0)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -994,23 +1124,24 @@ test('a bot Telegram keeps out of groups shows the join warning', async () => {
     { allowGroups: true },
     { canJoinGroups: false, canReadAllGroupMessages: true }
   )
-  assert.equal(joinWarnings(view).length, 1)
-  assert.equal(view.find({ text: PRIVACY_NOTE }), null)
+  assert.equal(calloutsTitled(view, JOIN_TITLE).length, 1)
+  assert.ok(view.find({ text: /send \/setjoingroups/ }))
+  assert.equal(calloutsTitled(view, PRIVACY_TITLE).length, 0)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
 test('no BotFather notes without Telegram caps or with groups off', async () => {
   const unknown = await mountGroups({ allowGroups: true }, null)
-  assert.equal(joinWarnings(unknown).length, 0)
-  assert.equal(unknown.find({ text: PRIVACY_NOTE }), null)
+  assert.equal(calloutsTitled(unknown, JOIN_TITLE).length, 0)
+  assert.equal(calloutsTitled(unknown, PRIVACY_TITLE).length, 0)
   await unknown.unmount()
 
   const groupsOff = await mountGroups(
     { allowGroups: false },
     { canJoinGroups: false, canReadAllGroupMessages: false }
   )
-  assert.equal(joinWarnings(groupsOff).length, 0)
-  assert.equal(groupsOff.find({ text: PRIVACY_NOTE }), null)
+  assert.equal(calloutsTitled(groupsOff, JOIN_TITLE).length, 0)
+  assert.equal(calloutsTitled(groupsOff, PRIVACY_TITLE).length, 0)
   await groupsOff.unmount()
 })
