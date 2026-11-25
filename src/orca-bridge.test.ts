@@ -1,8 +1,13 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { assert, test } from 'orca/testing'
 import {
   dispatchToOrcaBotAndWait,
   getOrcaBinary,
   isTelegramOriginatedUserMessage,
+  listBotsLocalFirst,
+  listLocalBots,
   OrcaCliError,
   runOrcaJson,
   type OrcaChatSummary,
@@ -10,6 +15,7 @@ import {
   type OrcaSessionEntry,
   type OrcaSessionRead
 } from './orca-bridge'
+import type { BotSummary } from './protocol'
 
 const BOUND_CHAT: OrcaChatSummary = {
   id: 'chat-1',
@@ -120,6 +126,7 @@ test('dispatch with an unknown turn state waits until the reply stops changing',
   const result = await dispatchToOrcaBotAndWait(runner, dispatchParams)
 
   assert.equal(result.replyText, 'Let me check…\n\nFinal answer')
+  assert.equal(result.shortened, false)
 })
 
 test('dispatch finds the reply after a tool-heavy turn pushed our message out of the read window', async () => {
@@ -153,7 +160,8 @@ test('dispatch tells the Telegram user when Orca shortened the reply', async () 
 
   const result = await dispatchToOrcaBotAndWait(runner, dispatchParams)
 
-  assert.match(result.replyText, /^Very long reply\n\n（回复过长已截断/)
+  assert.equal(result.replyText, 'Very long reply')
+  assert.equal(result.shortened, true)
 })
 
 test('dispatch stops polling as soon as the signal aborts', { timeout: 5000 }, async () => {
@@ -294,4 +302,87 @@ test('an already-aborted signal rejects with kind aborted and masks text argumen
   assert.equal(err.kind, 'aborted')
   assert.equal(err.exitCode, null)
   assert.deepEqual(err.args, ['orchestration', 'send', '--subject', '<26 chars>', '--json'])
+})
+
+async function withBotsRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tg-bridge-bots-'))
+  try {
+    return await run(root)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+async function writeBotFolder(root: string, folder: string, files: Record<string, string>): Promise<void> {
+  await mkdir(path.join(root, folder), { recursive: true })
+  for (const [name, content] of Object.entries(files)) {
+    await writeFile(path.join(root, folder, name), content, 'utf8')
+  }
+}
+
+test('local bot folders list only valid bots, sorted, with SOUL.md specialty', async () => {
+  await withBotsRoot(async (root) => {
+    // Folder order (babyshark, zed) and case-sensitive order (B < a) both differ from the wanted order.
+    await writeBotFolder(root, 'zed', {
+      'bot.json': JSON.stringify({ id: 'id-alpha', name: 'alpha', agent: 'codex' }),
+      'SOUL.md': '# Alpha\n\n## Role\n\nWatches the  deploys\nand reports.\n\nSecond paragraph.\n'
+    })
+    await writeBotFolder(root, 'babyshark', {
+      'bot.json': JSON.stringify({ id: 'id-shark', name: 'BabyShark', avatar: 'x' })
+    })
+    await writeBotFolder(root, 'no-meta', { 'SOUL.md': 'Not a bot.' })
+    await writeBotFolder(root, 'broken', { 'bot.json': '{ not json' })
+    await writeBotFolder(root, 'no-name', { 'bot.json': JSON.stringify({ id: 'id-anon' }) })
+
+    const bots = await listLocalBots(root)
+
+    assert.deepEqual(bots, [
+      { id: 'id-alpha', name: 'alpha', specialty: 'Watches the deploys and reports.', agent: 'codex' },
+      { id: 'id-shark', name: 'BabyShark', specialty: '', agent: 'claude' }
+    ])
+  })
+})
+
+test('a long SOUL.md paragraph is cut so the panel list stays short', async () => {
+  await withBotsRoot(async (root) => {
+    await writeBotFolder(root, 'talker', {
+      'bot.json': JSON.stringify({ id: 'id-talk', name: 'Talker' }),
+      'SOUL.md': 'word '.repeat(100)
+    })
+    const [bot] = await listLocalBots(root)
+    assert.ok(bot.specialty.length <= 200, `specialty has ${bot.specialty.length} chars`)
+    assert.match(bot.specialty, /^word word .*…$/)
+  })
+})
+
+test('a missing or empty bots folder yields no local bots', async () => {
+  await withBotsRoot(async (root) => {
+    assert.deepEqual(await listLocalBots(root), [])
+    assert.deepEqual(await listLocalBots(path.join(root, 'does-not-exist')), [])
+  })
+})
+
+const CLI_BOT: BotSummary = { id: 'id-remote', name: 'Remote', specialty: 'From CLI', agent: 'claude' }
+
+test('listing bots uses local folders and never waits on the CLI when any exist', async () => {
+  await withBotsRoot(async (root) => {
+    await writeBotFolder(root, 'babyshark', {
+      'bot.json': JSON.stringify({ id: 'id-shark', name: 'BabyShark', agent: 'claude' })
+    })
+    let cliCalls = 0
+    const bots = await listBotsLocalFirst(root, async () => {
+      cliCalls++
+      return [CLI_BOT]
+    })
+    assert.deepEqual(bots.map((b) => b.name), ['BabyShark'])
+    assert.equal(cliCalls, 0)
+  })
+})
+
+test('listing bots falls back to the CLI when no local bot is readable', async () => {
+  await withBotsRoot(async (root) => {
+    await writeBotFolder(root, 'broken', { 'bot.json': '{ not json' })
+    const bots = await listBotsLocalFirst(root, async () => [CLI_BOT])
+    assert.deepEqual(bots, [CLI_BOT])
+  })
 })

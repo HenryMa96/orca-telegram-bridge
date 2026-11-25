@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
+import { readdir, readFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { BotSummary } from './protocol'
@@ -294,19 +295,90 @@ export async function runOrcaJson<T>(
   })
 }
 
+const SPECIALTY_MAX_CHARS = 200
+
+/** Where Orca keeps the bots of this computer: `~/.orca/bots/<folder>/bot.json` (+ `SOUL.md`). */
+export function defaultBotsRoot(): string {
+  return path.join(os.homedir(), '.orca', 'bots')
+}
+
+/** First non-empty paragraph of SOUL.md without Markdown heading lines, on one line. */
+function soulSpecialty(soul: string): string {
+  for (const paragraph of soul.split(/\r?\n[ \t]*\r?\n/)) {
+    const text = paragraph
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*#/.test(line))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (text) {
+      return text.length > SPECIALTY_MAX_CHARS ? `${text.slice(0, SPECIALTY_MAX_CHARS - 1)}…` : text
+    }
+  }
+  return ''
+}
+
+async function readLocalBot(folder: string): Promise<BotSummary | null> {
+  try {
+    const meta = JSON.parse(await readFile(path.join(folder, 'bot.json'), 'utf8')) as {
+      id?: unknown
+      name?: unknown
+      agent?: unknown
+    }
+    if (typeof meta?.id !== 'string' || typeof meta.name !== 'string' || !meta.id || !meta.name) return null
+    const soul = await readFile(path.join(folder, 'SOUL.md'), 'utf8').catch(() => '')
+    return {
+      id: meta.id,
+      name: meta.name,
+      specialty: soulSpecialty(soul),
+      agent: typeof meta.agent === 'string' && meta.agent ? meta.agent : 'claude'
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Bots of this computer read from disk. `orca bot list` asks every paired computer and can hang for a
+ * minute when one is unreachable; the local folders answer at once. `[]` when the root is missing or empty.
+ */
+export async function listLocalBots(root: string = defaultBotsRoot()): Promise<BotSummary[]> {
+  let names: string[]
+  try {
+    names = await readdir(root)
+  } catch {
+    return []
+  }
+  const bots = await Promise.all(names.map((name) => readLocalBot(path.join(root, name))))
+  return bots
+    .filter((b): b is BotSummary => b !== null)
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+}
+
+async function listBotsFromCli(): Promise<BotSummary[]> {
+  const result = await runOrcaJson<{
+    bots: { id: string; name: string; specialty?: string; agent?: string }[]
+  }>(['bot', 'list', '--json'])
+  return (result.bots || []).map((b) => ({
+    id: b.id,
+    name: b.name,
+    specialty: b.specialty || '',
+    agent: b.agent || 'claude'
+  }))
+}
+
+/** Local bots when this computer has any; otherwise the (slower) `orca bot list --json`. */
+export async function listBotsLocalFirst(
+  root: string = defaultBotsRoot(),
+  fromCli: () => Promise<BotSummary[]> = listBotsFromCli
+): Promise<BotSummary[]> {
+  const local = await listLocalBots(root)
+  return local.length > 0 ? local : fromCli()
+}
+
 export function createOrcaCliRunner(): OrcaCliRunner {
   return {
-    async listBots() {
-      const result = await runOrcaJson<{
-        bots: { id: string; name: string; specialty?: string; agent?: string }[]
-      }>(['bot', 'list', '--json'])
-      return (result.bots || []).map((b) => ({
-        id: b.id,
-        name: b.name,
-        specialty: b.specialty || '',
-        agent: b.agent || 'claude'
-      }))
-    },
+    listBots: () => listBotsLocalFirst(),
     async listBotChats(botName) {
       const result = await runOrcaJson<{ chats: OrcaChatSummary[] }>([
         'bot',
@@ -491,8 +563,6 @@ export function findUnsyncedTail(
   return { matched: false, unsynced: [] }
 }
 
-const SHORTENED_REPLY_NOTE = '（回复过长已截断，请在 Orca 中查看完整内容）'
-
 /**
  * Assistant messages after the user entry that carries `requestMarker`, or `null` when that turn is
  * not in this read. `anyLatestUser` accepts the latest user turn (a chat we just created holds only
@@ -538,7 +608,7 @@ export async function dispatchToOrcaBotAndWait(
     onChatBound?: (chatId: string, title?: string) => Promise<void> | void
     onWorkingTick?: () => Promise<void> | void
   }
-): Promise<{ chatId: string; title?: string; replyText: string; tailHashes: string[] }> {
+): Promise<{ chatId: string; title?: string; replyText: string; shortened: boolean; tailHashes: string[] }> {
   const pollIntervalMs = params.pollIntervalMs ?? 1500
   const chatsBefore = await runner.listBotChats(params.botName)
 
@@ -639,9 +709,8 @@ export async function dispatchToOrcaBotAndWait(
       return {
         chatId: activeChatId,
         title: resolvedTitle,
-        replyText: reply.some((e) => e.shortened)
-          ? `${replyText}\n\n${SHORTENED_REPLY_NOTE}`
-          : replyText,
+        replyText,
+        shortened: reply.some((e) => e.shortened === true),
         tailHashes: computeTailHashes(extractMessageItems(session.entries))
       }
     }
