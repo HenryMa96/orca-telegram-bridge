@@ -4,20 +4,26 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects Telegram bo
 
 Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-telegram-bridge).
 
+<p align="center">
+  <img src="docs/images/setup-card.png" alt="The Telegram panel in Orca's right sidebar: Setup, Chats, Logs and Audit tabs, and the card of one bridge with its Active switch, people, groups and voice summary, and an Edit button" width="420">
+</p>
+
 **Talk to your Orca bots from Telegram, from your phone, anywhere.**
 
 - **As many bridges as you need.** Each bridge pairs one Telegram bot with one Orca bot, so `@ci_bot` can front your CI watcher and `@dev_bot` your coding assistant. Every bridge has its own token, access list, roles, language, proxy, group and voice settings, and they all run at once: a bridge that fails never stops the others.
-- **A panel that follows your bot.** Click a bot in Orca's left sidebar and the Telegram panel shows only that bot's bridge, chats and logs.
+- **A panel that follows your bot.** Click a bot in Orca's left sidebar and the Telegram panel shows only that bot's bridge, chats, logs and audit trail.
 - **Roles for the people you let in.** Choose what each person or group may do (chat, start or switch chats, sync, automations) and give each role an extra prompt for the Orca bot, such as "read-only, plain Spanish".
+- **Know who did what.** An Audit tab records who ran an automation, changed sync or chats, and who was refused, plus every access, role or token change made in the panel. Never message text.
 - **Private chats and groups**: in a group the bot answers when called, or follows the conversation and joins in when it can help.
 - **Voice messages**, transcribed with OpenRouter or OpenAI and answered as text.
 - **Images and files both ways**: photos reach the Orca bot as files, and the Orca bot can send back charts, screenshots and documents; Markdown and tables come back formatted.
+- **Calm long answers.** A long run shows "⏳ Working…" instead of silence, and a failure is one plain line, with **Details** for the owner and **Try again** only when it is safe.
 - **Replies in the user's language**: English, Português, Español, 中文, or Auto per chat.
 - **No server to run**: the plugin long-polls Telegram from inside Orca. No public IP, webhook or extra daemon.
 
 ## Features
 
-- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, roles, language, proxy and on/off switch. The Telegram panel follows the bot selected in Orca's left sidebar and shows only that bot's bridge, chats and logs
+- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, roles, language, proxy and on/off switch. The Telegram panel follows the bot selected in Orca's left sidebar and shows only that bot's bridge, chats, logs and audit trail
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
 - **Open or restricted access**: anyone on Telegram, or only the Telegram user and group IDs you list, with one-click **Allow** in the sidebar panel. See [Who can talk to the bot](#who-can-talk-to-the-bot)
 - **Roles**: per bridge, which commands each person or group may use (private and group rights kept apart for `/new`, `/home`, `/bind`), which automations they may run, and an extra prompt for the Orca bot. Built in: Full access, Member, and Stranger for anyone on Telegram. Refusals are one plain line; each person's `/` menu and `/help` show only what their role allows. See [Roles](#roles)
@@ -32,6 +38,8 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram. Orca's own automation prompts (reminders, deadlines, events, and scheduled runs of an automation that ran in that chat in the last 24 hours) stay in Orca; only the bot's answer goes. Like Orca, a bot answer ending in `NO_REPLY` sends nothing
 - **Telegram `/` command menu** (`setMyCommands`, per role and per language) + **interactive inline buttons**: `/help`, `/new`, `/home`, `/bots`, `/chats`, `/bind`, `/rename`, `/sync`, `/automations`, `/run`, `/status`
 - **Clean setup panel**: a bridge is shown by its bot's `@username`; the editor groups Connection, Who can talk, Roles, Groups and Features, with rare options under Advanced; **Save** closes the editor, and a failed save says why next to its buttons
+- **Working line and plain errors**: after 20 seconds without an answer, a "⏳ Working…" line that is removed when the answer comes; failures in plain words ("This took too long", "Can't reach Orca right now"), with a **Details** button and a **Try again** button only when the message surely never reached the Orca bot. See [Long answers and errors](#long-answers-and-errors)
+- **Audit trail**: an Audit tab of who did what (Telegram commands and buttons, role refusals, panel changes to access, roles and token), kept 90 days, with filters and CSV export; optionally one line in the group when someone changes its shared state. See [Audit trail](#audit-trail)
 - **Rich Markdown + Table PNG rendering**:
   - Converts Markdown headings, bold, italic, strikethrough, blockquotes, task lists, links, and fenced code blocks to Telegram HTML
   - Renders standard Markdown tables (`| col |`) into crisp PNG images via Python Pillow (`sendPhoto`), automatically falling back to formatted text when Python/Pillow is not installed
@@ -138,14 +146,18 @@ The upstream plugin has the key `henryma96.telegram-bridge`. This fork has a dif
 
 Do these steps after the plugin is installed and approved (it asks to read your workspaces, so the panel can follow the bot you select). Repeat them for each Orca bot you want on Telegram; each Orca bot has at most one bridge.
 
-1. Click an Orca bot in Orca's left sidebar, then open the **Telegram** panel in the right sidebar. The panel follows the selected bot: **Setup**, **Chats** and **Logs** show only that bot's bridge. With a project or workspace selected instead, the panel only asks you to select a bot (plus any bridge whose Orca bot no longer exists, so you can still remove it). If Orca cannot tell the panel which bot is selected, it shows every bridge. The **TG** item in Orca's status bar shows all bridges' state (`TG: 2/2` = 2 of 2 active bridges connected); click it to open this panel.
+1. Click an Orca bot in Orca's left sidebar, then open the **Telegram** panel in the right sidebar. The panel follows the selected bot: **Setup**, **Chats**, **Logs** and **Audit** show only that bot's bridge. With a project or workspace selected instead, the panel only asks you to select a bot (plus any bridge whose Orca bot no longer exists, so you can still remove it). If Orca cannot tell the panel which bot is selected, it shows every bridge. The **TG** item in Orca's status bar shows all bridges' state (`TG: 2/2` = 2 of 2 active bridges connected); click it to open this panel.
 2. A bot without a bridge shows **Add bridge**: click it. The new bridge talks only to this Orca bot; `/use` cannot switch it. A bridge is shown by its Telegram bot's `@username` ("New Telegram bot" until its token is checked). An update from 0.4.0 or older already has one bridge with your previous settings.
 3. **Connection:** paste the `@BotFather` bot token. Each Telegram bot token can belong to one bridge only.
 4. **Who can talk:** choose **Only these people and groups** and type the IDs, or **Anyone on Telegram**. See [Who can talk to the bot](#who-can-talk-to-the-bot).
 5. Click **Save**, then **Test connection**. The **Active** switch on the bridge's card turns it on or off at once; no Save needed.
 6. Optional: **Groups** (see [Use the bot in a group](#use-the-bot-in-a-group)), **Features** (voice messages, Orca-side sync) and **Advanced**, closed by default: the **Telegram reply language**, the reply timeout, an HTTP proxy (e.g. `http://127.0.0.1:7890`) and the transcription model. The reply language sets the bridge's own replies and command menu: **English**, **Português (Brasil)**, **Español** or **中文**, or **Auto (language of each message)**. With **Auto**, a chat starts in English. Once a message shows the sender's Telegram app language (Portuguese, Spanish or Chinese; any other counts as English), the chat keeps that language, also after a restart, for the bridge's replies and errors, for messages that do not show a language, and for Orca → Telegram sync; the `/` menu follows each person's app language. The Orca bot is asked to answer in the language the user wrote in, and in the chat's language when a message has no words (an image alone). With a fixed language, the Orca bot's answers keep the language the Orca bot writes in.
 
-To remove a bridge, open its editor, click **Remove**, then **Confirm remove**. Orca forgets its token and its chats; its log entries stay in the Logs tab.
+<p align="center">
+  <img src="docs/images/bridge-editor.png" alt="The bridge editor: Connection with the saved bot token and the Orca bot it talks to, Who can talk with two listed IDs and their roles, the Roles section, Groups options and Features" width="420">
+</p>
+
+To remove a bridge, open its editor, click **Remove**, then **Confirm remove**. Orca forgets its token and its chats; its log entries stay in the Logs tab and its audit entries in the Audit tab.
 
 Why not a connector inside Orca's **Bot settings → Connectors**? A plugin cannot add connectors there: Orca's connectors (Slack, Linear, GitHub, Google, Webhook) are built in. A native Telegram connector is requested upstream in [stablyai/orca#45959](https://github.com/stablyai/orca/issues/45959).
 
@@ -183,6 +195,10 @@ Which role applies: a listed person's own role, also in groups; a group's role f
 
 After the update that brought roles, everyone already on the list keeps **Full access**, so nothing changes until you choose otherwise; the panel asks you to review their roles once.
 
+<p align="center">
+  <img src="docs/images/bridge-roles.png" alt="The Roles section of the bridge editor: Full access, Member and Stranger, with Member opened to show its permission checkboxes and the extra prompt for the Orca bot" width="420">
+</p>
+
 ### Use the bot in a group
 
 Groups are off for a new bridge. Choose per bridge in the Setup tab → the bridge's **Edit** → **Groups**. Each option says what the bot reads and when it answers. "Called" means an `@yourbot` mention, a reply to one of the bot's messages, or a command for it (`/help@yourbot`).
@@ -197,6 +213,12 @@ Groups are off for a new bridge. Choose per bridge in the Setup tab → the brid
 The mention is removed before the text goes to the Orca bot. With the two **Follows the conversation** options, each group message starts one Orca bot turn, so a busy group costs more. Messages that do not call the bot never get a typing indicator or an error line in the group; problems go to the Logs tab. These two options work only with **Only these people and groups**; while the bridge is open to everyone, the bot reads only messages that call it, so strangers in a busy group cannot start an Orca run with every line.
 
 A bridge updated from 0.4.0 or older starts with **Answers when called**, the behavior it had before. A bridge that used **All messages** and was last saved before 0.8.0 starts with **Follows the conversation, joins in when useful**, so it keeps answering in the group. A bridge saved on 0.8.0 keeps the reply choice it saved then.
+
+**Post a line in the group when someone changes its shared chat, sync or runs an automation** (below the options, off by default) tells everyone in the group, for example "@joao started a new chat". See [Audit trail](#audit-trail).
+
+<p align="center">
+  <img src="docs/images/bridge-editor-groups.png" alt="The lower part of the bridge editor: the four Groups options, the group notice switch, Features (voice messages, transcription provider and key, Orca-side sync) and the opened Advanced section with reply language, reply timeout, HTTP proxy and transcription model" width="420">
+</p>
 
 Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; after the bot has connected once, the bridge's editor warns under **Groups** when one of them blocks the option you chose:
 
@@ -287,6 +309,12 @@ The **Audit** tab (next to Logs) answers "who did what, and when": it follows th
 
 ## Debugging
 
+<p align="center">
+  <img src="docs/images/logs-certificate-error.png" alt="The Logs tab with two warnings: voice messages not transcribed because the OpenRouter request failed with a self-signed certificate error" width="420">
+</p>
+
+The **Logs** tab answers "what went wrong"; the **Audit** tab answers "who did what" (see [Audit trail](#audit-trail)).
+
 - The **Logs** tab lists the newest 40 of up to 200 stored entries. Filter by level (all, errors, warnings and errors, debug only). Entries with details expand to show the error context: Orca CLI args, exit code and stderr; Telegram method, HTTP status and description; chat ids, timings and the top of the stack.
 - Turn on **Debug logging** in the Logs tab (or the `debugLogging` setting, off by default) to also record `debug` entries: Telegram and Orca CLI calls with timings, dispatch start/finish, sync ticks that forward something, config changes (field names only), poll loop start/stop/backoff and errors that were ignored before. Turn it off again when done; errors and warnings keep their details either way.
 - Error `self-signed certificate in certificate chain`? See [Troubleshooting](#self-signed-certificate-in-certificate-chain).
@@ -297,11 +325,7 @@ The **Audit** tab (next to Logs) answers "who did what, and when": it follows th
 
 ### `self-signed certificate in certificate chain`
 
-<p align="center">
-  <img src="docs/images/logs-certificate-error.png" alt="The Logs tab with two warnings: voice messages not transcribed because the OpenRouter request failed with a self-signed certificate error" width="420">
-</p>
-
-**What it means.** Something between your computer and the service re-signs HTTPS with its own certificate: antivirus HTTPS scanning (Kaspersky, ESET, Avast, Bitdefender…), a VPN, or a corporate proxy. Your operating system (Windows, macOS or Linux) trusts that certificate, so your browser works, but the Node runtime inside Orca has its own certificate list and refuses it. The scanner may pick some sites only; with Kaspersky on Windows we saw `openrouter.ai` intercepted while `api.telegram.org` and `api.openai.com` were not.
+**What it means.** The Logs tab shows it as a warning (screenshot under [Debugging](#debugging)). Something between your computer and the service re-signs HTTPS with its own certificate: antivirus HTTPS scanning (Kaspersky, ESET, Avast, Bitdefender…), a VPN, or a corporate proxy. Your operating system (Windows, macOS or Linux) trusts that certificate, so your browser works, but the Node runtime inside Orca has its own certificate list and refuses it. The scanner may pick some sites only; with Kaspersky on Windows we saw `openrouter.ai` intercepted while `api.telegram.org` and `api.openai.com` were not.
 
 **What the plugin does.**
 
@@ -326,6 +350,18 @@ In **Kaspersky** Standard, Plus or Premium ([Kaspersky: encrypted connections se
 Other antivirus products call the same setting HTTPS scanning, SSL/TLS filtering or web protection exclusions. Behind a corporate proxy, ask IT to exclude these hosts from TLS inspection.
 
 Then send the Telegram message or voice message again. The Logs tab shows the result.
+
+### One bot times out, other bots work
+
+**What it means.** Every Telegram request of one bridge (`getMe`, `getUpdates`) times out, while other bots, the network and `Test connection` with a wrong token answer quickly. Asking Telegram directly with that bot's token answers `502 Bad Gateway` after about 16 seconds. This is a fault in Telegram's servers for that one bot, not in Orca, the plugin, a proxy or an antivirus. It has been reported for other bots in [tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api/issues).
+
+**What to do.**
+
+1. Wait: Telegram fixes it on its side, sometimes in hours, sometimes in days. Reports say a new token for the same bot does not help.
+2. Or create a new bot with `@BotFather` (`/newbot`) and paste its token into the bridge's editor. A new bot gets a new ID, which should land on a healthy Telegram server; people must open the new bot, and groups must add it again.
+3. When the old bot comes back, Telegram delivers the messages sent while it was down, all at once.
+
+Never paste a bot token in a chat or a bug report; if you did, revoke it in `@BotFather` (`/mybots` → the bot → **API Token** → **Revoke current token**) and paste the new one in the editor.
 
 ## Develop & Release
 
