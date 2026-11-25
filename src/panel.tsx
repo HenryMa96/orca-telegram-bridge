@@ -957,7 +957,8 @@ function addRow(): void {
 }
 
 // The Who can talk list: one Telegram ID and its role per row. Optional while anyone can talk.
-function assignmentRows(accessMode: AccessMode, idsError: string | null) {
+// `knownNames` puts the name the bridge knows after each ID, matched as the ID is typed.
+function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNames: Record<string, string>) {
   const rows = read(assignmentRowsDraft)
   const roleOptions = read(rolesDraft).map((r) => ({ value: r.id, label: clip(r.name.trim() || r.id) }))
   const note = read(rolesNote)
@@ -970,6 +971,7 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null) {
         const id = row.id.trim()
         // NEEDS_ID points at the empty rows; a "not an ID" refusal at the rows that are not IDs.
         const invalid = idsError !== null && (id === '' ? idsError === NEEDS_ID : !isTelegramId(id))
+        const name = Object.hasOwn(knownNames, id) ? knownNames[id] : undefined
         return (
           <Row key={row.key} gap="xs" align="center">
             <Input
@@ -984,6 +986,11 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null) {
                 set(allowedIdsError, null)
               }}
             />
+            {name && (
+              <Text key={`name:${row.key}`} muted size="xs">
+                {name}
+              </Text>
+            )}
             <Select
               key={`role:${row.key}`}
               label={`Role for Telegram ID ${i + 1}`}
@@ -1274,7 +1281,7 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
               </Text>
             </Callout>
           )}
-          {assignmentRows(accessMode, idsError)}
+          {assignmentRows(accessMode, idsError, bridge.knownNames)}
           {rolesEditor(bridge)}
         </Stack>
 

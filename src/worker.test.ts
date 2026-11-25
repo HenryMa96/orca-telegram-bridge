@@ -78,6 +78,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
   const leftChats: (number | string)[] = []
   const editedMessages: { chatId: number | string; messageId: number; text: string }[] = []
   const deletedMessages: { chatId: number | string; messageId: number }[] = []
+  // Every getChat id, in order.
+  const chatLookups: (number | string)[] = []
 
   let chats: OrcaChatSummary[] = [
     {
@@ -192,6 +194,11 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async leaveChat(_token, chatId) {
       leftChats.push(chatId)
       return true
+    },
+    // Telegram knows no chat with these test ids, as for a person who never opened the bot.
+    async getChat(_token, chatId) {
+      chatLookups.push(chatId)
+      throw new TelegramApiError('Bad Request: chat not found', 400)
     },
     async editMessageText(_token, params) {
       outbox.push(`edit:${params.messageId}:${params.text}`)
@@ -315,7 +322,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     openedPanels,
     leftChats,
     editedMessages,
-    deletedMessages
+    deletedMessages,
+    chatLookups
   }
 }
 
@@ -1804,7 +1812,7 @@ type BridgeSeed = {
   token?: string
   voiceKey?: string
   config?: Record<string, JsonValue>
-  state?: Partial<Record<'offset' | 'bindings' | 'syncCursors' | 'lastBlocked' | 'commandScopes', JsonValue>>
+  state?: Partial<Record<'offset' | 'bindings' | 'syncCursors' | 'lastBlocked' | 'commandScopes' | 'knownNames', JsonValue>>
 }
 
 function bridgesHost(
@@ -3148,6 +3156,7 @@ test('removing a bridge stops its polling and deletes its token and state; the o
       state: {
         offset: 9,
         lastBlocked: '5',
+        knownNames: { '777888': '@drop_owner' },
         bindings: [{ tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-1', updatedAt: 1000 }]
       }
     }
@@ -3157,6 +3166,7 @@ test('removing a bridge stops its polling and deletes its token and state; the o
   const { manager, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await until(() => tg.openPolls['111:KEEP'] === 1 && tg.openPolls['222:DROP'] === 1, 'both bridges long-polling')
+    assert.deepEqual(manager.bridge('b-drop0001').view().knownNames, { '777888': '@drop_owner' })
     const state = (await within(worker.request('bridge.remove', { bridgeId: 'b-drop0001' }), 'remove')) as BridgeState
     assert.deepEqual(state.bridges.map((b) => b.id), ['b-keep0001'])
     assert.equal(tg.openPolls['222:DROP'], 0)
@@ -3166,7 +3176,7 @@ test('removing a bridge stops its polling and deletes its token and state; the o
     const { storage, secrets } = host.data()
     assert.equal(secrets['botToken.b-drop0001'], undefined)
     assert.equal(secrets['botToken.b-keep0001'], '111:KEEP')
-    for (const name of ['offset', 'bindings', 'syncCursors', 'lastBlocked']) {
+    for (const name of ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'knownNames']) {
       assert.equal(storage[`tg.b-drop0001.${name}`], undefined, `tg.b-drop0001.${name} is left behind`)
     }
     assert.deepEqual(storedBridges(host).map((b) => b.id), ['b-keep0001'])
@@ -5049,5 +5059,168 @@ test('listAudit filters by bridge, action and result, newest first, at most 500 
       assert.ok(named.text.split('\n')[1].includes('"Bridge 1"'), named.text.slice(0, 300))
     },
     { now: () => now, storage: { 'tg.audit': asJson(seeded) } }
+  )
+})
+
+// Names next to the listed IDs in the editor (specs/SPEC-known-names.md).
+const NAMES_BRIDGE = 'b-names001'
+
+function storedNames(host: MockHost): Record<string, string> | undefined {
+  return host.data().storage[`tg.${NAMES_BRIDGE}.knownNames`] as Record<string, string> | undefined
+}
+
+// Writes of the names key, so a repeated name can be shown to write nothing.
+function namesWrites(host: MockHost): number {
+  return host.calls.filter(
+    (c) => c.method.startsWith('storage.') && c.method !== 'storage.get' && JSON.stringify(c.params).includes(`${NAMES_BRIDGE}.knownNames`)
+  ).length
+}
+
+async function withNamesBridge(
+  options: {
+    config?: Record<string, JsonValue>
+    knownNames?: Record<string, string>
+    telegram?: Partial<TelegramClient>
+    debugLogging?: boolean
+  },
+  run: (ctx: { controller: BridgeRuntime; host: MockHost; deps: ReturnType<typeof makeMockDeps> }) => Promise<void>
+): Promise<void> {
+  const host = bridgesHost(
+    [
+      {
+        id: NAMES_BRIDGE,
+        token: '123456:TEST_TOKEN',
+        config: { roles: asJson(defaultRoles()), ...options.config },
+        state: options.knownNames ? { knownNames: options.knownNames } : {}
+      }
+    ],
+    { debugLogging: options.debugLogging }
+  )
+  const deps = makeMockDeps({ telegram: options.telegram })
+  const { controller, worker } = await mountBridge(host, deps)
+  try {
+    await run({ controller, host, deps })
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+}
+
+function personUpdate(
+  updateId: number,
+  from: { id: number; first_name: string; last_name?: string; username?: string }
+): TelegramUpdate {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: 100 + updateId,
+      from: { is_bot: false, ...from },
+      chat: { id: from.id, type: 'private' },
+      date: 1000,
+      text: '/help'
+    }
+  }
+}
+
+test('a listed person leaves @username or First Last, a listed group its title; an unlisted sender nothing', async () => {
+  await withNamesBridge({ config: { allowedUserIds: `111, 222, ${GROUP_ID}` } }, async ({ controller, host }) => {
+    await controller.testConnection()
+    await within(controller.handleIncomingUpdate(personUpdate(1, { id: 111, first_name: 'Ana', username: 'ana_dev' })), 'ana')
+    await within(controller.handleIncomingUpdate(personUpdate(2, { id: 222, first_name: 'Bruno', last_name: 'Costa' })), 'bruno')
+    // an unlisted member's line in a listed group: the group's title only
+    await within(controller.handleIncomingUpdate(groupUpdate(3, 999, 'hello all')), 'group line')
+    await within(controller.handleIncomingUpdate(personUpdate(4, { id: 555, first_name: 'Stranger', username: 'stranger' })), 'stranger')
+
+    const expected = { '111': '@ana_dev', '222': 'Bruno Costa', [String(GROUP_ID)]: 'Team' }
+    assert.deepEqual(storedNames(host), expected)
+    assert.deepEqual(controller.view().knownNames, expected)
+
+    // the same name again writes nothing; a new @username replaces the old name
+    const writes = namesWrites(host)
+    await within(controller.handleIncomingUpdate(personUpdate(5, { id: 111, first_name: 'Ana', username: 'ana_dev' })), 'ana again')
+    assert.equal(namesWrites(host), writes)
+    await within(controller.handleIncomingUpdate(personUpdate(6, { id: 111, first_name: 'Ana', username: 'ana_new' })), 'ana renamed')
+    assert.equal(storedNames(host)?.['111'], '@ana_new')
+  })
+})
+
+test('on an open bridge only people with a role leave a name, strangers none', async () => {
+  await withNamesBridge(
+    { config: { allowedUserIds: '', roleAssignments: { '111': 'full' } } },
+    async ({ controller, host }) => {
+      await within(controller.handleIncomingUpdate(personUpdate(1, { id: 555, first_name: 'Stranger' })), 'stranger')
+      assert.equal(storedNames(host), undefined)
+      await within(controller.handleIncomingUpdate(personUpdate(2, { id: 111, first_name: 'Ana' })), 'ana')
+      assert.deepEqual(storedNames(host), { '111': 'Ana' })
+    }
+  )
+})
+
+test('on connect each listed ID without a name is looked up once; a refusal stays blank, logged at debug only', async () => {
+  const lookups: (number | string)[] = []
+  await withNamesBridge(
+    {
+      config: { enabled: true, allowedUserIds: '111, 222, 333' },
+      knownNames: { '222': '@bob' },
+      debugLogging: true,
+      telegram: {
+        getUpdates: scriptedGetUpdates([[]]),
+        async getChat(_token, chatId) {
+          lookups.push(chatId)
+          if (chatId === 111) return { id: 111, type: 'private', first_name: 'Ana', username: 'ana_dev' }
+          throw new TelegramApiError('Forbidden: bot was blocked by the user', 403)
+        }
+      }
+    },
+    async ({ controller, host }) => {
+      await until(() => storedNames(host)?.['111'] !== undefined, 'the looked-up name')
+      await until(() => controller.view().status === 'connected', 'connected')
+      // more polls and turns: the refused ID is not asked again in this run
+      for (let i = 0; i < 50; i++) await nextTurn()
+      assert.deepEqual(lookups, [111, 333])
+      assert.deepEqual(storedNames(host), { '111': '@ana_dev', '222': '@bob' })
+      assert.deepEqual(controller.view().knownNames, { '111': '@ana_dev', '222': '@bob' })
+      const logs = storedLogs(host)
+      assert.equal(logs.filter((e) => e.level === 'warn' || e.level === 'error').length, 0)
+      assert.ok(logs.some((e) => e.level === 'debug' && /No name for Telegram ID 333/.test(e.message)))
+    }
+  )
+})
+
+test('after a save the listed IDs without a name are looked up, at most 50, and a removed ID drops its name', async () => {
+  const lookups: (number | string)[] = []
+  const many = Array.from({ length: 60 }, (_, i) => String(2001 + i))
+  await withNamesBridge(
+    {
+      config: { allowedUserIds: '111' },
+      knownNames: { '111': '@ana_dev' },
+      telegram: {
+        async getChat(_token, chatId) {
+          lookups.push(chatId)
+          if (chatId === -1001) return { id: -1001, type: 'supergroup', title: 'Ops Team' }
+          throw new TelegramApiError('Bad Request: chat not found', 400)
+        }
+      }
+    },
+    async ({ controller, host }) => {
+      await within(controller.saveConfig(saveInput(controller, { allowedUserIds: ['111', '-1001', ...many].join(', ') })), 'save')
+      await until(() => lookups.length === 50 && storedNames(host)?.['-1001'] !== undefined, '50 lookups')
+      for (let i = 0; i < 50; i++) await nextTurn()
+      // the known 111 is not asked; the cap stops at 50 of the 61 missing
+      assert.deepEqual(lookups, [-1001, ...many.slice(0, 49).map(Number)])
+      assert.deepEqual(storedNames(host), { '111': '@ana_dev', '-1001': 'Ops Team' })
+
+      // the next save retries the ones still missing, once each
+      await within(controller.saveConfig(saveInput(controller, {})), 'save again')
+      await until(() => lookups.length === 100, 'the retry run')
+      for (let i = 0; i < 50; i++) await nextTurn()
+      assert.equal(lookups.length, 100)
+
+      // removing an ID drops its name at that save
+      await within(controller.saveConfig(saveInput(controller, { allowedUserIds: '-1001' })), 'save without 111')
+      assert.deepEqual(storedNames(host), { '-1001': 'Ops Team' })
+      assert.deepEqual(controller.view().knownNames, { '-1001': 'Ops Team' })
+    }
   )
 })

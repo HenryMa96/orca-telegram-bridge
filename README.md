@@ -180,6 +180,8 @@ Each listed person or group has a **role** (see [Roles](#roles)) that sets what 
 
 Once the list is restricted, an unknown person gets one short reply with their Telegram ID (at most once a minute), and the panel shows a banner: `User <ID> messaged your bot but is not in the allowlist.` Click **Allow \<ID\>** to add them with the **Member** role. The banner shows only the latest unknown person.
 
+Each listed ID shows the name the bot knows for it, right after the ID: the person's `@username` (or first and last name), or the group's title. The bridge learns it from their messages, and asks Telegram once when it connects and after **Save** for IDs that have none yet. Telegram answers only for people who have opened the bot and groups the bot is in; the others stay blank until they write. Only listed IDs are kept, on this computer.
+
 Removing an ID stops the bot from answering that person or group, and stops sync to their chats. Choosing **Anyone on Telegram** opens the bot to everyone again.
 
 ### Roles

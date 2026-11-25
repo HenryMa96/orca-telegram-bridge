@@ -7,6 +7,7 @@ export type TelegramUser = {
   id: number
   is_bot: boolean
   first_name: string
+  last_name?: string
   username?: string
   // The language of the person's Telegram app (IETF tag); absent for some users.
   language_code?: string
@@ -21,6 +22,7 @@ export type TelegramChat = {
   title?: string
   username?: string
   first_name?: string
+  last_name?: string
 }
 
 export type TelegramPhotoSize = {
@@ -237,6 +239,9 @@ export interface TelegramClient {
     options?: TelegramRequestOptions
   ): Promise<Buffer>
   leaveChat(token: string, chatId: number | string, options?: TelegramRequestOptions): Promise<boolean>
+  // A person's or group's current name; fails (400/403) for a person who never opened the bot or a
+  // group the bot is not in.
+  getChat(token: string, chatId: number | string, options?: TelegramRequestOptions): Promise<TelegramChat>
   // Replaces the text of a message the bot sent; its buttons are dropped.
   editMessageText(
     token: string,
@@ -855,6 +860,9 @@ export function createTelegramClient(): TelegramClient {
     },
     leaveChat(token, chatId, options) {
       return callTelegramApi<boolean>(token, 'leaveChat', { chat_id: chatId }, options)
+    },
+    getChat(token, chatId, options) {
+      return callTelegramApi<TelegramChat>(token, 'getChat', { chat_id: chatId }, options)
     },
     editMessageText(token, params, options) {
       return callTelegramApi<TelegramMessage>(

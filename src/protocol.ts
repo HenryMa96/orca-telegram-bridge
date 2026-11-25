@@ -105,6 +105,9 @@ export type BridgeView = {
   bindings: ChatBinding[]
   // What @BotFather allows for this bot, from getMe; null until the bot has connected once.
   telegramCaps: { canJoinGroups: boolean; canReadAllGroupMessages: boolean } | null
+  // Names of the listed Telegram IDs, for the editor's "People and groups" rows: "@username", else
+  // "First Last" for a person, a group's title. Only IDs on the bridge's list; absent when unknown.
+  knownNames: Record<string, string>
 }
 
 export type GlobalConfig = {

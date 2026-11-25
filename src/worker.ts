@@ -107,10 +107,11 @@ const STORAGE_LOGS = 'tg.logs'
 // One key for every bridge, not per bridge, so a removed bridge's entries stay.
 const STORAGE_AUDIT = 'tg.audit'
 // commandScopes: the user/group ids that got a command menu of their own, so a removed id's menu is deleted.
-const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages', 'commandScopes'] as const
+// knownNames: the names of the listed ids, shown next to them in the editor.
+const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages', 'commandScopes', 'knownNames'] as const
 // What 0.4.0 and earlier stored for their single bridge; moved into "Bridge 1" on the first start.
 const LEGACY_SECRET_BOT_TOKEN = 'botToken'
-// chatLanguages and commandScopes came later, so 0.4.0 had nothing to move for them.
+// chatLanguages, commandScopes and knownNames came later, so 0.4.0 had nothing to move for them.
 const LEGACY_STORAGE: Partial<Record<(typeof BRIDGE_STORAGE_NAMES)[number], string>> = {
   offset: 'tg.updateOffset',
   bindings: 'tg.bindings',
@@ -247,6 +248,25 @@ function parseAllowedIds(raw: string): Set<string> {
 function isAllowed(allowed: Set<string>, fromId: string, tgChatId: string): boolean {
   return allowed.size === 0 || allowed.has(fromId) || allowed.has(tgChatId)
 }
+
+// The ids whose names are kept: the allowlist and everyone with a role, so strangers on an open
+// bridge are never stored.
+function listedIds(config: Pick<BridgeConfig, 'allowedUserIds' | 'roleAssignments'>): Set<string> {
+  const ids = parseAllowedIds(config.allowedUserIds)
+  for (const id of Object.keys(config.roleAssignments)) {
+    if (/^-?\d+$/.test(id)) ids.add(id)
+  }
+  return ids
+}
+
+// "@username", else "First Last"; '' when Telegram gave neither.
+function personName(person: { username?: string; first_name?: string; last_name?: string }): string {
+  if (person.username) return `@${person.username}`
+  return [person.first_name, person.last_name].filter(Boolean).join(' ').trim()
+}
+
+// getChat calls per connect or save, so a long list cannot flood Telegram.
+const MAX_NAME_LOOKUPS = 50
 
 // The menu commands a role may use in a private chat or in a group; /help is always one of them.
 function commandsForRole(role: BridgeRole, isGroup: boolean): TelegramCommandName[] {
@@ -688,6 +708,7 @@ function traceTelegram(client: TelegramClient, tracer: Tracer): TelegramClient {
       ),
     leaveChat: (token, chatId, options) =>
       trace(`leaveChat chat=${chatId}`, () => client.leaveChat(token, chatId, options)),
+    getChat: (token, chatId, options) => trace(`getChat chat=${chatId}`, () => client.getChat(token, chatId, options)),
     editMessageText: (token, params, options) =>
       trace(`editMessageText chat=${params.chatId} message=${params.messageId} ${params.text.length} chars`, () =>
         client.editMessageText(token, params, options)
@@ -802,6 +823,9 @@ export class BridgeRuntime {
   private readonly failedAnswers = new Map<string, FailedAnswer>()
   // Chats already warned that a working line could not be deleted.
   private readonly workingLineWarned = new Set<string>()
+  // The names of the listed ids (stored as knownNames), and the queue of getChat runs that fill them in.
+  private readonly knownNames = new Map<string, string>()
+  private nameLookups: Promise<void> = Promise.resolve()
 
   constructor(manager: BridgeManager, stored: StoredBridge) {
     this.manager = manager
@@ -888,7 +912,8 @@ export class BridgeRuntime {
       lastPollAt: this.lastPollAt,
       config: { ...this.config },
       bindings: [...this.bindings].sort((a, b) => b.updatedAt - a.updatedAt),
-      telegramCaps: this.telegramCaps
+      telegramCaps: this.telegramCaps,
+      knownNames: Object.fromEntries(this.knownNames)
     }
   }
 
@@ -1002,6 +1027,13 @@ export class BridgeRuntime {
     if (!prev.syncOrcaOutbound && this.config.syncOrcaOutbound) {
       await this.resetSyncCursors()
     }
+    // A name is kept only while its id is listed.
+    const listed = listedIds(this.config)
+    const unlisted = [...this.knownNames.keys()].filter((id) => !listed.has(id))
+    if (unlisted.length > 0) {
+      for (const id of unlisted) this.knownNames.delete(id)
+      await this.saveKnownNames()
+    }
     this.lastError = null
     this.manager.refreshBotsInBackground()
     await this.appendLog('info', 'config', 'Configuration saved.')
@@ -1030,6 +1062,7 @@ export class BridgeRuntime {
     } else if (this.config.syncOrcaOutbound) {
       this.ensureOutboundLoopStarted(this.pollAbort)
     }
+    if (this.cachedToken) this.lookUpMissingNames(this.cachedToken)
     this.emitState()
   }
 
@@ -1177,6 +1210,7 @@ export class BridgeRuntime {
       this.updateOffset = update.update_id + 1
       await this.orca.storage.set(this.key('offset'), this.updateOffset)
     }
+    await this.rememberNames(update)
 
     if (update.callback_query) {
       return this.acceptCallbackQuery(update.callback_query)
@@ -3538,6 +3572,7 @@ export class BridgeRuntime {
               signal: abort.signal
             })
           )
+          this.lookUpMissingNames(token)
         }
 
         await this.ensureCommandsRegistered(token, abort.signal)
@@ -3634,6 +3669,14 @@ export class BridgeRuntime {
       ? savedScopes.filter((id): id is string => typeof id === 'string' && /^-?\d+$/.test(id))
       : []
 
+    const savedNames = await this.orca.storage.get(this.key('knownNames'))
+    this.knownNames.clear()
+    if (savedNames && typeof savedNames === 'object' && !Array.isArray(savedNames)) {
+      for (const [id, name] of Object.entries(savedNames)) {
+        if (typeof name === 'string' && name) this.knownNames.set(id, name)
+      }
+    }
+
     if (this.seedRolesFromBindings) await this.seedFullAccessFromBindings()
   }
 
@@ -3666,6 +3709,67 @@ export class BridgeRuntime {
       await this.orca.storage.set(this.key('chatLanguages'), toPlainJson(Object.fromEntries(this.chatLanguages)))
     } catch (err) {
       await this.appendLog('warn', 'bridge', `Could not store the language of Telegram chat ${tgChatId}`, describeError(err))
+    }
+  }
+
+  // Keeps the name of a listed sender and of a listed group, when new or changed. Strangers are
+  // never stored, even on an open bridge.
+  private async rememberNames(update: TelegramUpdate): Promise<void> {
+    const listed = listedIds(this.config)
+    const from = update.message?.from ?? update.callback_query?.from ?? update.my_chat_member?.from
+    const chat = update.message?.chat ?? update.my_chat_member?.chat
+    const found: [string, string][] = []
+    if (from) found.push([String(from.id), personName(from)])
+    if (chat && isGroupChat(chat)) found.push([String(chat.id), (chat.title ?? '').trim()])
+    let changed = false
+    for (const [id, name] of found) {
+      if (!name || !listed.has(id) || this.knownNames.get(id) === name) continue
+      this.knownNames.set(id, name)
+      changed = true
+    }
+    if (!changed) return
+    await this.saveKnownNames()
+    this.emitState()
+  }
+
+  // Asks Telegram for the names of the listed ids that have none, one after another, at most
+  // MAX_NAME_LOOKUPS per run. A person who never opened the bot, or a group without it, fails with
+  // 400/403: that id stays blank until the next connect or save, so a failure never loops. Runs in
+  // the background so a slow Telegram holds up neither polling nor a save; runs queue, never overlap.
+  private lookUpMissingNames(token: string): void {
+    this.nameLookups = this.nameLookups.then(() => this.lookUpMissingNamesNow(token)).catch(() => {})
+  }
+
+  private async lookUpMissingNamesNow(token: string): Promise<void> {
+    const missing = [...listedIds(this.config)].filter((id) => !this.knownNames.has(id)).slice(0, MAX_NAME_LOOKUPS)
+    let changed = false
+    for (const id of missing) {
+      let chat: TelegramChat
+      try {
+        chat = await this.deps.telegram.getChat(token, Number(id), { proxyUrl: this.config.proxyUrl, timeoutMs: 12_000 })
+      } catch (err) {
+        if (this.disposed) return
+        await this.appendLog('debug', 'telegram', `No name for Telegram ID ${id}: getChat failed`, describeError(err))
+        continue
+      }
+      // A removed bridge must not write its names back; the list may also have changed meanwhile.
+      if (this.disposed) return
+      const name = chat.type === 'private' ? personName(chat) : (chat.title ?? '').trim()
+      if (!name || !listedIds(this.config).has(id) || this.knownNames.get(id) === name) continue
+      this.knownNames.set(id, name)
+      changed = true
+    }
+    if (!changed) return
+    await this.saveKnownNames()
+    this.emitState()
+  }
+
+  // Best effort: a name is only shown in the editor, so a failed write is not worth a warning.
+  private async saveKnownNames(): Promise<void> {
+    try {
+      await this.orca.storage.set(this.key('knownNames'), toPlainJson(Object.fromEntries(this.knownNames)))
+    } catch (err) {
+      await this.appendLog('debug', 'bridge', 'Storing the names of the listed Telegram IDs failed', describeError(err))
     }
   }
 

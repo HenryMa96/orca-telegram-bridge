@@ -180,6 +180,25 @@ test('editMessageText and deleteMessage send the chat and message ids as Telegra
   assert.deepEqual(JSON.parse(removed.body), { chat_id: -100500, message_id: 77 })
 })
 
+// The editor shows these names next to the listed IDs; a misspelled chat_id would leave every row blank.
+test('getChat posts the chat id and returns the name fields', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: true, result: { id: 555, type: 'private', first_name: 'Ana', last_name: 'Lima', username: 'ana' } }))
+    },
+    async (proxyUrl) => {
+      const chat = await client.getChat(TOKEN, 555, { proxyUrl })
+      assert.equal(chat.username, 'ana')
+      assert.equal(chat.last_name, 'Lima')
+    }
+  )
+  assert.match(requests[0].path, /\/bot123456:TEST_TOKEN\/getChat$/)
+  assert.deepEqual(JSON.parse(requests[0].body), { chat_id: 555 })
+})
+
 // Telegram ignores unknown fields, so a misspelled language_code would quietly drop the per-language menus.
 test('setMyCommands sends language_code only for a language menu', async () => {
   const requests: FakeRequest[] = []

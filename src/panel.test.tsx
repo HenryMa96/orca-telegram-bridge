@@ -4,7 +4,8 @@ import {
   mount,
   test,
   type MockHostOptions,
-  type TestPanel
+  type TestPanel,
+  type TreeSnapshot
 } from 'orca/testing'
 import * as panel from './panel'
 import type {
@@ -66,6 +67,7 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
     lastPollAt: Date.now(),
     bindings: [binding('123456', 'Assistant', 'chat-abc')],
     telegramCaps: { canJoinGroups: true, canReadAllGroupMessages: true },
+    knownNames: {},
     ...rest,
     config: {
       id,
@@ -1292,6 +1294,53 @@ test('rows: added rows get Member, each role select is saved, removed rows are g
   assert.equal(saved[0].allowedUserIds, '123456, -1001234567890')
   assert.deepEqual(saved[0].roleAssignments, { '123456': 'full', '-1001234567890': 'member' })
   assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+// The words of every Text in the editor row whose ID field has this label.
+function rowTexts(view: TestPanel, label: string): string[] {
+  const words = (node: TreeSnapshot | string): string =>
+    typeof node === 'string' ? node : (node.children ?? []).map(words).join('')
+  const holds = (node: TreeSnapshot | string, match: (n: TreeSnapshot) => boolean): boolean =>
+    typeof node !== 'string' && (match(node) || (node.children ?? []).some((c) => holds(c, match)))
+  const texts = (node: TreeSnapshot | string): string[] =>
+    typeof node === 'string' ? [] : node.type === 'Text' ? [words(node)] : (node.children ?? []).flatMap(texts)
+  const isField = (n: TreeSnapshot) => n.type === 'Input' && n.props?.label === label
+  // The innermost Row holding the field is that ID's row.
+  const rowOf = (node: TreeSnapshot | string): TreeSnapshot | null => {
+    if (typeof node === 'string' || !holds(node, isField)) return null
+    for (const child of node.children ?? []) {
+      const inner = rowOf(child)
+      if (inner) return inner
+    }
+    return node.type === 'Row' ? node : null
+  }
+  const tree = view.tree()
+  const row = tree === null ? null : rowOf(tree)
+  return row ? texts(row) : []
+}
+
+test('each ID row shows the name the bridge knows for its trimmed ID, follows edits, and nothing when unknown', async () => {
+  const state = makeState({
+    bridges: [makeBridge('b1', { knownNames: { '123456': '@ana_dev', '-1001234567890': 'Ops Team' } })]
+  })
+  const view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => state } }) })
+  await openEditor(view, 'b1')
+  assert.deepEqual(rowTexts(view, 'Telegram ID 1'), ['@ana_dev'])
+  assert.equal(view.findAll({ text: 'Ops Team' }).length, 0)
+
+  await view.press({ text: 'Add person or group' })
+  assert.equal(rowTexts(view, 'Telegram ID 2').length, 0)
+  await view.type({ label: 'Telegram ID 2' }, ' -1001234567890 ')
+  assert.deepEqual(rowTexts(view, 'Telegram ID 2'), ['Ops Team'])
+  assert.deepEqual(rowTexts(view, 'Telegram ID 1'), ['@ana_dev'])
+
+  // an ID the bridge has no name for shows nothing
+  await view.type({ label: 'Telegram ID 1' }, '777', { replace: true })
+  assert.equal(rowTexts(view, 'Telegram ID 1').length, 0)
+  assert.equal(view.findAll({ text: '@ana_dev' }).length, 0)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
   await view.unmount()
 })
 

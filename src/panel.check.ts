@@ -104,6 +104,8 @@ export default defineCheck({
           updatedAt: 1795400000000
         }
       ],
+      // Shown next to the IDs in the editor's "People and groups" rows.
+      'tg.b1.knownNames': { '123456789': '@ana_dev', '-1001234567890': 'Ops Team' },
       'tg.logs': [
         {
           id: 'log-3',
