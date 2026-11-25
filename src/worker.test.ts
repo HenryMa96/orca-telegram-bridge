@@ -308,6 +308,58 @@ for (const scenario of ['no Orca bots found', 'Orca bots found'] as const) {
   })
 }
 
+// Orca rejects a panel handler answer that is not plain JSON ("answered with a non-JSON value"), and
+// mockHost does not check answers, so this mirrors Orca's rule: the first non-JSON value's path, or null.
+function nonJsonPath(value: unknown, at = '$'): string | null {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return null
+  if (typeof value === 'number') return Number.isFinite(value) ? null : at
+  if (Array.isArray(value)) {
+    for (const [i, item] of value.entries()) {
+      const found = nonJsonPath(item, `${at}[${i}]`)
+      if (found) return found
+    }
+    return null
+  }
+  if (typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      const found = nonJsonPath(item, `${at}.${key}`)
+      if (found) return found
+    }
+    return null
+  }
+  return at
+}
+
+test('panel handlers answer plain JSON after a message created a binding with no Orca bot', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: false, defaultBot: '', allowedUserIds: '175844659', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({ orcaCli: { listBots: async () => [] } })
+  let controller!: TelegramBridgeController
+  const worker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        controller = await main.activateWithDeps(orca, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+      },
+      deactivate: main.deactivate
+    },
+    { host }
+  )
+  try {
+    await within(controller.handleIncomingUpdate(textUpdate(681159817, 175844659, 'oi')), 'first message')
+    const enabled = await worker.request('bridge.setDebugLogging', { enabled: true })
+    assert.equal(nonJsonPath(enabled), null)
+    assert.equal((enabled as BridgeState).config.debugLogging, true)
+    const state = await worker.request('bridge.getState')
+    assert.equal(nonJsonPath(state), null)
+    assert.equal((state as BridgeState).bindings.length, 1)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
 test('extractTablesFromMarkdown extracts GFM tables outside code fences', () => {
   const md = [
     '说明：',

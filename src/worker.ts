@@ -145,9 +145,10 @@ function truncateText(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
 }
 
-// Orca refuses a storage value holding `undefined` (invalid_params "Invalid input"); optional
-// fields such as a binding's botId are often unset, so drop them as JSON would.
-function toStorageJson<T>(value: T): T {
+// Orca refuses `undefined` (and NaN) anywhere in a storage value (invalid_params "Invalid input") and
+// in a panel answer ("answered with a non-JSON value"). Optional fields such as a binding's botId are
+// often unset, so drop them as JSON would.
+function toPlainJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
 
@@ -355,7 +356,7 @@ export class TelegramBridgeController {
   }
 
   getState(): BridgeState {
-    return {
+    return toPlainJson({
       status: this.status,
       polling: this.pollAbort !== null,
       botUsername: this.botUsername,
@@ -368,7 +369,7 @@ export class TelegramBridgeController {
       bindings: [...this.bindings].sort((a, b) => b.updatedAt - a.updatedAt),
       logs: this.logs.slice(0, STATE_LOGS),
       logTotal: this.logs.length
-    }
+    })
   }
 
   // Texts for Telegram, in the language the settings chose.
@@ -538,7 +539,7 @@ export class TelegramBridgeController {
       }
       await this.appendLog('info', 'telegram', `Verified Telegram bot @${me.username || me.id}`)
       this.emitState()
-      return { ok: true, username: me.username, botId: me.id, state: this.getState() }
+      return { ok: true, ...(me.username ? { username: me.username } : {}), botId: me.id, state: this.getState() }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       this.lastError = message
@@ -2111,7 +2112,7 @@ export class TelegramBridgeController {
 
   private async saveSyncCursors(): Promise<void> {
     try {
-      await this.orca.storage.set(STORAGE_SYNC_CURSORS, toStorageJson(this.syncCursors))
+      await this.orca.storage.set(STORAGE_SYNC_CURSORS, toPlainJson(this.syncCursors))
     } catch (err) {
       // Non-fatal in mock/read-only runs.
       await this.appendLog('debug', 'sync', 'Saving sync cursors failed', describeError(err))
@@ -2393,7 +2394,7 @@ export class TelegramBridgeController {
     } else {
       this.bindings.push(binding)
     }
-    await this.orca.storage.set(STORAGE_BINDINGS, toStorageJson(this.bindings))
+    await this.orca.storage.set(STORAGE_BINDINGS, toPlainJson(this.bindings))
   }
 
   // Debug entries are stored only while debugLogging is on and never post state themselves.
