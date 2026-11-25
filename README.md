@@ -6,18 +6,23 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 
 **Talk to your Orca bots from Telegram, from your phone, anywhere.**
 
-- **As many bridges as you need.** Each bridge pairs one Telegram bot with one Orca bot, so `@ci_bot` can front your CI watcher and `@dev_bot` your coding assistant. Every bridge has its own token, access list, language, proxy, group and voice settings, and they all run at once: a bridge that fails never stops the others.
-- **Private chats and groups**, open to everyone or restricted to the Telegram user and group IDs you list.
+- **As many bridges as you need.** Each bridge pairs one Telegram bot with one Orca bot, so `@ci_bot` can front your CI watcher and `@dev_bot` your coding assistant. Every bridge has its own token, access list, roles, language, proxy, group and voice settings, and they all run at once: a bridge that fails never stops the others.
+- **A panel that follows your bot.** Click a bot in Orca's left sidebar and the Telegram panel shows only that bot's bridge, chats and logs.
+- **Roles for the people you let in.** Choose what each person or group may do (chat, start or switch chats, sync, automations) and give each role an extra prompt for the Orca bot, such as "read-only, plain Spanish".
+- **Private chats and groups**: in a group the bot answers when called, or follows the conversation and joins in when it can help.
 - **Voice messages**, transcribed with OpenRouter or OpenAI and answered as text.
 - **Images and files both ways**: photos reach the Orca bot as files, and the Orca bot can send back charts, screenshots and documents; Markdown and tables come back formatted.
+- **Replies in the user's language**: English, Português, Español, 中文, or Auto per chat.
 - **No server to run**: the plugin long-polls Telegram from inside Orca. No public IP, webhook or extra daemon.
 
 ## Features
 
-- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, language, proxy and on/off switch. The Telegram panel follows the bot selected in Orca's left sidebar and shows only that bot's bridge, chats and logs
+- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, roles, language, proxy and on/off switch. The Telegram panel follows the bot selected in Orca's left sidebar and shows only that bot's bridge, chats and logs
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
-- **Open or restricted access**: open to everyone while the ID list is empty; add Telegram user or group IDs to restrict it, with one-click **Allow** in the sidebar panel
-- **Telegram groups**: in a group the bot answers commands addressed to it, replies to its own messages and, with Telegram privacy mode off, `@yourbot` mentions
+- **Open or restricted access**: anyone on Telegram, or only the Telegram user and group IDs you list, with one-click **Allow** in the sidebar panel. See [Who can talk to the bot](#who-can-talk-to-the-bot)
+- **Roles**: per bridge, which commands each person or group may use (private and group rights kept apart for `/new`, `/home`, `/bind`), which automations they may run, and an extra prompt for the Orca bot. Built in: Full access, Member, and Stranger for anyone on Telegram. Refusals are one plain line; each person's `/` menu and `/help` show only what their role allows. See [Roles](#roles)
+- **Telegram groups**: Off, answers when called (`@yourbot` mention, reply to the bot, or a command for it), or follows the conversation and answers when called or when it can help. See [Use the bot in a group](#use-the-bot-in-a-group)
+- **Reply language**: the bridge's own replies and `/` menu in English, Português (Brasil), Español or 中文, or **Auto**: each chat in its user's Telegram language (English until one is known), and the Orca bot asked to answer in the language of each message
 - **Encrypted Bot Token storage** via `orca.secrets` (OS keyring)
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
@@ -25,7 +30,8 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **Orca → Telegram images and documents** — the Orca bot attaches a file by writing `![caption](path or https URL)`; the plugin sends it as a photo or document
 - **Voice messages**: per bridge, voice messages and audio files are transcribed with OpenRouter or OpenAI and reach the Orca bot as text
 - **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram. Orca's own automation prompts (reminders, deadlines, events, and scheduled runs of an automation that ran in that chat in the last 24 hours) stay in Orca; only the bot's answer goes. Like Orca, a bot answer ending in `NO_REPLY` sends nothing
-- **Telegram `/` command menu** (`setMyCommands`) + **interactive inline buttons**: `/help`, `/new`, `/home`, `/bots`, `/use`, `/chats`, `/bind`, `/rename`, `/sync`, `/automations`, `/run`, `/status`
+- **Telegram `/` command menu** (`setMyCommands`, per role and per language) + **interactive inline buttons**: `/help`, `/new`, `/home`, `/bots`, `/chats`, `/bind`, `/rename`, `/sync`, `/automations`, `/run`, `/status`
+- **Clean setup panel**: a bridge is shown by its bot's `@username`; the editor groups Connection, Who can talk, Roles, Groups and Features, with rare options under Advanced; **Save** closes the editor, and a failed save says why next to its buttons
 - **Rich Markdown + Table PNG rendering**:
   - Converts Markdown headings, bold, italic, strikethrough, blockquotes, task lists, links, and fenced code blocks to Telegram HTML
   - Renders standard Markdown tables (`| col |`) into crisp PNG images via Python Pillow (`sendPhoto`), automatically falling back to formatted text when Python/Pillow is not installed
@@ -245,20 +251,22 @@ Even when restricted, the Orca bot reads files with your rights, and an allowed 
 
 ## Telegram Commands
 
-| Command | Description |
-| --- | --- |
-| `/help` | Show current target bot, session ID, sync status, and command list |
-| `/new` | Reset current chat binding and start a fresh Orca session |
-| `/home` | Bind Telegram chat to the current bot's Home Chat |
-| `/bots` | List all available Orca bots with inline switch buttons |
-| `/use <name>` | Switch target Orca bot |
-| `/chats` | List recent active Orca chats with inline bind/new/home buttons |
-| `/bind <chatId>` | Bind Telegram chat to an existing Orca chat |
-| `/rename <title>` | Rename the currently bound Orca chat |
-| `/sync [on\|off]` | Toggle or set Orca → Telegram outbound sync |
-| `/automations` | List Orca automations with inline run buttons |
-| `/run <id>` | Trigger an Orca automation immediately |
-| `/status` | Show Telegram bot, target Orca bot, session, sync, and polling status |
+Each command needs its permission in the sender's [role](#roles); `/help` always works and lists only the commands the role allows.
+
+| Command | Description | Role permission |
+| --- | --- | --- |
+| `/help` | Show the current Orca bot, chat, sync status, and the commands you may use | always |
+| `/new` | Reset this chat's binding and start a fresh Orca chat | `/new` in private, or in groups |
+| `/home` | Bind this chat to the Orca bot's Home Chat | `/home` in private, or in groups |
+| `/bots` | List the Orca bots on this computer | `/bots` |
+| `/use <name>` | Say which Orca bot this Telegram bot is pinned to (it cannot be switched from Telegram) | `/bots` |
+| `/chats` | List recent Orca chats with inline bind / new / home buttons | `/chats` and `/bind` in private, or in groups |
+| `/bind <chatId>` | Bind this chat to an existing Orca chat | `/chats` and `/bind` in private, or in groups |
+| `/rename <title>` | Rename the bound Orca chat | `/rename` |
+| `/sync [on\|off]` | Toggle or set Orca → Telegram sync | `/sync` |
+| `/automations` | List the Orca automations your role may run, with Run buttons | `/automations` (buttons need `/run`) |
+| `/run <id>` | Run an Orca automation now | `/run` (all, or only the role's chosen automations) |
+| `/status` | Show the Telegram bot, Orca bot, chat, sync and polling status | `/status` |
 
 ## Debugging
 
