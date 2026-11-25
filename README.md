@@ -7,7 +7,8 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 ## Features
 
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
-- **Strict user allowlist** (`allowedUserIds`) with one-click pairing in the sidebar panel
+- **Open or restricted access**: open to everyone while the ID list is empty; add Telegram user or group IDs to restrict it, with one-click **Allow** in the sidebar panel
+- **Telegram groups**: in a group the bot answers commands, mentions (`@yourbot`) and replies to its own messages
 - **Encrypted Bot Token storage** via `orca.secrets` (OS keyring)
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
@@ -126,31 +127,40 @@ Do these steps after the plugin is installed and approved.
 4. Choose the **Telegram reply language**: English (default), Português (Brasil) or 中文. The bot uses it for its own replies and its command menu. The Orca bot's answers keep the language the Orca bot writes in.
 5. Optional: set an HTTP proxy (e.g. `http://127.0.0.1:7890`).
 6. Click **Save Settings**, then **Test Connection**.
-7. Authorize yourself: send any message to your Telegram bot, then click **Allow \<your ID\>** in the panel banner. See [Who can talk to the bot](#who-can-talk-to-the-bot).
+7. Decide who can use the bot. By default it is open to everyone. See [Who can talk to the bot](#who-can-talk-to-the-bot).
 
 ## Who can talk to the bot
 
-The bot answers only Telegram users whose numeric ID is in **Allowed Telegram User IDs**. Every person who talks to the bot needs their own entry, you included. The list starts empty, so at first the bot answers nobody.
+Access depends on **Allowed Telegram IDs** in the Setup tab:
 
-To authorize a person:
+- **Empty (default): open to everyone.** Any Telegram user who finds your bot, and any group it is in, can use it. The panel shows an **Open to everyone** warning while the list is empty.
+- **One or more IDs: restricted.** Only the listed IDs can use the bot. A user ID allows that person in private chats and in any group. A group ID (a negative number, e.g. `-1001234567890`) allows every member of that group.
 
-1. Ask them to send any message to the bot.
-2. In Orca, open the **Telegram** panel. A banner shows `User <ID> messaged your bot but is not in the allowlist.`
-3. Click **Allow \<ID\>**. Their next message goes to the Orca bot.
+Every person who can use the bot uses your Orca bots with your rights: they can chat with them, list and bind your existing Orca chats (`/chats`, `/bind`), switch bots and run automations. Keep the bot open only if you accept that, or restrict it.
 
-What the person sees before that:
+[Orca → Telegram sync](#features) works only with a restricted list. While the bot is open to everyone, sync is paused, so a stranger who binds one of your Orca chats does not receive what you write in Orca.
 
-- While the allowlist is empty, the bot replies that access is not authorized and shows their Telegram ID.
-- Once the allowlist has at least one ID, the bot does not reply to unknown people at all. Only the panel banner and the Logs tab show the attempt.
-- The banner shows only the latest unknown person. If several people wrote, allow them one by one, or type the IDs yourself.
+### Restrict access
 
-To add or remove IDs by hand, edit **Allowed Telegram User IDs** in the Setup tab and click **Save Settings**. Separate IDs with commas or spaces. Only numeric user IDs count; group chat IDs are ignored. A person who knows no ID can get theirs from a Telegram bot such as `@userinfobot`.
+1. Ask each person to send any message to the bot (in a group, mention the bot).
+2. While the list is still empty, the bot answers them. To restrict it, add at least one ID: your own first. Your ID: send a message to the bot, then read it in the panel's **Chats** tab (`TG <ID> -> …`), or ask a bot such as `@userinfobot`.
+3. Type the IDs in **Allowed Telegram IDs**, separated by commas or spaces, and click **Save Settings**.
 
-In a group, the bot checks who sent each message, not the group. If you add the bot to a group, messages from allowed people in it reach your Orca bot, and the replies are visible to everyone in the group.
+Once the list is restricted, an unknown person gets one short reply with their Telegram ID (at most once a minute), and the panel shows a banner: `User <ID> messaged your bot but is not in the allowlist.` Click **Allow \<ID\>** to add them. The banner shows only the latest unknown person.
 
-Removing an ID stops the bot from answering that person. It also stops [Orca-side sync](#features) to their chats.
+Removing an ID stops the bot from answering that person or group, and stops sync to their chats. Emptying the list opens the bot to everyone again.
 
-Every allowed person can use your Orca bots with your rights: chat with them, switch bots, run automations. Allow only people you trust.
+### Use the bot in a group
+
+1. Add the bot to the group in Telegram (group menu → **Add members**). If Telegram refuses, enable **Allow Groups?** for the bot in `@BotFather` (`/setjoingroups`).
+2. In the group, talk to the bot in one of these ways:
+   - a command, such as `/help` or `/help@yourbot`;
+   - a message that mentions it: `@yourbot what changed today?` (the mention is removed before the text goes to the Orca bot);
+   - a reply to one of the bot's messages.
+   Other group messages are ignored. This matches Telegram's default privacy mode for bots, so you do not need to change it in `@BotFather`.
+3. To restrict access to this group, add the group's ID to **Allowed Telegram IDs**. The group's ID appears in the **Chats** tab (`TG -100… -> …`) after the bot answers there once.
+
+In a group, everyone sees the bot's replies, and the whole group shares one Orca chat: `/new`, `/use`, `/bind` and `/home` change it for everyone in that group.
 
 ## Telegram Commands
 
