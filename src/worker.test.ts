@@ -479,6 +479,52 @@ test('a direct reply that is only NO_REPLY sends nothing to Telegram; words befo
   }
 })
 
+// Orca titles a new handoff chat "Telegram: <first words>"; the bridge names it after the Telegram
+// chat so the owner can tell bridged chats apart, and never touches a title someone chose.
+test('a bridged Orca chat under its automatic title is named telegram@<name>, once; a chosen title stays', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '555000111, 555000222',
+      proxyUrl: '',
+      replyTimeoutSec: 300
+    }
+  })
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+  const withUsername = (updateId: number, text: string): TelegramUpdate => {
+    const update = textUpdate(updateId, 555000111, text)
+    update.message!.from = { id: 555000111, is_bot: false, first_name: 'Ana', username: 'ana_dev' }
+    return update
+  }
+  try {
+    await within(controller.handleIncomingUpdate(withUsername(1, 'hello')), 'first message')
+    // the mock's first new chat (Home is the first chat)
+    const chatId = 'tg-chat-2'
+    assert.equal(deps.sentToBots[0].chatId, 'new')
+    // one "@": the username already carries it
+    assert.deepEqual(deps.renamedChats, [{ sessionId: chatId, name: 'telegram@ana_dev' }])
+
+    await within(controller.handleIncomingUpdate(withUsername(2, 'again')), 'second message')
+    assert.equal(deps.renamedChats.length, 1)
+
+    // a title the owner chose in Orca is kept
+    await deps.orcaCli.renameChat(chatId, 'Project X')
+    await within(controller.handleIncomingUpdate(withUsername(3, 'third')), 'chosen title')
+    assert.equal(deps.renamedChats.at(-1)?.name, 'Project X')
+
+    // without a username: first name
+    await within(controller.handleIncomingUpdate(textUpdate(4, 555000222, 'hi')), 'no username')
+    assert.equal(deps.renamedChats.at(-1)?.name, 'telegram@User')
+  } finally {
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+})
+
 // Orca rejects a panel handler answer that is not plain JSON ("answered with a non-JSON value"), and
 // mockHost does not check answers, so this mirrors Orca's rule: the first non-JSON value's path, or null.
 function nonJsonPath(value: unknown, at = '$'): string | null {

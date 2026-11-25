@@ -268,6 +268,21 @@ function personName(person: { username?: string; first_name?: string; last_name?
 // getChat calls per connect or save, so a long list cannot flood Telegram.
 const MAX_NAME_LOOKUPS = 50
 
+// Orca titles a chat it opens for a handoff from the subject ("Telegram: <first words>"), sometimes
+// behind the sender ("your owner's agent: Telegram: …"). Only such a title is replaced, so a name
+// given with /rename or in Orca stays.
+function isAutomaticChatTitle(title: string | undefined): boolean {
+  return title !== undefined && /(^|: )Telegram: /.test(title)
+}
+
+// "telegram@drecchia" for a person, "telegram@Ana Souza" without a username, "telegram@Ops Team"
+// for a group. Empty when Telegram gave no name.
+function orcaChatNameFor(msg: Pick<TelegramMessage, 'from' | 'chat'>): string {
+  const name = msg.chat.type === 'private' ? (msg.from ? personName(msg.from) : '') : (msg.chat.title ?? '').trim()
+  if (!name) return ''
+  return name.startsWith('@') ? `telegram${name}` : `telegram@${name}`
+}
+
 // The menu commands a role may use in a private chat or in a group; /help is always one of them.
 function commandsForRole(role: BridgeRole, isGroup: boolean): TelegramCommandName[] {
   return TELEGRAM_COMMAND_NAMES.filter((name) => roleAllows(role, permissionForCommand(`/${name}`, isGroup)))
@@ -1881,6 +1896,7 @@ export class BridgeRuntime {
               delivery.imageCount > 0 ? ` + ${delivery.imageCount} table image(s)` : ''
             }${delivery.attachmentCount > 0 ? ` + ${delivery.attachmentCount} attachment(s)` : ''}.`
       )
+      await this.nameOrcaChat(msg, tgChatId, binding, result.chatId, result.title)
       this.emitState()
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -3908,6 +3924,33 @@ export class BridgeRuntime {
     }
     await this.upsertBinding(created)
     return created
+  }
+
+  // After an answer: an Orca chat still under Orca's automatic title gets "telegram@<name>", so the
+  // owner can tell the bridged chats apart in Orca's sidebar. Best effort; a failure only logs.
+  private async nameOrcaChat(
+    msg: TelegramMessage,
+    tgChatId: string,
+    binding: ChatBinding,
+    orcaChatId: string,
+    title: string | undefined
+  ): Promise<void> {
+    if (!isAutomaticChatTitle(title)) return
+    const name = orcaChatNameFor(msg)
+    if (!name) return
+    try {
+      await this.deps.orcaCli.renameChat(orcaChatId, name)
+      await this.upsertBinding({ ...binding, orcaChatId, title: name, updatedAt: Date.now() })
+      await this.appendLog('debug', 'orca-cli', `Named Orca chat ${orcaChatId} after the Telegram chat ${tgChatId}.`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await this.appendLog(
+        'debug',
+        'orca-cli',
+        `Naming Orca chat ${orcaChatId} failed: ${message}`,
+        describeError(err, { tgChatId, orcaChatId })
+      )
+    }
   }
 
   private async upsertBinding(binding: ChatBinding): Promise<void> {

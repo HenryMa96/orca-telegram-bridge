@@ -31,7 +31,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **Reply language**: the bridge's own replies and `/` menu in English, Português (Brasil), Español or 中文, or **Auto**: each chat in its user's Telegram language (English until one is known), and the Orca bot asked to answer in the language of each message
 - **Encrypted Bot Token storage** via `orca.secrets` (OS keyring)
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
-- **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
+- **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`. The Orca chat is named after the Telegram chat, such as `telegram@drecchia` (a person's `@username`, else their name; a group's title), replacing Orca's automatic "Telegram: …" title after the first answer; a title set with `/rename` or in Orca is kept
 - **Telegram → Orca image forwarding** — downloads compressed photos and uncompressed image documents locally and passes their file path(s) to the Orca bot (with optional caption)
 - **Orca → Telegram images and documents** — the Orca bot attaches a file by writing `![caption](path or https URL)`; the plugin sends it as a photo or document
 - **Voice messages**: per bridge, voice messages and audio files are transcribed with OpenRouter or OpenAI and reach the Orca bot as text
