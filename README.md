@@ -193,7 +193,7 @@ Orca bots run agent CLIs that read text, so the plugin transcribes voice message
 
 Then a voice message, or an audio file (mp3, m4a, ogg, wav, flac, webm), reaches the Orca bot as `[Voice message, transcribed] <text>`, after the caption if there is one. The bot answers the text; the transcript is not posted back to Telegram and never written to the logs.
 
-- The audio goes to the chosen provider, which charges per minute of audio. Files over 25 MB are refused.
+- The audio goes to the chosen provider, which charges per minute of audio. Files over 20 MB are refused: Telegram does not let a bot download larger files.
 - The bridge's HTTP proxy, when set, is used for the transcription too.
 - With **Voice messages** off, or on without a key, the sender gets a short reply that voice messages are not enabled for this bot.
 - If the transcription fails, the sender gets a short reply with the reason, and the Logs tab has the details.

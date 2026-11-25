@@ -38,6 +38,7 @@ import {
   createTelegramClient,
   markdownToTelegramHtml,
   splitTelegramMessage,
+  MAX_TELEGRAM_DOWNLOAD_BYTES,
   TelegramApiError,
   type TelegramAudio,
   type TelegramBotCommand,
@@ -1360,8 +1361,9 @@ export class BridgeRuntime {
     // English for the log, localized for the sender.
     let logReason: string | null = null
     let replyReason = ''
-    if (bytes > MAX_TRANSCRIBE_BYTES) {
-      logReason = 'the file is over 25 MB'
+    // Telegram lets a bot download 20 MB at most, below the providers' 25 MB.
+    if (bytes > Math.min(MAX_TRANSCRIBE_BYTES, MAX_TELEGRAM_DOWNLOAD_BYTES)) {
+      logReason = 'the file is over 20 MB'
       replyReason = this.i18n.voiceTooLarge
     } else {
       try {

@@ -2978,9 +2978,10 @@ test('a failing transcription answers with the reason, dispatches nothing and ne
   )
 })
 
-test('a voice file over 25 MB is refused before downloading', async () => {
+test('a voice file over 20 MB is refused before downloading', async () => {
   await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, deps, calls }) => {
-    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice', {}, 26 * 1024 * 1024))
+    // 21 MB: under the providers' 25 MB but over what Telegram lets a bot download.
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice', {}, 21 * 1024 * 1024))
     assert.equal(calls.length, 0)
     assert.equal(deps.sentToBots.length, 0)
     assert.equal(deps.sentMessages.at(-1)?.text, t('en').voiceFailed(t('en').voiceTooLarge))

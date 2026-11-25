@@ -21,7 +21,7 @@ and choose its own provider, model and API key.
 - The bridge's HTTP proxy, when set, is used for the transcription call too.
 - Voice off, or on without an API key: the sender gets a short localized reply that voice
   messages are not enabled for this bot; nothing reaches the Orca bot.
-- Transcription failure (HTTP error, timeout, empty text, file over 25 MB): a short localized
+- Transcription failure (HTTP error, timeout, empty text, file over 20 MB, Telegram's download cap for bots): a short localized
   reply with the reason, a warn log with details; nothing reaches the Orca bot.
 - No transcript echo to Telegram. The transcript is never logged (only duration, bytes, model, ms).
 - The API key is a secret (`voiceKey.<bridgeId>`), redacted from logs/exports like the bot token,

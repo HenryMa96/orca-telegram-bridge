@@ -480,7 +480,8 @@ async function sendTelegramHttp<T>(
   })
 }
 
-const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
+// Telegram's Bot API refuses getFile downloads over 20 MB.
+export const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 async function downloadTelegramFileBytes(
   token: string,
