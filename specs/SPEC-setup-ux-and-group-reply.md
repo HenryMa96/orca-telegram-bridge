@@ -5,7 +5,7 @@
 
 ## Goal
 1. A calm, low-effort setup panel: one identity (the Telegram bot's `@username`), sections, rare options behind a disclosure, an explicit "who can talk" choice.
-2. In groups with **All messages**, a per-bridge reply policy: **only when mentioned** (default) or **when it can help**.
+2. In groups with **All messages**, a per-bridge reply policy: **only when addressed** (mention, reply to the bot, command for it; default for new bridges) or **when it can help**.
 
 ## Contract (src/protocol.ts)
 - `GroupReply = 'mentioned' | 'helpful'`; `BridgeConfig.groupReply`; `SaveConfigInput.groupReply?` (absent keeps).
@@ -14,16 +14,16 @@
 
 ## Group reply behavior (worker)
 - Applies only to messages that `groupMessageText` returns with `addressed: false` (group, groupMode `all`, restricted allowlist). Addressed messages (mention, reply to the bot, command for it) are unchanged.
-- Each unaddressed message is still sent to the Orca bot (it "reads everything"); the handoff body gets one extra line:
-  - `mentioned`: `This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.`
-  - `helpful`: `This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.`
+- Each unaddressed message is still sent to the Orca bot (it "reads everything"); its reply rule replaces the usual "your final message will be sent back to Telegram" line, so the two never contradict each other:
+  - `mentioned`: `This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY. Nothing you write is sent to Telegram.` (no attachment syntax line: nothing goes back)
+  - `helpful`: `This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY. A reply is sent back to the group (use standard Markdown tables; avoid wide ASCII box tables).`
 - `mentioned` is enforced by the bridge: whatever the bot answers to an unaddressed message is not sent to Telegram (logged at info with its length only).
 - Unaddressed messages are quiet: no typing action, and no user-facing error or notice lines in the group (processing failure, unsupported image, voice not enabled / transcription failure); those are logged only.
-- Default `groupReply` for new and existing bridges: `mentioned`.
+- Default `groupReply`: `mentioned` for new bridges. A bridge stored before 0.8.0 with groupMode `all` (and no `groupReply`) starts at `helpful`, because it answered every group message before; others start at `mentioned`.
 
 ## Panel (src/panel.tsx)
 - Card: title `@username` (fallback: "New Telegram bot" before the token is checked), description `→ <Orca bot>`. One switch row with the status badge. Summary lines in plain words. Actions: **Edit** only; **Remove** moves to the editor footer with the existing confirm step.
-- Editor sections (Heading + spacing): **Connection** (token, Orca bot) · **Who can talk** (radio: "Only these people and groups" with the IDs field / "Anyone on Telegram" with a warning Callout) · **Groups** (radio: Off / Only messages for the bot / All messages; with All messages a second radio: "Reply only when mentioned" / "Reply when it can help"; privacy-mode Callout with numbered steps) · **Features** (voice switch + provider + key; sync switch) · **Advanced** Collapsible, closed (reply language, reply timeout, HTTP proxy, transcription model).
+- Editor sections (Heading + spacing): **Connection** (token, Orca bot) · **Who can talk** (radio: "Only these people and groups" with the IDs field / "Anyone on Telegram" with a warning Callout) · **Groups** (radio: Off / Only messages for the bot / All messages; with All messages a second radio **Replies**: "Only when addressed" / "When it can help", with a helper that defines "addressed" and the per-message bot-turn cost; privacy-mode Callout with numbered steps) · **Features** (voice switch + provider + key; sync switch) · **Advanced** Collapsible, closed (reply language, reply timeout, HTTP proxy, transcription model).
 - Name field removed. Chats tab and log filter label bridges by `@username` (fallback to the stored name).
 - Footer: Save (primary), Cancel (ghost); Test connection (outline) and Remove (ghost, danger) after them.
 - Sentence case for every label and button.

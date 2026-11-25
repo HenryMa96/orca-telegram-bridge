@@ -3028,9 +3028,9 @@ test("'all' with an open allowlist acts as 'addressed': a plain group line start
 })
 
 const SILENT_LINE =
-  'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.'
+  'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY. Nothing you write is sent to Telegram.'
 const HELPFUL_LINE =
-  'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.'
+  'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY. A reply is sent back to the group (use standard Markdown tables; avoid wide ASCII box tables).'
 
 function groupMessages(deps: ReturnType<typeof makeMockDeps>) {
   return deps.sentMessages.filter((m) => m.chatId === GROUP_ID)
@@ -3040,9 +3040,8 @@ function typed(deps: ReturnType<typeof makeMockDeps>): boolean {
   return deps.sentActions.some((a) => a.action === 'typing')
 }
 
-// No groupReply stored: the default, 'mentioned'.
-test("'all' + reply only when mentioned: an unaddressed line reaches the bot as context, and its answer stays out of the group", async () => {
-  await withGroupBridge({ allowGroups: true, groupMode: 'all', allowedUserIds: '777888' }, async (controller, deps, manager) => {
+test("'all' + reply only when addressed: an unaddressed line reaches the bot as context, and its answer stays out of the group", async () => {
+  await withGroupBridge({ allowGroups: true, groupMode: 'all', groupReply: 'mentioned', allowedUserIds: '777888' }, async (controller, deps, manager) => {
     await within(controller.handleIncomingUpdate(groupUpdate(1, 777888, 'the deploy failed again')), 'unaddressed line')
     assert.equal(deps.sentToBots.length, 1)
     assert.ok(deps.sentToBots[0].body.includes(SILENT_LINE))
@@ -3174,6 +3173,24 @@ test('a save without a name keeps it; groupReply defaults to mentioned, round-tr
     await worker.request('bridge.saveConfig', saveInput(controller, { groupReply: 'mentioned' }))
     assert.equal(controller.view().config.groupReply, 'mentioned')
     assert.deepEqual(worker.refusals, [])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+// Before 0.8.0, All messages answered every group message: an upgraded bridge keeps answering.
+test("a bridge stored before groupReply keeps answering with All messages ('helpful'); others start at 'mentioned'", async () => {
+  const host = bridgesHost([
+    { id: 'b-legacyall', token: '123456:TEST_TOKEN', config: { name: 'Old all', groupMode: 'all' } },
+    { id: 'b-legacyadr', token: '654321:TEST_TOKEN', config: { name: 'Old addressed', groupMode: 'addressed' } }
+  ])
+  const deps = makeMockDeps()
+  const { worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    const state = (await worker.request('bridge.getState')) as BridgeState
+    const replyOf = (name: string) => state.bridges.find((b) => b.name === name)?.config.groupReply
+    assert.equal(replyOf('Old all'), 'helpful')
+    assert.equal(replyOf('Old addressed'), 'mentioned')
   } finally {
     await worker.deactivate()
   }

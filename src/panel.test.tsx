@@ -1003,7 +1003,7 @@ test('the editor has sections and keeps the rare options in a closed Advanced', 
   await view.unmount()
 })
 
-const ALL_NOTE = /All messages needs "Only these people and groups"/
+const ALL_NOTE = /All messages works only with "Only these people and groups"/
 const PRIVACY_TITLE = 'Privacy mode is on'
 const JOIN_TITLE = 'This bot cannot join groups'
 
@@ -1048,7 +1048,7 @@ test('the reply policy shows only with All messages, and Save sends the group ch
 
   await view.select({ label: 'Group messages' }, 'all')
   assert.equal(view.valueOf({ label: 'Replies' }), 'mentioned')
-  assert.ok(view.find({ text: /uses a bot turn per message/ }))
+  assert.ok(view.find({ text: /Addressed means a mention, a reply to the bot or a command for it\..*uses a bot turn per message/ }))
   await view.select({ label: 'Replies' }, 'helpful')
   await view.press({ text: 'Save' })
   assert.equal(saved[0].allowGroups, true)
@@ -1088,7 +1088,7 @@ test('each bridge card says how it reads groups', async () => {
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: 'Groups: off' }))
   assert.ok(view.find({ text: 'Groups: messages for the bot' }))
-  assert.ok(view.find({ text: 'Groups: reads all, replies when mentioned' }))
+  assert.ok(view.find({ text: 'Groups: reads all, replies when addressed' }))
   assert.ok(view.find({ text: 'Groups: reads all, replies when it can help' }))
   assert.ok(view.find({ text: 'Groups: messages for the bot (all messages needs an ID list)' }))
   assert.deepEqual(view.errors, [])

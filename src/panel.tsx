@@ -91,7 +91,7 @@ const MAX_LABEL = 500
 const ORCA_BOT_LABEL = 'Orca bot (this Telegram bot talks only to it)'
 const NEW_BOT_LABEL = 'New Telegram bot'
 const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
-const ALL_NEEDS_IDS = 'All messages needs "Only these people and groups". While anyone can talk, the bot reads only messages for it.'
+const ALL_NEEDS_IDS = 'All messages works only with "Only these people and groups". While anyone can talk, the bot reads only messages for it.'
 
 const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
   { value: 'all', label: 'All levels' },
@@ -115,7 +115,7 @@ const GROUP_OPTIONS: Array<{ value: 'off' | GroupMode; label: string }> = [
   { value: 'all', label: 'All messages' }
 ]
 const GROUP_REPLY_OPTIONS: Array<{ value: GroupReply; label: string }> = [
-  { value: 'mentioned', label: 'Only when mentioned' },
+  { value: 'mentioned', label: 'Only when addressed' },
   { value: 'helpful', label: 'When it can help' }
 ]
 const VOICE_PROVIDER_OPTIONS: Array<{ value: VoiceProvider; label: string }> = [
@@ -494,7 +494,7 @@ function groupsSummary(bridge: BridgeView, openToEveryone: boolean): string {
   if (openToEveryone) return 'Groups: messages for the bot (all messages needs an ID list)'
   return groupReply === 'helpful'
     ? 'Groups: reads all, replies when it can help'
-    : 'Groups: reads all, replies when mentioned'
+    : 'Groups: reads all, replies when addressed'
 }
 
 function bridgeCard(bridge: BridgeView, isBusy: boolean) {
@@ -697,7 +697,8 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
                 onChange={(v) => edit(groupReplyDraft, v as GroupReply)}
               />
               <Text muted size="xs">
-                Each group message is sent to the Orca bot, so it uses a bot turn per message.
+                Addressed means a mention, a reply to the bot or a command for it. Each group
+                message is sent to the Orca bot, so it uses a bot turn per message.
               </Text>
             </Stack>
           )}

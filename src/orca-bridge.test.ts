@@ -230,7 +230,7 @@ test('bridge-sent message is recognised when the sender label contains parenthes
   )
 })
 
-test('the not-addressed line is in the body only for an unaddressed group message, after the attachment line', async () => {
+test('an unaddressed group message gets its reply rule instead of "will be sent back"', async () => {
   const bodyFor = async (unaddressedGroupReply?: 'mentioned' | 'helpful') => {
     const { runner, sentBodies } = makeRunner({
       afterSend: (_poll, ourUser) => ({ orcaSessionId: BOUND_CHAT.id, state: 'done', entries: [ourUser, assistant('ok')] })
@@ -238,23 +238,23 @@ test('the not-addressed line is in the body only for an unaddressed group messag
     await dispatchToOrcaBotAndWait(runner, { ...dispatchParams, unaddressedGroupReply })
     return sentBodies[0]
   }
-  const plain = await bodyFor()
-  assert.equal(/not addressed to you/.test(plain), false)
+  const plain = (await bodyFor()).split('\n')
+  assert.match(plain[1], /will be sent back to Telegram/)
+  assert.match(plain[2], /^To send an image or file/)
+  assert.equal(/not addressed to you/.test(plain.join('\n')), false)
 
-  const silent = (await bodyFor('mentioned')).split('\n')
-  assert.equal(
-    silent[3],
-    'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.'
-  )
-  assert.match(silent[2], /^To send an image or file/)
-  assert.equal(isTelegramOriginatedUserMessage(silent.join('\n')), true)
-  assert.equal(silent.at(-1), 'status?')
+  // Context only: no "sent back" promise and no attachment syntax.
+  const silent = await bodyFor('mentioned')
+  const silentLines = silent.split('\n')
+  assert.match(silentLines[1], /^This group message was not addressed to you\. Read it for context only/)
+  assert.equal(/will be sent back|To send an image or file/.test(silent), false)
+  assert.equal(isTelegramOriginatedUserMessage(silent), true)
+  assert.equal(silentLines.at(-1), 'status?')
 
   const helpful = (await bodyFor('helpful')).split('\n')
-  assert.equal(
-    helpful[3],
-    'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.'
-  )
+  assert.match(helpful[1], /^This group message was not addressed to you\. Reply only if you can clearly help/)
+  assert.match(helpful[2], /^To send an image or file/)
+  assert.equal(/will be sent back/.test(helpful.join('\n')), false)
 })
 
 test('getOrcaBinary uses orca-ide on Linux, never the GNOME screen reader', () => {

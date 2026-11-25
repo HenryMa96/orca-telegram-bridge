@@ -172,12 +172,12 @@ Groups are off for a new bridge. Choose per bridge in the Setup tab → the brid
 - **Off**: the bot ignores group messages. If someone adds it to a group, it leaves the group at once and the Logs tab says so.
 - **Only messages for the bot**: commands addressed to it (`/help@yourbot`), replies to its messages and, with privacy mode off, `@yourbot` mentions. The mention is removed before the text goes to the Orca bot. Normal conversation in the group is ignored.
 - **All messages**: every message an allowed person writes in the group goes to the Orca bot, so it follows the whole conversation. One more choice appears, **Replies**:
-  - **Only when mentioned** (default): the bot answers only messages for it (mention, reply, command). Other messages only give it context; the bridge never posts an answer to them.
+  - **Only when addressed** (default for a new bridge): the bot answers only messages for it (a mention, a reply to the bot, a command for it). Other messages only give it context; the bridge never posts an answer to them.
   - **When it can help**: the bot may also answer a message not addressed to it, when it can clearly help; otherwise it stays silent (`NO_REPLY`).
 
   Each group message starts one Orca bot turn, so a busy group costs more. Messages not addressed to the bot never get a typing indicator or an error line in the group; problems go to the Logs tab. **All messages** works only with **Only these people and groups**; while the bridge is open to everyone, the bot reads only messages for it, so strangers in a busy group cannot start an Orca run with every line.
 
-A bridge updated from 0.4.0 or older starts with **Only messages for the bot**, the behavior it had before.
+A bridge updated from 0.4.0 or older starts with **Only messages for the bot**, the behavior it had before. A bridge that already used **All messages** before 0.8.0 starts with **When it can help**, so it keeps answering in the group; choose **Only when addressed** to make it answer only messages for it.
 
 Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; after the bot has connected once, the bridge's editor warns under **Groups** when one of them blocks the option you chose:
 

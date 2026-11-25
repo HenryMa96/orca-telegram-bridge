@@ -420,7 +420,13 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
     replyLanguage: normalizeLanguage(raw.replyLanguage),
     allowGroups: typeof raw.allowGroups === 'boolean' ? raw.allowGroups : true,
     groupMode: raw.groupMode === 'all' ? 'all' : 'addressed',
-    groupReply: raw.groupReply === 'helpful' ? 'helpful' : 'mentioned',
+    // Before 0.8.0, 'all' answered every group message; such a bridge keeps answering ('helpful').
+    groupReply:
+      raw.groupReply === 'helpful' || raw.groupReply === 'mentioned'
+        ? raw.groupReply
+        : raw.groupMode === 'all'
+          ? 'helpful'
+          : 'mentioned',
     voiceEnabled: typeof raw.voiceEnabled === 'boolean' ? raw.voiceEnabled : false,
     voiceProvider: raw.voiceProvider === 'openai' ? 'openai' : 'openrouter',
     voiceModel: text(raw.voiceModel)

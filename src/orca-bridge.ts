@@ -716,12 +716,13 @@ function findRequestReply(
     .filter((e) => e.kind === 'message' && e.role === 'assistant' && e.text?.trim())
 }
 
-// The extra handoff line for a group message not addressed to the bot (groupMode 'all').
+// The reply rule for a group message not addressed to the bot (groupMode 'all'); it replaces the
+// usual "will be sent back" line.
 const UNADDRESSED_GROUP_LINES: Record<GroupReply, string> = {
   mentioned:
-    'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY.',
+    'This group message was not addressed to you. Read it for context only and do not reply: answer exactly NO_REPLY. Nothing you write is sent to Telegram.',
   helpful:
-    'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY.'
+    'This group message was not addressed to you. Reply only if you can clearly help with it; otherwise answer exactly NO_REPLY. A reply is sent back to the group (use standard Markdown tables; avoid wide ASCII box tables).'
 }
 
 export async function dispatchToOrcaBotAndWait(
@@ -762,16 +763,23 @@ export async function dispatchToOrcaBotAndWait(
   const preview = previewBase.replace(/\s+/g, ' ').trim().slice(0, 40)
   const subject = targetChatId === 'new' ? `Telegram: ${preview}` : `Telegram reply: ${preview}`
   const requestMarker = `[tg:${params.tgChatId}:${Date.now()}]`
+  const groupReply = params.unaddressedGroupReply
   const bodyParts = [
     // Not "owner": with open access and groups the sender can be anyone, and the Orca bot must not
     // give them the owner's trust.
     `Telegram message from user (${params.senderLabel}, chat ${params.tgChatId}) ${requestMarker}.`,
-    'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).',
-    'To send an image or file to the Telegram user, put it on its own line as Markdown ![short caption](absolute local path or https URL); wrap a path with spaces in <>. Images: PNG, JPEG, GIF, WEBP (up to 10 MB). Documents: PDF, CSV, TSV, TXT, MD and Office/OpenDocument files (up to 50 MB).'
+    // A group message not addressed to the bot gets its group rule instead of "will be sent back",
+    // so the two never contradict each other.
+    groupReply
+      ? UNADDRESSED_GROUP_LINES[groupReply]
+      : 'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).',
+    // Nothing goes back for a context-only message, so it does not need the attachment syntax.
+    ...(groupReply === 'mentioned'
+      ? []
+      : [
+          'To send an image or file to the Telegram user, put it on its own line as Markdown ![short caption](absolute local path or https URL); wrap a path with spaces in <>. Images: PNG, JPEG, GIF, WEBP (up to 10 MB). Documents: PDF, CSV, TSV, TXT, MD and Office/OpenDocument files (up to 50 MB).'
+        ])
   ]
-  if (params.unaddressedGroupReply) {
-    bodyParts.push(UNADDRESSED_GROUP_LINES[params.unaddressedGroupReply])
-  }
   if (imagePaths.length > 0) {
     bodyParts.push(
       '',
