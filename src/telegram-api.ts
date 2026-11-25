@@ -221,7 +221,8 @@ export function resolveProxyUrl(explicitProxy?: string): string | undefined {
 
 // Antivirus HTTPS scanning (e.g. Kaspersky), VPNs and corporate proxies re-sign TLS with a root
 // that the OS trusts but Node's bundled list does not ("self-signed certificate in certificate
-// chain"). Trust both lists, as browsers do; certificates are still verified.
+// chain"). Transcription calls trust both lists; certificates are still verified. Telegram calls
+// keep Node's list on purpose: they carry the bot token, which such a root could otherwise read.
 let trustedCa: string[] | null | undefined
 export function trustedCaCertificates(): string[] | undefined {
   if (trustedCa === undefined) {
@@ -239,7 +240,13 @@ export function trustedCaCertificates(): string[] | undefined {
   return trustedCa ?? undefined
 }
 
-export function createProxyAgent(proxyUrl: string, timeoutMs: number, signal?: AbortSignal): https.Agent {
+// `ca` replaces Node's list for the tunnelled TLS; absent keeps Node's default.
+export function createProxyAgent(
+  proxyUrl: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  ca?: string[]
+): https.Agent {
   const parsed = new URL(proxyUrl)
   // Only plain-HTTP CONNECT is implemented; an https:// or socks proxy would get raw TCP and fail obscurely.
   if (parsed.protocol !== 'http:') {
@@ -311,7 +318,7 @@ export function createProxyAgent(proxyUrl: string, timeoutMs: number, signal?: A
         const tlsSocket = tls.connect({
           socket,
           servername: targetHost,
-          ca: trustedCaCertificates()
+          ca
         })
         tlsSocket.once('error', (err) => done(err))
         done(null, tlsSocket)
@@ -415,7 +422,6 @@ async function sendTelegramHttp<T>(
         path: `/bot${token}/${method}`,
         method: httpMethod,
         agent,
-        ca: trustedCaCertificates(),
         headers
       },
       (res) => {
@@ -530,8 +536,7 @@ async function downloadTelegramFileBytes(
         port: 443,
         path: `/file/bot${token}/${cleanPath}`,
         method: 'GET',
-        agent,
-        ca: trustedCaCertificates()
+        agent
       },
       (res) => {
         const status = res.statusCode ?? 0

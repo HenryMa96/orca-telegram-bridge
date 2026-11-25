@@ -118,7 +118,7 @@ export function transcribeAudio(params: TranscribeParams): Promise<string> {
     }
     let agent: https.Agent | undefined
     try {
-      agent = proxyUrl ? createProxyAgent(proxyUrl, timeoutMs, signal) : undefined
+      agent = proxyUrl ? createProxyAgent(proxyUrl, timeoutMs, signal, trustedCaCertificates()) : undefined
     } catch (err) {
       reject(new TranscriptionError(err instanceof Error ? err.message : String(err), 0))
       return
