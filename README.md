@@ -174,7 +174,7 @@ Removing an ID stops the bot from answering that person or group, and stops sync
 
 Each bridge has its own roles (Setup tab → the bridge's **Edit** → **Roles**). A role has:
 
-- **What it may do**, one checkbox each: chat with the bot, `/status`, `/bots`, `/new`, `/home` and `/chats` + `/bind` (each separately **in private** and **in groups**, so a teammate can start a fresh private chat without resetting the group's shared chat), `/rename`, `/sync`, `/automations` and `/run`. With `/run`, choose **All** automations or **Only these**. `/help` always works and lists only what the role may do; the `/` menu each person sees follows their role too.
+- **What it may do**, one checkbox each: chat with the bot, `/status`, `/bots`, `/new`, `/home` and `/chats` + `/bind` (each separately **in private** and **in groups**, so a teammate can start a fresh private chat without resetting the group's shared chat), `/rename`, `/sync`, `/automations`, `/run`, and **See error details** (the [Details] button under a failed answer, in private chats). With `/run`, choose **All** automations or **Only these**. `/help` and `/status` always work, list only what the role may do, and show the bound chat and sync state only to roles that may change them; the `/` menu each person sees follows their role too.
 - **An extra prompt for the Orca bot**, added to every message from people with that role, for example "Finance user: read-only, answer in plain Spanish". It is a hint to the bot, not a lock: only the checkboxes are enforced by the bridge. People never see it.
 
 Three roles come built in: **Full access** (everything), **Member** (chat, `/status`, `/new` in their own private chat) and **Stranger** (for **Anyone on Telegram**; it can never get the risky commands). Add your own with **Add role**, or **Copy roles from** another bridge.
@@ -248,6 +248,13 @@ The plugin tells the Orca bot about this in every message, takes those lines out
 **Files from your computer are sent only when the bridge is restricted** to [Only these people and groups](#who-can-talk-to-the-bot). While the bot is open to everyone, a file reference gets a short "only when restricted" line instead, so a stranger cannot ask the bot for your files; https links still work. The same rule already applies to Orca → Telegram sync and to the group **Follows the conversation** options.
 
 Even when restricted, the Orca bot reads files with your rights, and an allowed person can ask it for one. The plugin always refuses files in credential folders (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.config/gcloud`) and `.env` files, even through a shortcut or link, and sends only the image and document types above. Allow only people you trust if the bot can see private documents.
+
+## Long answers and errors
+
+- **Working line**: when the Orca bot takes more than 20 seconds, the chat gets one "⏳ Working… 20s" message that counts up (edited, not repeated). It is removed as soon as the answer, or nothing (`NO_REPLY`), comes back. Group lines that did not call the bot never get one.
+- **Plain errors**: a failed answer is one line in the chat's language, without technical text: the bot is still working and went past the wait time, Orca could not be reached on the computer, or something went wrong. The technical cause stays in the **Logs** tab.
+- **[Details]**: in a private chat, people whose role has **See error details** can see the technical cause (tokens masked).
+- **[Try again]**: shown only when the message surely never reached the Orca bot (the Orca command could not even start). Orca cannot cancel a running answer, so after a timeout or any later failure there is no Try again: the first run may still be going, and a second could repeat an action. Only the person who sent the message can tap it, within 30 minutes.
 
 ## Telegram Commands
 

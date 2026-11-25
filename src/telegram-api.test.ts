@@ -154,6 +154,32 @@ test('getUpdates asks for membership changes and leaveChat posts the chat id', a
   assert.deepEqual(JSON.parse(leave.body), { chat_id: -100500 })
 })
 
+// The working line is edited and deleted by id; a misspelled field would leave it in the chat.
+test('editMessageText and deleteMessage send the chat and message ids as Telegram expects them', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(
+        req.path.endsWith('/editMessageText')
+          ? JSON.stringify({ ok: true, result: { message_id: 77, date: 1, chat: { id: -100500, type: 'supergroup' } } })
+          : JSON.stringify({ ok: true, result: true })
+      )
+    },
+    async (proxyUrl) => {
+      const edited = await client.editMessageText(TOKEN, { chatId: -100500, messageId: 77, text: '⏳ Working… 35s' }, { proxyUrl })
+      assert.equal(edited.message_id, 77)
+      assert.equal(await client.deleteMessage(TOKEN, -100500, 77, { proxyUrl }), true)
+    }
+  )
+  const [edit, removed] = requests
+  assert.match(edit.path, /\/bot123456:TEST_TOKEN\/editMessageText$/)
+  assert.deepEqual(JSON.parse(edit.body), { chat_id: -100500, message_id: 77, text: '⏳ Working… 35s' })
+  assert.match(removed.path, /\/bot123456:TEST_TOKEN\/deleteMessage$/)
+  assert.deepEqual(JSON.parse(removed.body), { chat_id: -100500, message_id: 77 })
+})
+
 // Telegram ignores unknown fields, so a misspelled language_code would quietly drop the per-language menus.
 test('setMyCommands sends language_code only for a language menu', async () => {
   const requests: FakeRequest[] = []

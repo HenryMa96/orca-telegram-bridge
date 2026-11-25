@@ -16,6 +16,8 @@ export type RolePermission =
   | 'sync'
   | 'automations'
   | 'run'
+  // [Details] under a failed answer, in a private chat: the technical cause (token masked).
+  | 'errorDetails'
 
 export const ROLE_PERMISSIONS: readonly RolePermission[] = [
   'chat',
@@ -30,7 +32,8 @@ export const ROLE_PERMISSIONS: readonly RolePermission[] = [
   'rename',
   'sync',
   'automations',
-  'run'
+  'run',
+  'errorDetails'
 ]
 
 export type BridgeRole = {
@@ -61,6 +64,7 @@ export const STRANGER_FORBIDDEN: readonly RolePermission[] = [
   'rename',
   'sync',
   'automations',
+  'errorDetails',
   'run'
 ]
 
@@ -198,6 +202,9 @@ export function permissionForCallback(data: string, isGroup: boolean): RolePermi
   if (data === 'c:home') return isGroup ? 'homeGroup' : 'homePrivate'
   if (data.startsWith('s:')) return 'sync'
   if (data.startsWith('r:')) return 'run'
+  // [Try again] re-sends a message to the Orca bot; [Details] shows a failure's technical cause.
+  if (data.startsWith('x:')) return 'chat'
+  if (data.startsWith('d:')) return 'errorDetails'
   return null
 }
 

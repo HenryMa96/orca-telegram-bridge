@@ -1,13 +1,14 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { setImmediate as nextTurn } from 'node:timers/promises'
+import { setImmediate as nextTurn, setTimeout as pause } from 'node:timers/promises'
 import { assert, hostError, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
 import type { JsonValue } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { t } from './i18n'
 import {
   computeTailHashes,
+  DispatchTimeoutError,
   extractMessageItems,
   findUnsyncedTail,
   isTelegramOriginatedUserMessage,
@@ -75,6 +76,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
   const triggeredAutomations: string[] = []
   const openedPanels: { pluginKey: string; panelId: string }[] = []
   const leftChats: (number | string)[] = []
+  const editedMessages: { chatId: number | string; messageId: number; text: string }[] = []
+  const deletedMessages: { chatId: number | string; messageId: number }[] = []
 
   let chats: OrcaChatSummary[] = [
     {
@@ -190,6 +193,21 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
       leftChats.push(chatId)
       return true
     },
+    async editMessageText(_token, params) {
+      outbox.push(`edit:${params.messageId}:${params.text}`)
+      editedMessages.push({ chatId: params.chatId, messageId: params.messageId, text: params.text })
+      return {
+        message_id: params.messageId,
+        chat: { id: Number(params.chatId), type: 'private' },
+        date: Math.floor(Date.now() / 1000),
+        text: params.text
+      }
+    },
+    async deleteMessage(_token, chatId, messageId) {
+      outbox.push(`delete:${messageId}`)
+      deletedMessages.push({ chatId, messageId })
+      return true
+    },
     ...overrides.telegram
   }
 
@@ -295,7 +313,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     renamedChats,
     triggeredAutomations,
     openedPanels,
-    leftChats
+    leftChats,
+    editedMessages,
+    deletedMessages
   }
 }
 
@@ -402,7 +422,7 @@ for (const scenario of ['no Orca bots found', 'Orca bots found'] as const) {
       await within(controller.handleIncomingUpdate(textUpdate(681159817, 555000111, 'oi')), 'first message')
       assert.deepEqual(host.refusals, [])
       const lastReply = deps.sentMessages.at(-1)?.text ?? ''
-      assert.equal(lastReply.startsWith(t('en').processingFailed('')), false)
+      assert.equal([t('en').errorGeneric, t('en').errorOrcaUnreachable, t('en').errorTimeout].includes(lastReply), false)
       if (scenario === 'no Orca bots found') assert.equal(lastReply, t('en').noBotsAvailable)
     } finally {
       await within(controller.dispose(), 'dispose')
@@ -1382,8 +1402,8 @@ test('with Auto, two chats handled side by side each get the bridge texts in the
     releaseA.resolve()
     await within(failedA.promise, 'chat 111 answered after its bot fails')
     const textOf = (chatId: string) => deps.sentMessages.find((m) => String(m.chatId) === chatId)?.text ?? ''
-    assert.match(textOf('222'), /^Error al procesar: /)
-    assert.match(textOf('111'), /^Falha no processamento: /)
+    assert.equal(textOf('222'), t('es').errorGeneric)
+    assert.equal(textOf('111'), t('pt-BR').errorGeneric)
   } finally {
     releaseA.resolve()
     await within(controller.dispose(), 'dispose')
@@ -1548,7 +1568,7 @@ test('saving settings that do not touch the connection keeps an in-flight reply 
     release.resolve()
     await within(replied.promise, 'the reply to reach Telegram')
     assert.equal(deps.sentMessages[0].text, 'Reply #1 from Assistant')
-    assert.ok(!deps.sentMessages.some((m) => m.text.startsWith('Processing failed')))
+    assert.ok(!deps.sentMessages.some((m) => m.text === t('en').errorGeneric))
   } finally {
     release.resolve()
     await controller.dispose()
@@ -1581,7 +1601,9 @@ test('an Orca CLI failure in /home or a Home button answers the user and keeps p
   const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await within(replied.promise, 'an error reply to /home')
-    assert.match(deps.sentMessages[0].text, /Processing failed: orca bot chats failed/)
+    // A plain line, never the CLI's own text; the command never reached the Orca bot, so it may be retried.
+    assert.equal(deps.sentMessages[0].text, t('en').errorGeneric)
+    assert.match(deps.sentMessages[0].replyMarkup?.inline_keyboard[0][0].callback_data ?? '', /^x:/)
     assert.equal(controller.view().status, 'connected')
     assert.equal(controller.view().lastError, null)
 
@@ -1879,7 +1901,7 @@ test('a failing orca CLI call shows its args, exit code and stderr in the panel 
     assert.match(entry.details ?? '', /bot=Assistant/)
     assert.match(entry.details ?? '', /elapsedMs=\d+/)
     // The user is still told it failed.
-    assert.match(deps.sentMessages.at(-1)?.text ?? '', /Processing failed/)
+    assert.equal(deps.sentMessages.at(-1)?.text, t('en').errorOrcaUnreachable)
   } finally {
     await worker.deactivate()
   }
@@ -1914,7 +1936,7 @@ test('the bot token never reaches log messages, details, storage, orca.log or th
     assert.match(surfaces.state, /bot<redacted>/)
     assert.match(surfaces.export, /bot<redacted>/)
     const reply = deps.sentMessages.at(-1)?.text ?? ''
-    assert.match(reply, /^Processing failed: /)
+    assert.equal(reply, t('en').errorGeneric)
     assert.ok(!reply.includes(REAL_TOKEN) && !reply.includes('bot123:ABC'), 'the Telegram reply holds the token')
   } finally {
     await worker.deactivate()
@@ -2242,22 +2264,22 @@ test("Auto keeps each chat's language: English until one is seen, then that one,
   await run(first, async (send) => {
     // Nothing known yet, and no Telegram language: English.
     await send(update(1, 777888, 'please fail'))
-    assert.match(lastTo(first, '777888'), /^Processing failed: /)
+    assert.equal(lastTo(first, '777888'), t('en').errorGeneric)
     // A Spanish Telegram app: the chat's language from now on, and the bot is told.
     await send(update(2, 777888, 'hola', 'es'))
     assert.ok(first.sentToBots.at(-1)?.body.includes('answer in Spanish.'))
     // A later message without a Telegram language keeps Spanish.
     await send(update(3, 777888, 'please fail'))
-    assert.match(lastTo(first, '777888'), /^Error al procesar: /)
+    assert.equal(lastTo(first, '777888'), t('es').errorGeneric)
   })
 
   const afterRestart = failingDeps()
   await run(afterRestart, async (send) => {
     await send(update(4, 777888, 'please fail'))
-    assert.match(lastTo(afterRestart, '777888'), /^Error al procesar: /)
+    assert.equal(lastTo(afterRestart, '777888'), t('es').errorGeneric)
     // Another chat starts in English.
     await send(update(5, 555, 'please fail'))
-    assert.match(lastTo(afterRestart, '555'), /^Processing failed: /)
+    assert.equal(lastTo(afterRestart, '555'), t('en').errorGeneric)
   })
 })
 
@@ -4375,4 +4397,321 @@ test('menus: a default menu per access mode, one per assigned id, and a removed 
     await controller.dispose()
     await worker.deactivate()
   }
+})
+
+// Waits on real timers (the working line runs on them), a few ms at a time, for at most 2 s.
+async function eventually(ready: () => boolean, label: string): Promise<void> {
+  for (let waited = 0; waited < 2000; waited += 2) {
+    if (ready()) return
+    await pause(2)
+  }
+  throw new Error(`Gave up waiting for ${label}`)
+}
+
+// A bridge stored with the default roles (plus `config`) whose working line shows after 5 ms and is
+// edited every 5 ms. `prepare` changes the mocks before the bridge starts.
+async function withWorkingLine(
+  config: Record<string, JsonValue>,
+  prepare: (deps: ReturnType<typeof makeMockDeps>) => void,
+  run: (controller: BridgeRuntime, deps: ReturnType<typeof makeMockDeps>) => Promise<void>,
+  extra: Partial<BridgeDeps> = {}
+): Promise<void> {
+  const host = bridgesHost([{ id: 'b-working1', token: '123456:TEST_TOKEN', config: { roles: asJson(defaultRoles()), ...config } }])
+  const deps = makeMockDeps()
+  prepare(deps)
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1,
+    logFlushMs: 0,
+    workingLineAfterMs: 5,
+    workingLineEveryMs: 5,
+    ...extra
+  })
+  try {
+    await controller.testConnection()
+    await run(controller, deps)
+    assert.equal(worker.refusals.length, 0)
+  } finally {
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+}
+
+// The Orca bot's answers wait until the test calls the returned release().
+function holdAnswers(deps: ReturnType<typeof makeMockDeps>, answer?: string): () => void {
+  const released = Promise.withResolvers<void>()
+  const readSession = deps.orcaCli.readSession
+  deps.orcaCli.readSession = async (sessionId, limit) => {
+    await released.promise
+    const session = await readSession(sessionId, limit)
+    if (answer === undefined) return session
+    return {
+      ...session,
+      entries: session.entries.map((e) => (e.kind === 'message' && e.role === 'assistant' ? { ...e, text: answer } : e))
+    }
+  }
+  return () => released.resolve()
+}
+
+// The first send to the Orca bot fails as the CLI does when it cannot reach Orca; later ones work.
+function failFirstSend(deps: ReturnType<typeof makeMockDeps>, message = 'orchestration send failed'): void {
+  const sendToBot = deps.orcaCli.sendToBot
+  let failed = false
+  deps.orcaCli.sendToBot = async (params) => {
+    if (failed) return sendToBot(params)
+    failed = true
+    // The CLI never started, so the message surely never reached Orca.
+    throw new OrcaCliError(message, {
+      kind: 'spawn',
+      args: ['orchestration', 'send', '--to', 'bot:Assistant', '--chat', 'new', '--body-file', '-', '--json'],
+      durationMs: 41
+    })
+  }
+}
+
+function buttonsOf(message: { replyMarkup?: TelegramInlineKeyboardMarkup } | undefined) {
+  return (message?.replyMarkup?.inline_keyboard ?? []).flat()
+}
+
+test('a slow answer gets a working line, edited while waiting and deleted before the answer', async () => {
+  let release = () => {}
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' } },
+    (deps) => {
+      release = holdAnswers(deps)
+    },
+    async (controller, deps) => {
+      const handled = controller.handleIncomingUpdate(textUpdate(1, 777888, 'slow question'))
+      await eventually(() => deps.editedMessages.length >= 2, 'the working line edited twice')
+      const line = deps.sentMessages[0]
+      assert.match(line.text, /^⏳ Working… \d+s$/)
+      assert.equal(line.replyToMessageId, 101)
+      assert.ok(deps.editedMessages.every((e) => e.messageId === 901 && /^⏳ Working… \d+s$/.test(e.text)))
+
+      release()
+      await within(handled, 'the answer')
+      assert.deepEqual(deps.deletedMessages, [{ chatId: 777888, messageId: 901 }])
+      const deletedAt = deps.outbox.indexOf('delete:901')
+      assert.ok(deletedAt >= 0 && deletedAt < deps.outbox.indexOf('message:Reply #1 from Assistant'), deps.outbox.join('\n'))
+      assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
+    }
+  )
+})
+
+test('a fast answer gets no working line', async () => {
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' } },
+    () => {},
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 777888, 'quick question')), 'the answer')
+      assert.deepEqual(deps.sentMessages.map((m) => m.text), ['Reply #1 from Assistant'])
+      assert.equal(deps.editedMessages.length + deps.deletedMessages.length, 0)
+    },
+    { workingLineAfterMs: 1500 }
+  )
+})
+
+test('a NO_REPLY answer after the threshold deletes the working line and sends nothing else', async () => {
+  let release = () => {}
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' } },
+    (deps) => {
+      release = holdAnswers(deps, 'NO_REPLY')
+    },
+    async (controller, deps) => {
+      const handled = controller.handleIncomingUpdate(textUpdate(1, 777888, 'just so you know'))
+      await eventually(() => deps.sentMessages.length === 1, 'the working line')
+      release()
+      await within(handled, 'the quiet answer')
+      assert.deepEqual(deps.deletedMessages, [{ chatId: 777888, messageId: 901 }])
+      assert.equal(deps.sentMessages.length, 1)
+      assert.match(deps.sentMessages[0].text, /^⏳ /)
+    }
+  )
+})
+
+test('a timeout gives the plain line in the chat language, no [Try again], and [Details] for Full access', async () => {
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' }, replyLanguage: 'pt-BR' },
+    (deps) => {
+      deps.orcaCli.readSession = async () => {
+        // The working line shows first, then the reply wait passes.
+        await eventually(() => deps.sentMessages.length === 1, 'the working line')
+        throw new DispatchTimeoutError('Timed out after 300s waiting for "Assistant" to finish.')
+      }
+    },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 777888, 'long job')), 'the timeout')
+      const failure = deps.sentMessages.at(-1)
+      assert.equal(failure?.text, t('pt-BR').errorTimeout)
+      assert.deepEqual(buttonsOf(failure).map((b) => b.text), [t('pt-BR').detailsButton])
+      assert.equal(deps.deletedMessages.length, 1)
+      assert.ok(!deps.sentMessages.some((m) => m.text.includes('Timed out')))
+    }
+  )
+})
+
+test('a send that never reached the Orca bot gets [Try again]; [Details] sends the redacted cause', async () => {
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' } },
+    (deps) => failFirstSend(deps, 'orchestration send failed for bot123456:TEST_TOKEN'),
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello')), 'the failed send')
+      const failure = deps.sentMessages.at(-1)
+      assert.equal(failure?.text, t('en').errorOrcaUnreachable)
+      assert.equal(failure?.replyToMessageId, 101)
+      const buttons = buttonsOf(failure)
+      assert.deepEqual(buttons.map((b) => b.text), [t('en').retryButton, t('en').detailsButton])
+      assert.ok(!deps.sentMessages.some((m) => /not running|orchestration|TEST_TOKEN/.test(m.text)))
+      const [retry, details] = buttons.map((b) => b.callback_data)
+      assert.match(retry, /^x:/)
+      assert.equal(details.slice(2), retry.slice(2))
+
+      await within(controller.handleIncomingUpdate(buttonUpdate(2, 777888, 777888, details)), 'details')
+      assert.equal(deps.sentMessages.at(-1)?.text, 'orchestration send failed for bot<redacted>')
+      assert.equal(deps.sentMessages.at(-1)?.replyToMessageId, 101)
+
+      await within(controller.handleIncomingUpdate(buttonUpdate(3, 777888, 777888, retry)), 'retry')
+      assert.equal(deps.sentToBots.length, 1)
+      assert.equal(lastBodyLine(deps), 'hello')
+      assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
+
+      // Used up: a second tap does not send it again.
+      await within(controller.handleIncomingUpdate(buttonUpdate(4, 777888, 777888, retry)), 'second retry')
+      assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').retryExpired)
+      assert.equal(deps.sentToBots.length, 1)
+    }
+  )
+})
+
+test('a failure after the Orca bot got the message has no [Try again]', async () => {
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' } },
+    (deps) => {
+      deps.orcaCli.readSession = async () => {
+        throw new Error('session read broke')
+      }
+    },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello')), 'the failure')
+      assert.equal(deps.sentToBots.length, 1)
+      const failure = deps.sentMessages.at(-1)
+      assert.equal(failure?.text, t('en').errorGeneric)
+      assert.deepEqual(buttonsOf(failure).map((b) => b.text), [t('en').detailsButton])
+    }
+  )
+})
+
+// A CLI that timed out while sending may still have delivered the message; retrying could run it twice.
+test('a send that timed out has no [Try again]: the Orca bot may have the message', async () => {
+  await withWorkingLine(
+    { roleAssignments: { '777888': 'full' } },
+    (deps) => {
+      deps.orcaCli.sendToBot = async () => {
+        throw new OrcaCliError('Orca CLI timed out after 30000ms', {
+          kind: 'timeout',
+          args: ['orchestration', 'send', '--to', 'bot:Assistant', '--chat', 'new', '--body-file', '-', '--json'],
+          durationMs: 30000
+        })
+      }
+    },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 777888, 'restart the payout worker')), 'the timed-out send')
+      const failure = deps.sentMessages.at(-1)
+      assert.equal(failure?.text, t('en').errorOrcaUnreachable)
+      assert.deepEqual(buttonsOf(failure).map((b) => b.text), [t('en').detailsButton])
+    }
+  )
+})
+
+test('in a group only the sender may retry, and there is no [Details]', async () => {
+  await withWorkingLine(
+    { allowedUserIds: `${GROUP_ID}, 42`, roleAssignments: { [String(GROUP_ID)]: 'member', '42': 'full' } },
+    (deps) => failFirstSend(deps),
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(groupUpdate(1, 42, '@demo_orca_bot hello')), 'the failed send')
+      const failure = deps.sentMessages.at(-1)
+      assert.equal(failure?.chatId, GROUP_ID)
+      assert.equal(failure?.text, t('en').errorOrcaUnreachable)
+      const buttons = buttonsOf(failure)
+      assert.deepEqual(buttons.map((b) => b.text), [t('en').retryButton])
+      const retry = buttons[0].callback_data
+
+      // 555 is a Member here, a role with chat, but did not ask.
+      await within(controller.handleIncomingUpdate(buttonUpdate(2, 555, GROUP_ID, retry)), 'retry by another member')
+      assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').retryOnlySender)
+      assert.equal(deps.sentToBots.length, 0)
+
+      // A made-up [Details] for the same failure is refused in a group, even for Full access.
+      await within(controller.handleIncomingUpdate(buttonUpdate(3, 42, GROUP_ID, `d:${retry.slice(2)}`)), 'details in a group')
+      assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').notAllowedForRole)
+
+      await within(controller.handleIncomingUpdate(buttonUpdate(4, 42, GROUP_ID, retry)), 'retry by the sender')
+      assert.equal(deps.sentToBots.length, 1)
+      assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
+      assert.equal(deps.sentMessages.at(-1)?.chatId, GROUP_ID)
+    }
+  )
+})
+
+test('a Member gets no [Details], and [Try again] expires', async () => {
+  await withWorkingLine(
+    { allowedUserIds: '42', roleAssignments: { '42': 'member' } },
+    (deps) => failFirstSend(deps),
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 42, 'hello')), 'the failed send')
+      const buttons = buttonsOf(deps.sentMessages.at(-1))
+      assert.deepEqual(buttons.map((b) => b.text), [t('en').retryButton])
+      const id = buttons[0].callback_data.slice(2)
+
+      await within(controller.handleIncomingUpdate(buttonUpdate(2, 42, 42, `d:${id}`)), 'made-up details')
+      assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').notAllowedForRole)
+
+      await within(controller.handleIncomingUpdate(buttonUpdate(3, 42, 42, `x:${id}`)), 'expired retry')
+      assert.equal(deps.answeredCallbacks.at(-1)?.text, t('en').retryExpired)
+      assert.equal(deps.sentToBots.length, 0)
+      assert.equal(deps.sentMessages.length, 1)
+    },
+    // No working line here, however slow the host, so the failure is the only message.
+    { failedAnswerTtlMs: 0, workingLineAfterMs: 60_000 }
+  )
+})
+
+test('an unaddressed group line gets no working line and no error message', async () => {
+  await withWorkingLine(
+    { allowedUserIds: `${GROUP_ID}, 42`, groupMode: 'all', roleAssignments: { [String(GROUP_ID)]: 'member', '42': 'full' } },
+    (deps) => {
+      deps.orcaCli.readSession = async () => {
+        // No line can only be shown by letting the 5 ms threshold pass; the bridge's timers are real.
+        await pause(30)
+        throw new DispatchTimeoutError('Timed out after 300s waiting for "Assistant" to finish.')
+      }
+    },
+    async (controller, deps) => {
+      await within(controller.handleIncomingUpdate(groupUpdate(1, 42, 'just chatting among us')), 'the unaddressed line')
+      assert.equal(deps.sentToBots.length, 1)
+      assert.equal(deps.sentMessages.length + deps.editedMessages.length + deps.deletedMessages.length, 0)
+    }
+  )
+})
+
+test('/help and /status show the bound chat id only with bind and the sync state only with sync', async () => {
+  await withRoles({ allowedUserIds: '42, 43', roleAssignments: { '42': 'member', '43': 'full' } }, async (controller, deps) => {
+    await within(controller.handleIncomingUpdate(textUpdate(1, 42, '/help')), 'Member /help')
+    const member = deps.sentMessages.at(-1)?.text ?? ''
+    assert.ok(member.includes('Current bot: Assistant'), member)
+    assert.ok(!member.includes('Current chat') && !member.includes('Two-way sync'), member)
+    await within(controller.handleIncomingUpdate(textUpdate(2, 42, '/status')), 'Member /status')
+    const memberStatus = deps.sentMessages.at(-1)?.text ?? ''
+    assert.ok(memberStatus.includes('Target Orca bot: Assistant'), memberStatus)
+    assert.ok(!memberStatus.includes('Bound chat ID') && !memberStatus.includes('Two-way sync'), memberStatus)
+
+    await within(controller.handleIncomingUpdate(textUpdate(3, 43, '/help')), 'Full /help')
+    const full = deps.sentMessages.at(-1)?.text ?? ''
+    assert.ok(full.includes('Current chat') && full.includes('Two-way sync (Orca -> TG): off'), full)
+    await within(controller.handleIncomingUpdate(textUpdate(4, 43, '/status')), 'Full /status')
+    const fullStatus = deps.sentMessages.at(-1)?.text ?? ''
+    assert.ok(fullStatus.includes('Bound chat ID') && fullStatus.includes('Two-way sync (Orca -> TG): off'), fullStatus)
+  })
 })

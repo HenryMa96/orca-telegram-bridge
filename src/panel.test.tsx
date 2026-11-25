@@ -1556,7 +1556,7 @@ test('roles: a ticked permission and the prompt are saved; Full and Stranger loc
   assert.ok(view.find({ text: PROMPT_HELPER }))
 
   await view.toggle({ type: 'Collapsible', label: 'Stranger' })
-  for (const p of ['bots', 'newGroup', 'homePrivate', 'homeGroup', 'bindPrivate', 'bindGroup', 'rename', 'sync', 'automations', 'run']) {
+  for (const p of ['bots', 'newGroup', 'homePrivate', 'homeGroup', 'bindPrivate', 'bindGroup', 'rename', 'sync', 'automations', 'run', 'errorDetails']) {
     const box = view.find({ testId: `perm:stranger:${p}` })
     assert.ok(box, p)
     assert.equal(box.disabled, true, p)

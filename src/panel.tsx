@@ -165,7 +165,8 @@ const PERMISSION_LABEL: Record<RolePermission, string> = {
   rename: '/rename',
   sync: '/sync',
   automations: '/automations',
-  run: '/run'
+  run: '/run',
+  errorDetails: 'See error details (private chats)'
 }
 const RUN_SCOPE_OPTIONS = [
   { value: 'all', label: 'All' },

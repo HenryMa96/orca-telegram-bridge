@@ -237,6 +237,18 @@ export interface TelegramClient {
     options?: TelegramRequestOptions
   ): Promise<Buffer>
   leaveChat(token: string, chatId: number | string, options?: TelegramRequestOptions): Promise<boolean>
+  // Replaces the text of a message the bot sent; its buttons are dropped.
+  editMessageText(
+    token: string,
+    params: { chatId: number | string; messageId: number; text: string },
+    options?: TelegramRequestOptions
+  ): Promise<TelegramMessage>
+  deleteMessage(
+    token: string,
+    chatId: number | string,
+    messageId: number,
+    options?: TelegramRequestOptions
+  ): Promise<boolean>
 }
 
 export function resolveProxyUrl(explicitProxy?: string): string | undefined {
@@ -843,6 +855,17 @@ export function createTelegramClient(): TelegramClient {
     },
     leaveChat(token, chatId, options) {
       return callTelegramApi<boolean>(token, 'leaveChat', { chat_id: chatId }, options)
+    },
+    editMessageText(token, params, options) {
+      return callTelegramApi<TelegramMessage>(
+        token,
+        'editMessageText',
+        { chat_id: params.chatId, message_id: params.messageId, text: params.text },
+        options
+      )
+    },
+    deleteMessage(token, chatId, messageId, options) {
+      return callTelegramApi<boolean>(token, 'deleteMessage', { chat_id: chatId, message_id: messageId }, options)
     }
   }
 }

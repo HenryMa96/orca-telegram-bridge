@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -18,6 +19,7 @@ import {
   computeTailHashes,
   createOrcaCliRunner,
   dispatchToOrcaBotAndWait,
+  DispatchTimeoutError,
   extractMessageItems,
   findUnsyncedTail,
   getOrcaBinary,
@@ -130,6 +132,11 @@ const AUTOMATION_RUN_WINDOW_MS = 24 * 60 * 60 * 1000
 // Clicking through bots in Orca's sidebar asks for the focused bot each time; the workspace list
 // is reused this long so fast clicking does not ask Orca for it again and again.
 const WORKSPACE_LIST_CACHE_MS = 5000
+// A slow answer gets a "⏳ Working…" line after this long, edited at most this often while it lasts.
+const WORKING_LINE_AFTER_MS = 20_000
+const WORKING_LINE_EVERY_MS = 15_000
+// How long a failed answer's [Try again] and [Details] keep working; in memory only.
+const FAILED_ANSWER_TTL_MS = 30 * 60 * 1000
 
 // A chat entry may differ from the stored prompt in line endings and outer whitespace.
 function normalizePrompt(text: string): string {
@@ -168,6 +175,10 @@ export type BridgeDeps = {
   logFlushMs?: number
   // Speech-to-text for voice messages; tests inject a fake.
   transcribe?: Transcriber
+  // The working line's delay and edit interval, and how long a failure's buttons work (tests).
+  workingLineAfterMs?: number
+  workingLineEveryMs?: number
+  failedAnswerTtlMs?: number
 }
 
 type IncomingTelegramImage = {
@@ -316,7 +327,21 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 type ErrorContext = Record<string, string | number | boolean | null | undefined>
 type DispatchParams = Parameters<typeof dispatchToOrcaBotAndWait>[1]
 type DispatchResult = Awaited<ReturnType<typeof dispatchToOrcaBotAndWait>>
-type DispatchStats = { startedAt: number; polls: number; lastState?: string }
+// `sent` turns true once sendToBot resolved: from then on the Orca bot has the message.
+type DispatchStats = { startedAt: number; polls: number; lastState?: string; sent?: boolean }
+
+// A failed answer remembered for its [Try again] and [Details] buttons, in memory only.
+type FailedAnswer = {
+  msg: TelegramMessage
+  senderId: string
+  updateId: number
+  // Sends the same message (text or transcript, image paths) again. Absent when it may have reached
+  // the Orca bot: its turn may still be running, and a second run could repeat a risky request.
+  rerun?: (signal: AbortSignal | undefined) => Promise<void>
+  // The technical cause for [Details], redacted and truncated as the reply used to show it.
+  detail: string
+  expiresAt: number
+}
 type AutomationSnapshot = { runs: OrcaAutomationRun[]; automations: OrcaAutomationSummary[] }
 
 function indentLines(text: string): string {
@@ -611,7 +636,15 @@ function traceTelegram(client: TelegramClient, tracer: Tracer): TelegramClient {
         (bytes) => `${bytes.length} bytes`
       ),
     leaveChat: (token, chatId, options) =>
-      trace(`leaveChat chat=${chatId}`, () => client.leaveChat(token, chatId, options))
+      trace(`leaveChat chat=${chatId}`, () => client.leaveChat(token, chatId, options)),
+    editMessageText: (token, params, options) =>
+      trace(`editMessageText chat=${params.chatId} message=${params.messageId} ${params.text.length} chars`, () =>
+        client.editMessageText(token, params, options)
+      ),
+    deleteMessage: (token, chatId, messageId, options) =>
+      trace(`deleteMessage chat=${chatId} message=${messageId}`, () =>
+        client.deleteMessage(token, chatId, messageId, options)
+      )
   }
 }
 
@@ -714,6 +747,10 @@ export class BridgeRuntime {
   // Failures retried every few seconds (sync ticks, secrets, command menu) by site:
   // logged once until their message changes or the call succeeds again.
   private readonly lastFailures = new Map<string, string>()
+  // Failed answers by the id in their buttons' callback data (x:<id>, d:<id>).
+  private readonly failedAnswers = new Map<string, FailedAnswer>()
+  // Chats already warned that a working line could not be deleted.
+  private readonly workingLineWarned = new Set<string>()
 
   constructor(manager: BridgeManager, stored: StoredBridge) {
     this.manager = manager
@@ -1190,24 +1227,14 @@ export class BridgeRuntime {
         }
         await this.processAuthorizedMessage(msg, text, image, signal, update.update_id, false, unaddressed)
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        await this.appendLog(
-          'error',
-          'bridge',
-          `Failed handling Telegram message in chat ${tgChatId}: ${message}`,
-          describeError(err, { tgChatId, updateId: update.update_id, messageId: msg.message_id })
-        )
-        this.emitState()
-        if (unaddressed) return
-        const token = await this.readToken()
-        if (token) {
-          await this.safeSendTelegram(
-            token,
-            msg.chat.id,
-            this.i18n.processingFailed(truncateText(this.redact(message), MAX_DETAIL_CHARS)),
-            msg.message_id
-          )
-        }
+        // Everything after the Orca bot got the message is answered inside processAuthorizedMessage,
+        // so what lands here never reached it and may be sent again.
+        const rerun = unsupportedImage
+          ? undefined
+          : voice
+          ? (s: AbortSignal | undefined) => this.processVoiceMessage(msg, voice, text, s, update.update_id)
+          : (s: AbortSignal | undefined) => this.processAuthorizedMessage(msg, text, image, s, update.update_id)
+        await this.messageFailed(err, msg, update.update_id, unaddressed, rerun)
       }
     })
     return { done }
@@ -1258,6 +1285,10 @@ export class BridgeRuntime {
       return null
     }
 
+    if (data.startsWith('x:') || data.startsWith('d:')) {
+      return this.acceptFailureButton(token, cq, cq.message.chat, data)
+    }
+
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
         await this.processCallbackQuery(token, cq)
@@ -1274,6 +1305,129 @@ export class BridgeRuntime {
       }
     })
     return { done }
+  }
+
+  // [Try again] (x:) sends the failed message again, for its sender only; [Details] (d:) shows the
+  // cause, in a private chat only. Both act at once, not behind a slow answer in the chat's queue,
+  // and answer "expired" once the failure is forgotten.
+  private async acceptFailureButton(
+    token: string,
+    cq: TelegramCallbackQuery,
+    chat: TelegramChat,
+    data: string
+  ): Promise<{ done: Promise<void> } | null> {
+    const fromId = String(cq.from.id)
+    const tgChatId = String(chat.id)
+    this.forgetExpiredFailures()
+    const failure = this.failedAnswers.get(data.slice(2))
+    const retry = data.startsWith('x:')
+    // Ids are random, so a failure from another chat, or one with nothing to retry, is a forged tap.
+    if (!failure || String(failure.msg.chat.id) !== tgChatId || (retry && !failure.rerun)) {
+      await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.retryExpired, true)
+      return null
+    }
+    if (!retry) {
+      if (isGroupChat(chat)) {
+        await this.appendLog('info', 'bridge', `Refused button d: from ${fromId} in group ${tgChatId}: details are for private chats only.`)
+        await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.notAllowedForRole, true)
+        return null
+      }
+      await this.safeAnswerCallbackQuery(token, cq.id)
+      await this.safeSendTelegram(token, chat.id, failure.detail, failure.msg.message_id)
+      return null
+    }
+    if (failure.senderId !== fromId) {
+      await this.appendLog('info', 'bridge', `Refused button x: from ${fromId} in chat ${tgChatId}: only the sender may retry.`)
+      await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.retryOnlySender, true)
+      return null
+    }
+    const rerun = failure.rerun!
+    // Used up by this tap, so one retry runs at a time; failing again brings new buttons.
+    failure.rerun = undefined
+    await this.safeAnswerCallbackQuery(token, cq.id)
+    await this.appendLog('info', 'bridge', `Retrying message ${failure.msg.message_id} in chat ${tgChatId} for ${fromId}.`)
+    const done = this.enqueueChatWork(tgChatId, async () => {
+      try {
+        await rerun(this.pollAbort?.signal)
+      } catch (err) {
+        await this.messageFailed(err, failure.msg, failure.updateId, false, rerun)
+      }
+    })
+    return { done }
+  }
+
+  private forgetExpiredFailures(): void {
+    const now = Date.now()
+    for (const [id, failure] of this.failedAnswers) {
+      if (failure.expiresAt <= now) this.failedAnswers.delete(id)
+    }
+  }
+
+  // A failure that escaped a message's handling: logged, then answered unless the group line was
+  // not addressed to the bot.
+  private async messageFailed(
+    err: unknown,
+    msg: TelegramMessage,
+    updateId: number,
+    unaddressed: boolean,
+    rerun: FailedAnswer['rerun']
+  ): Promise<void> {
+    const tgChatId = String(msg.chat.id)
+    const message = err instanceof Error ? err.message : String(err)
+    await this.appendLog(
+      'error',
+      'bridge',
+      `Failed handling Telegram message in chat ${tgChatId}: ${message}`,
+      describeError(err, { tgChatId, updateId, messageId: msg.message_id })
+    )
+    this.emitState()
+    if (unaddressed) return
+    const token = await this.readToken()
+    if (token) await this.sendFailureLine(token, msg, updateId, err, rerun)
+  }
+
+  // One plain line by kind of failure; its technical text is only in the Logs and behind [Details]
+  // (a private chat whose sender's role has errorDetails). [Try again] only with `rerun`.
+  private async sendFailureLine(
+    token: string,
+    msg: TelegramMessage,
+    updateId: number,
+    err: unknown,
+    rerun: FailedAnswer['rerun']
+  ): Promise<void> {
+    const i18n = this.i18n
+    const line =
+      err instanceof DispatchTimeoutError
+        ? i18n.errorTimeout
+        : err instanceof OrcaCliError
+        ? i18n.errorOrcaUnreachable
+        : i18n.errorGeneric
+    const senderId = msg.from ? String(msg.from.id) : String(msg.chat.id)
+    const details = !isGroupChat(msg.chat) && roleAllows(this.roleOf(senderId, msg.chat), 'errorDetails')
+    const buttons: TelegramInlineKeyboardButton[] = []
+    if (rerun || details) {
+      this.forgetExpiredFailures()
+      const id = randomBytes(6).toString('base64url')
+      const message = err instanceof Error ? err.message : String(err)
+      this.failedAnswers.set(id, {
+        msg,
+        senderId,
+        updateId,
+        rerun,
+        detail: truncateText(this.redact(message), MAX_DETAIL_CHARS),
+        expiresAt: Date.now() + (this.deps.failedAnswerTtlMs ?? FAILED_ANSWER_TTL_MS)
+      })
+      if (rerun) buttons.push({ text: i18n.retryButton, callback_data: `x:${id}` })
+      if (details) buttons.push({ text: i18n.detailsButton, callback_data: `d:${id}` })
+    }
+    await this.safeSendTelegram(
+      token,
+      msg.chat.id,
+      line,
+      msg.message_id,
+      false,
+      buttons.length > 0 ? { inline_keyboard: [buttons] } : undefined
+    )
   }
 
   // The role that applies to this sender in this chat (rules in src/roles.ts).
@@ -1419,7 +1573,9 @@ export class BridgeRuntime {
     // A transcript is sent as is, even when it starts with '/'.
     fromVoice = false,
     // A group message not addressed to the bot (groupMode 'all'): quiet, and the reply policy applies.
-    unaddressed = false
+    unaddressed = false,
+    // Images saved by an earlier try of this message, so [Try again] does not download them again.
+    savedImagePaths: string[] = []
   ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
@@ -1461,9 +1617,11 @@ export class BridgeRuntime {
 
     let boundOrcaChatId = binding.orcaChatId
     const stats: DispatchStats = { startedAt: Date.now(), polls: 0 }
+    const imagePaths = [...savedImagePaths]
+    // Never for an unaddressed group line: those stay quiet.
+    const working = unaddressed ? null : this.startWorkingLine(token, msg)
     try {
-      const imagePaths: string[] = []
-      if (image) {
+      if (image && imagePaths.length === 0) {
         if (!unaddressed) await this.sendTypingAction(token, msg.chat.id)
         const savedPath = await this.downloadTelegramImage(token, image, msg.message_id, signal)
         imagePaths.push(savedPath)
@@ -1499,6 +1657,8 @@ export class BridgeRuntime {
         onWorkingTick: unaddressed ? undefined : () => this.sendTypingAction(token, msg.chat.id)
       })
 
+      // Gone before the answer, so the phone notifies for the answer itself.
+      await working?.stop()
       boundOrcaChatId = result.chatId
       this.activeTelegramOrcaChats.add(result.chatId)
       await this.upsertBinding({
@@ -1564,11 +1724,17 @@ export class BridgeRuntime {
       )
       this.emitState()
       if (!unaddressed) {
-        await this.safeSendTelegram(
+        await working?.stop()
+        // Only a message that never reached the Orca bot is offered again: once it has it, its turn
+        // may still be running (always so after a timeout).
+        await this.sendFailureLine(
           token,
-          msg.chat.id,
-          this.i18n.processingFailed(truncateText(this.redact(message), MAX_DETAIL_CHARS)),
-          msg.message_id
+          msg,
+          updateId,
+          err,
+          stats.sent
+            ? undefined
+            : (s) => this.processAuthorizedMessage(msg, text, image, s, updateId, fromVoice, false, imagePaths)
         )
       }
     } finally {
@@ -1716,7 +1882,92 @@ export class BridgeRuntime {
     }
   }
 
-  // dispatchToOrcaBotAndWait with debug start/finish entries; `stats` counts its session reads.
+  // After WORKING_LINE_AFTER_MS without an answer, replies "⏳ Working… 20s" to the message and edits
+  // the time at most every WORKING_LINE_EVERY_MS. stop() ends it and deletes the line; it never
+  // throws and may be called again.
+  private startWorkingLine(token: string, msg: TelegramMessage): { stop: () => Promise<void> } {
+    // Taken now, so every edit speaks the language of the message it answers.
+    const i18n = this.i18n
+    const startedAt = Date.now()
+    const options = { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000 }
+    let messageId: number | null = null
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // The send or edit in flight; stop() waits for it, so a line sent late is still deleted.
+    let pending: Promise<void> = Promise.resolve()
+    const tick = () => {
+      pending = (async () => {
+        if (stopped) return
+        const text = `⏳ ${i18n.workingLine(Date.now() - startedAt)}`
+        try {
+          if (messageId === null) {
+            const sent = await this.deps.telegram.sendMessage(
+              token,
+              { chatId: msg.chat.id, text, replyToMessageId: msg.message_id },
+              options
+            )
+            messageId = sent.message_id
+          } else {
+            await this.deps.telegram.editMessageText(token, { chatId: msg.chat.id, messageId, text }, options)
+          }
+        } catch (err) {
+          // Non-fatal: the answer still comes; the next tick tries again.
+          await this.appendLog(
+            'debug',
+            'telegram',
+            `Working line in chat ${msg.chat.id} failed`,
+            describeError(err, { tgChatId: msg.chat.id, messageId: messageId ?? undefined })
+          )
+        }
+        if (!stopped) timer = setTimeout(tick, this.deps.workingLineEveryMs ?? WORKING_LINE_EVERY_MS)
+      })()
+    }
+    timer = setTimeout(tick, this.deps.workingLineAfterMs ?? WORKING_LINE_AFTER_MS)
+    return {
+      stop: async () => {
+        stopped = true
+        clearTimeout(timer)
+        await pending
+        if (messageId === null) return
+        const id = messageId
+        messageId = null
+        await this.removeWorkingLine(token, msg.chat.id, id)
+      }
+    }
+  }
+
+  // Deletes a working line; when Telegram refuses (e.g. no right to delete in a group), it is edited
+  // to "✓" so it no longer looks busy, and the chat is warned about once.
+  private async removeWorkingLine(token: string, chatId: number, messageId: number): Promise<void> {
+    const options = { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000 }
+    try {
+      await this.deps.telegram.deleteMessage(token, chatId, messageId, options)
+      return
+    } catch (err) {
+      const tgChatId = String(chatId)
+      const level = this.workingLineWarned.has(tgChatId) ? 'debug' : 'warn'
+      this.workingLineWarned.add(tgChatId)
+      await this.appendLog(
+        level,
+        'telegram',
+        `Deleting the working line in chat ${tgChatId} failed; marking it done instead.`,
+        describeError(err, { tgChatId, messageId })
+      )
+    }
+    try {
+      await this.deps.telegram.editMessageText(token, { chatId, messageId, text: '✓' }, options)
+    } catch (err) {
+      await this.appendLog(
+        'debug',
+        'telegram',
+        `Marking the working line in chat ${chatId} done failed`,
+        describeError(err, { tgChatId: chatId, messageId })
+      )
+    }
+  }
+
+  // dispatchToOrcaBotAndWait with debug start/finish entries; `stats` counts its session reads and
+  // notes when the Orca bot got the message.
   private async dispatchTraced(stats: DispatchStats, params: DispatchParams): Promise<DispatchResult> {
     const cli = this.deps.orcaCli
     const runner: OrcaCliRunner = {
@@ -1726,6 +1977,21 @@ export class BridgeRuntime {
         const session = await cli.readSession(sessionId, limit)
         stats.lastState = session.state
         return session
+      },
+      sendToBot: async (sendParams) => {
+        try {
+          await cli.sendToBot(sendParams)
+        } catch (err) {
+          // Any failure once the CLI is running (timeout, exit, Orca's own error, garbage) may come
+          // after the message was delivered: the CLI keeps no proof either way. Counting it as sent
+          // keeps [Try again] from running a request twice; only a CLI that never started is sure
+          // not to have delivered it.
+          if (!(err instanceof OrcaCliError && err.kind === 'spawn')) {
+            stats.sent = true
+          }
+          throw err
+        }
+        stats.sent = true
       }
     }
     await this.appendLog(
@@ -2016,10 +2282,11 @@ export class BridgeRuntime {
     const binding = await this.resolveBindingBot(await this.getOrCreateBinding(tgChatId, fromId))
 
     if (cmd === '/start' || cmd === '/help') {
+      // The bound chat id and the sync state only for a role that may change them.
       const helpText = this.i18n.help({
         botName: binding.botName,
-        orcaChatId: binding.orcaChatId,
-        syncOn: this.config.syncOrcaOutbound,
+        ...(roleAllows(role, isGroup ? 'bindGroup' : 'bindPrivate') ? { orcaChatId: binding.orcaChatId } : {}),
+        ...(roleAllows(role, 'sync') ? { syncOn: this.config.syncOrcaOutbound } : {}),
         commands: commandsForRole(role, isGroup)
       })
       await this.safeSendTelegram(token, msg.chat.id, helpText, msg.message_id)
@@ -2308,8 +2575,9 @@ export class BridgeRuntime {
       const statusText = this.i18n.status({
         botUsername: this.botUsername,
         botName: binding.botName,
-        orcaChatId: binding.orcaChatId,
-        syncOn: this.config.syncOrcaOutbound,
+        // As in /help: the bound chat id and the sync state only for a role that may change them.
+        ...(roleAllows(role, isGroup ? 'bindGroup' : 'bindPrivate') ? { orcaChatId: binding.orcaChatId } : {}),
+        ...(roleAllows(role, 'sync') ? { syncOn: this.config.syncOrcaOutbound } : {}),
         pollStatus: this.status
       })
       await this.safeSendTelegram(token, msg.chat.id, statusText, msg.message_id)

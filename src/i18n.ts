@@ -38,8 +38,10 @@ export type TelegramCommandName = (typeof TELEGRAM_COMMAND_NAMES)[number]
 
 export type HelpInfo = {
   botName: string
-  orcaChatId: string | null
-  syncOn: boolean
+  // Absent when the sender's role may not bind chats here: the bound chat id is not theirs to see.
+  orcaChatId?: string | null
+  // Absent when the sender's role may not turn sync on or off.
+  syncOn?: boolean
   // The commands this sender's role may use; /help lists only these.
   commands: readonly TelegramCommandName[]
 }
@@ -47,8 +49,9 @@ export type HelpInfo = {
 export type StatusInfo = {
   botUsername: string | null
   botName: string
-  orcaChatId: string | null
-  syncOn: boolean
+  // Absent when the sender's role may not bind chats or switch sync, as in HelpInfo.
+  orcaChatId?: string | null
+  syncOn?: boolean
   pollStatus: string
 }
 
@@ -57,6 +60,16 @@ function allowedLines(lines: string[], allowed: readonly TelegramCommandName[]):
   return lines.filter((line) => allowed.includes(line.slice(1).split(/\s/)[0] as TelegramCommandName))
 }
 
+// "20s" under a minute, "1 min 30 s" from then on (the units differ by language).
+function elapsedText(ms: number, units: { s: string; min: string; minS: string }): string {
+  const total = Math.floor(ms / 1000)
+  if (total < 60) return `${total}${units.s}`
+  const seconds = total % 60
+  return `${Math.floor(total / 60)}${units.min}${seconds ? ` ${seconds}${units.minS}` : ''}`
+}
+
+const LATIN_UNITS = { s: 's', min: ' min', minS: ' s' }
+
 export type Messages = {
   commands: Record<TelegramCommandName, string>
   unauthorized: (userId: string) => string
@@ -64,7 +77,17 @@ export type Messages = {
   // A command or button the sender's role does not allow.
   notAllowedForRole: string
   unsupportedImage: string
-  processingFailed: (detail: string) => string
+  // While a slow answer is awaited: the time since the message was sent to the Orca bot.
+  workingLine: (elapsedMs: number) => string
+  // The one plain line for a failed answer, by kind; the technical cause stays in the Logs.
+  errorTimeout: string
+  errorOrcaUnreachable: string
+  errorGeneric: string
+  retryButton: string
+  detailsButton: string
+  // Toasts for [Try again] tapped by someone else, or after the failure was forgotten.
+  retryOnlySender: string
+  retryExpired: string
   voiceDisabled: string
   voiceFailed: (reason: string) => string
   // Short reasons for voiceFailed.
@@ -149,7 +172,14 @@ const en: Messages = {
   callbackUnauthorized: 'Access denied. Add your ID to the allowlist first.',
   notAllowedForRole: "This isn't available for you. Ask the bot's owner.",
   unsupportedImage: 'This image format is not supported. Send a JPG, PNG, WEBP, GIF or BMP image.',
-  processingFailed: (detail) => `Processing failed: ${detail}`,
+  workingLine: (elapsedMs) => `Working… ${elapsedText(elapsedMs, LATIN_UNITS)}`,
+  errorTimeout: 'The Orca bot is still working and went past the wait time. Try again in a few minutes.',
+  errorOrcaUnreachable: "I couldn't reach Orca on this computer.",
+  errorGeneric: 'Something went wrong while answering.',
+  retryButton: 'Try again',
+  detailsButton: 'Details',
+  retryOnlySender: 'Only the person who asked can retry.',
+  retryExpired: 'This message expired.',
   voiceDisabled: 'Voice messages are not enabled for this bot. Please send text.',
   voiceFailed: (reason) => `Could not transcribe the voice message: ${reason}`,
   voiceTooLarge: 'the file is larger than 20 MB',
@@ -171,8 +201,8 @@ const en: Messages = {
   help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `Current bot: ${botName || '(none found)'}`,
-      `Current chat: ${orcaChatId || '(new chat, created with your next message)'}`,
-      `Two-way sync (Orca -> TG): ${enOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`Current chat: ${orcaChatId || '(new chat, created with your next message)'}`]),
+      ...(syncOn === undefined ? [] : [`Two-way sync (Orca -> TG): ${enOnOff(syncOn)}`]),
       '',
       'Commands:',
       ...allowedLines(
@@ -195,8 +225,8 @@ const en: Messages = {
     [
       `Telegram bot: ${botUsername ? `@${botUsername}` : 'unknown'}`,
       `Target Orca bot: ${botName}`,
-      `Bound chat ID: ${orcaChatId || '(none yet, your next message creates one)'}`,
-      `Two-way sync (Orca -> TG): ${enOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`Bound chat ID: ${orcaChatId || '(none yet, your next message creates one)'}`]),
+      ...(syncOn === undefined ? [] : [`Two-way sync (Orca -> TG): ${enOnOff(syncOn)}`]),
       `Polling: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (current)',
@@ -263,7 +293,14 @@ const ptBR: Messages = {
   callbackUnauthorized: 'Acesso negado. Adicione seu ID à lista de permitidos primeiro.',
   notAllowedForRole: 'Isto não está disponível para você. Fale com o dono do bot.',
   unsupportedImage: 'Formato de imagem não suportado. Envie uma imagem JPG, PNG, WEBP, GIF ou BMP.',
-  processingFailed: (detail) => `Falha no processamento: ${detail}`,
+  workingLine: (elapsedMs) => `Trabalhando… ${elapsedText(elapsedMs, LATIN_UNITS)}`,
+  errorTimeout: 'O bot do Orca ainda está trabalhando e passou do tempo de espera. Tente de novo em alguns minutos.',
+  errorOrcaUnreachable: 'Não consegui falar com o Orca neste computador.',
+  errorGeneric: 'Algo deu errado ao responder.',
+  retryButton: 'Tentar de novo',
+  detailsButton: 'Detalhes',
+  retryOnlySender: 'Só quem perguntou pode tentar de novo.',
+  retryExpired: 'Esta mensagem expirou.',
   voiceDisabled: 'Mensagens de voz não estão ativadas para este bot. Envie texto.',
   voiceFailed: (reason) => `Não foi possível transcrever a mensagem de voz: ${reason}`,
   voiceTooLarge: 'o arquivo passa de 20 MB',
@@ -286,8 +323,8 @@ const ptBR: Messages = {
   help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `Bot atual: ${botName || '(nenhum encontrado)'}`,
-      `Conversa atual: ${orcaChatId || '(nova conversa, criada com sua próxima mensagem)'}`,
-      `Sincronização bidirecional (Orca -> TG): ${ptOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`Conversa atual: ${orcaChatId || '(nova conversa, criada com sua próxima mensagem)'}`]),
+      ...(syncOn === undefined ? [] : [`Sincronização bidirecional (Orca -> TG): ${ptOnOff(syncOn)}`]),
       '',
       'Comandos:',
       ...allowedLines(
@@ -310,8 +347,8 @@ const ptBR: Messages = {
     [
       `Bot do Telegram: ${botUsername ? `@${botUsername}` : 'desconhecido'}`,
       `Bot do Orca de destino: ${botName}`,
-      `ID da conversa vinculada: ${orcaChatId || '(nenhuma ainda, sua próxima mensagem cria uma)'}`,
-      `Sincronização bidirecional (Orca -> TG): ${ptOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`ID da conversa vinculada: ${orcaChatId || '(nenhuma ainda, sua próxima mensagem cria uma)'}`]),
+      ...(syncOn === undefined ? [] : [`Sincronização bidirecional (Orca -> TG): ${ptOnOff(syncOn)}`]),
       `Polling: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (atual)',
@@ -377,7 +414,14 @@ const es: Messages = {
   callbackUnauthorized: 'Acceso denegado. Primero agrega tu ID a la lista de permitidos.',
   notAllowedForRole: 'Esto no está disponible para ti. Pregunta al dueño del bot.',
   unsupportedImage: 'Formato de imagen no compatible. Envía una imagen JPG, PNG, WEBP, GIF o BMP.',
-  processingFailed: (detail) => `Error al procesar: ${detail}`,
+  workingLine: (elapsedMs) => `Trabajando… ${elapsedText(elapsedMs, LATIN_UNITS)}`,
+  errorTimeout: 'El bot de Orca sigue trabajando y superó el tiempo de espera. Vuelve a intentarlo en unos minutos.',
+  errorOrcaUnreachable: 'No pude conectar con Orca en esta computadora.',
+  errorGeneric: 'Algo salió mal al responder.',
+  retryButton: 'Reintentar',
+  detailsButton: 'Detalles',
+  retryOnlySender: 'Solo quien preguntó puede reintentar.',
+  retryExpired: 'Este mensaje expiró.',
   voiceDisabled: 'Los mensajes de voz no están activados para este bot. Envía texto.',
   voiceFailed: (reason) => `No se pudo transcribir el mensaje de voz: ${reason}`,
   voiceTooLarge: 'el archivo supera los 20 MB',
@@ -400,8 +444,8 @@ const es: Messages = {
   help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `Bot actual: ${botName || '(ninguno encontrado)'}`,
-      `Conversación actual: ${orcaChatId || '(nueva conversación, se crea con tu próximo mensaje)'}`,
-      `Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`Conversación actual: ${orcaChatId || '(nueva conversación, se crea con tu próximo mensaje)'}`]),
+      ...(syncOn === undefined ? [] : [`Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`]),
       '',
       'Comandos:',
       ...allowedLines(
@@ -424,8 +468,8 @@ const es: Messages = {
     [
       `Bot de Telegram: ${botUsername ? `@${botUsername}` : 'desconocido'}`,
       `Bot de Orca de destino: ${botName}`,
-      `ID de la conversación vinculada: ${orcaChatId || '(ninguna todavía, tu próximo mensaje crea una)'}`,
-      `Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`ID de la conversación vinculada: ${orcaChatId || '(ninguna todavía, tu próximo mensaje crea una)'}`]),
+      ...(syncOn === undefined ? [] : [`Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`]),
       `Polling: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (actual)',
@@ -491,7 +535,14 @@ const zhCN: Messages = {
   callbackUnauthorized: '未授权访问，请先加入白名单。',
   notAllowedForRole: '此功能对你不可用，请联系机器人的所有者。',
   unsupportedImage: '暂不支持该图片格式，请发送 JPG、PNG、WEBP、GIF 或 BMP 图片。',
-  processingFailed: (detail) => `处理失败：${detail}`,
+  workingLine: (elapsedMs) => `处理中… ${elapsedText(elapsedMs, { s: ' 秒', min: ' 分', minS: ' 秒' })}`,
+  errorTimeout: 'Orca Bot 仍在处理，已超过等待时间。请过几分钟再试。',
+  errorOrcaUnreachable: '无法连接到这台电脑上的 Orca。',
+  errorGeneric: '回答时出现问题。',
+  retryButton: '重试',
+  detailsButton: '详情',
+  retryOnlySender: '只有提问的人可以重试。',
+  retryExpired: '此消息已过期。',
   voiceDisabled: '此机器人未启用语音消息，请发送文字。',
   voiceFailed: (reason) => `语音消息转写失败：${reason}`,
   voiceTooLarge: '文件超过 20 MB',
@@ -513,8 +564,8 @@ const zhCN: Messages = {
   help: ({ botName, orcaChatId, syncOn, commands }) =>
     [
       `当前连接 Bot：${botName || '(未检测到)'}`,
-      `当前会话：${orcaChatId || '(新会话，将在下一条消息创建)'}`,
-      `双向同步 (Orca -> TG)：${zhOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`当前会话：${orcaChatId || '(新会话，将在下一条消息创建)'}`]),
+      ...(syncOn === undefined ? [] : [`双向同步 (Orca -> TG)：${zhOnOff(syncOn)}`]),
       '',
       '可用指令：',
       ...allowedLines(
@@ -537,8 +588,8 @@ const zhCN: Messages = {
     [
       `Telegram Bot: ${botUsername ? `@${botUsername}` : '未知'}`,
       `目标 Orca Bot: ${botName}`,
-      `绑定会话 ID: ${orcaChatId || '(未创建，发消息自动新建)'}`,
-      `双向同步 (Orca -> TG): ${zhOnOff(syncOn)}`,
+      ...(orcaChatId === undefined ? [] : [`绑定会话 ID: ${orcaChatId || '(未创建，发消息自动新建)'}`]),
+      ...(syncOn === undefined ? [] : [`双向同步 (Orca -> TG): ${zhOnOff(syncOn)}`]),
       `轮询状态: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (当前)',

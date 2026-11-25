@@ -246,6 +246,10 @@ export class OrcaCliError extends Error {
   }
 }
 
+// The reply wait passed while the Orca bot was still working; its turn may still be running. The
+// name stays 'Error' so the log reads as before.
+export class DispatchTimeoutError extends Error {}
+
 export async function runOrcaJson<T>(
   args: string[],
   options: { stdinText?: string; timeoutMs?: number; signal?: AbortSignal } = {}
@@ -887,7 +891,7 @@ export async function dispatchToOrcaBotAndWait(
     await sleep(pollIntervalMs, params.signal)
   }
 
-  throw new Error(
+  throw new DispatchTimeoutError(
     `Timed out after ${Math.round(params.timeoutMs / 1000)}s waiting for "${params.botName}" to finish.`
   )
 }
