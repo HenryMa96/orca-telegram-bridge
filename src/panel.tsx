@@ -110,6 +110,9 @@ const accessModeDraft = atom<AccessMode>('restricted')
 // while rows above it are removed.
 type AssignmentRow = { key: string; id: string; roleId: string; saved: boolean }
 const assignmentRowsDraft = atom<AssignmentRow[]>([])
+// Pixels. The ID field fits "-1001234567890 @a_long_username"; the role field fits "Full access".
+const ID_FIELD_WIDTH = 260
+const ROLE_FIELD_WIDTH = 140
 let rowSeq = 0
 // Shown under the rows when Save is refused: no valid ID, or a row that is not an ID.
 const allowedIdsError = atom<string | null>(null)
@@ -975,39 +978,46 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNa
         const invalid = idsError !== null && (id === '' ? idsError === NEEDS_ID : !isTelegramId(id))
         const name = Object.hasOwn(knownNames, id) ? knownNames[id] : undefined
         return (
+          // Fixed widths: without them the Select sizes itself by the role's label and the ID field
+          // takes what is left, so every row would line up differently.
           <Row key={row.key} gap="xs" align="center">
-            {row.saved ? (
-              // A saved ID cannot be edited: remove the row and add another instead. `value` without
-              // `onChange` is read-only. The name already carries its "@" when it is a username.
-              <Input
-                key={`id:${row.key}`}
-                label={`Telegram ID ${i + 1}`}
+            <Box key={`idbox:${row.key}`} width={ID_FIELD_WIDTH}>
+              {row.saved ? (
+                // A saved ID cannot be edited: remove the row and add another instead. `value`
+                // without `onChange` is read-only. The name already carries its "@" when it is a
+                // username.
+                <Input
+                  key={`id:${row.key}`}
+                  label={`Telegram ID ${i + 1}`}
+                  labelHidden
+                  value={name ? `${row.id} ${name}` : row.id}
+                  invalid={invalid}
+                />
+              ) : (
+                <Input
+                  key={`id:${row.key}`}
+                  label={`Telegram ID ${i + 1}`}
+                  labelHidden
+                  value={row.id}
+                  placeholder="e.g. 123456789 or -1001234567890"
+                  invalid={invalid}
+                  onChange={(v) => {
+                    updateRow(row.key, { id: v })
+                    set(allowedIdsError, null)
+                  }}
+                />
+              )}
+            </Box>
+            <Box key={`rolebox:${row.key}`} width={ROLE_FIELD_WIDTH}>
+              <Select
+                key={`role:${row.key}`}
+                label={`Role for Telegram ID ${i + 1}`}
                 labelHidden
-                value={name ? `${row.id} ${name}` : row.id}
-                invalid={invalid}
+                value={row.roleId}
+                options={roleOptions}
+                onChange={(v) => updateRow(row.key, { roleId: v })}
               />
-            ) : (
-              <Input
-                key={`id:${row.key}`}
-                label={`Telegram ID ${i + 1}`}
-                labelHidden
-                value={row.id}
-                placeholder="e.g. 123456789 or -1001234567890"
-                invalid={invalid}
-                onChange={(v) => {
-                  updateRow(row.key, { id: v })
-                  set(allowedIdsError, null)
-                }}
-              />
-            )}
-            <Select
-              key={`role:${row.key}`}
-              label={`Role for Telegram ID ${i + 1}`}
-              labelHidden
-              value={row.roleId}
-              options={roleOptions}
-              onChange={(v) => updateRow(row.key, { roleId: v })}
-            />
+            </Box>
             <IconButton
               key={`remove:${row.key}`}
               icon="close"
