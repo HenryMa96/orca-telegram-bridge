@@ -1,7 +1,7 @@
 # SPEC: "Working…" line and plain-language errors (wave B)
 
 **Date:** 2026-11-25
-**Status:** approved. Decisions: show the line after 20 s; [Details] gated by a new role permission `errorDetails` (Full access has it, Stranger never). No [Stop]: Orca has no way to cancel a bot's turn (no CLI command or host API).
+**Status:** implemented in 0.12.0. Decisions: show the line after 20 s; [Details] gated by a new role permission `errorDetails` (Full access has it, Stranger never). No [Stop]: Orca has no way to cancel a bot's turn (no CLI command or host API). [Try again] only when the Orca CLI never started: every later failure (timeout, exit, Orca's own error) may come after delivery and the CLI keeps no proof, so a retry could repeat an action. Allowing it for specific Orca refusal codes needs those codes confirmed first.
 
 ## Contract (done by the orchestrator)
 - `src/roles.ts`: permission `errorDetails` (in ROLE_PERMISSIONS, Full access gets it, in STRANGER_FORBIDDEN); `permissionForCallback`: `x:<id>` (Try again) -> `chat`, `d:<id>` (Details) -> `errorDetails`.
@@ -26,11 +26,11 @@
 - `editMessageText(token, { chatId, messageId, text }, options)` and `deleteMessage(token, chatId, messageId, options)`; add to the tracer and every mock that lists client methods.
 
 ## Acceptance Criteria
-1. [ ] An answer after 20 s: a working line appears, is edited, then deleted before the answer; an answer before 20 s: no line.
-2. [ ] A timeout and a CLI failure each give their plain line in the chat's language with [Try again]; no technical text in Telegram.
-3. [ ] [Try again] by the sender re-sends and answers; by someone else it is refused; after 30 min it says expired.
-4. [ ] [Details] shows only in private chats for roles with errorDetails and sends the redacted cause; a Member sees no [Details].
-5. [ ] Unaddressed group lines: no working line, no error message.
-6. [ ] /help hides the chat id without bind and the sync state without sync.
-7. [ ] Wire format tests for editMessageText and deleteMessage.
-8. [ ] `orca plugin test`, `check`, `validate` pass; tsc no new error.
+1. [x] An answer after 20 s: a working line appears, is edited, then deleted before the answer; an answer before 20 s: no line; NO_REPLY removes it too.
+2. [x] A timeout and a CLI failure each give their plain line in the chat's language; [Try again] only when the CLI never started; no technical text in Telegram.
+3. [x] [Try again] by the sender re-sends and answers; by someone else it is refused; after 30 min it says expired.
+4. [x] [Details] shows only in private chats for roles with errorDetails and sends the redacted cause; a Member sees no [Details].
+5. [x] Unaddressed group lines: no working line, no error message.
+6. [x] /help and /status hide the chat id without bind and the sync state without sync.
+7. [x] Wire format tests for editMessageText and deleteMessage.
+8. [x] `orca plugin test` (239), `check`, `validate` pass; tsc no new error (12 older type-only errors remain).
