@@ -44,6 +44,18 @@ export type TelegramFile = {
   file_path?: string
 }
 
+// A voice note (OGG/Opus) or an audio file; `audio` also carries file_name, title and performer.
+export type TelegramAudio = {
+  file_id: string
+  file_unique_id: string
+  duration: number
+  mime_type?: string
+  file_size?: number
+  file_name?: string
+  title?: string
+  performer?: string
+}
+
 export type TelegramMessageEntity = {
   type: string
   offset: number
@@ -62,6 +74,8 @@ export type TelegramMessage = {
   reply_to_message?: TelegramMessage
   photo?: TelegramPhotoSize[]
   document?: TelegramDocument
+  voice?: TelegramAudio
+  audio?: TelegramAudio
 }
 
 export type TelegramInlineKeyboardButton = {
@@ -205,7 +219,7 @@ export function resolveProxyUrl(explicitProxy?: string): string | undefined {
   return envProxy?.trim() || undefined
 }
 
-function createProxyAgent(proxyUrl: string, timeoutMs: number, signal?: AbortSignal): https.Agent {
+export function createProxyAgent(proxyUrl: string, timeoutMs: number, signal?: AbortSignal): https.Agent {
   const parsed = new URL(proxyUrl)
   // Only plain-HTTP CONNECT is implemented; an https:// or socks proxy would get raw TCP and fail obscurely.
   if (parsed.protocol !== 'http:') {

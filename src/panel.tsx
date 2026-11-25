@@ -37,7 +37,8 @@ import type {
   BridgeState,
   BridgeView,
   GroupMode,
-  SaveConfigInput
+  SaveConfigInput,
+  VoiceProvider
 } from './protocol'
 import type { ReplyLanguage } from './i18n'
 
@@ -67,6 +68,10 @@ const syncOrcaOutboundDraft = atom(false)
 const replyLanguageDraft = atom<ReplyLanguage>('en')
 const allowGroupsDraft = atom(false)
 const groupModeDraft = atom<GroupMode>('addressed')
+const voiceEnabledDraft = atom(false)
+const voiceProviderDraft = atom<VoiceProvider>('openrouter')
+const voiceModelDraft = atom('')
+const voiceKeyDraft = atom('')
 const busy = atom(false)
 const feedback = atom<{ tone: 'success' | 'danger' | 'accent'; text: string } | null>(null)
 // The bridge the drafts were filled from.
@@ -94,6 +99,22 @@ const GROUP_MODE_OPTIONS: Array<{ value: GroupMode; label: string }> = [
   { value: 'addressed', label: 'Only messages for the bot' },
   { value: 'all', label: 'All messages' }
 ]
+const VOICE_PROVIDER_OPTIONS: Array<{ value: VoiceProvider; label: string }> = [
+  { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'openai', label: 'OpenAI' }
+]
+const VOICE_PROVIDER_LABEL: Record<VoiceProvider, string> = {
+  openrouter: 'OpenRouter',
+  openai: 'OpenAI'
+}
+const VOICE_DEFAULT_MODEL: Record<VoiceProvider, string> = {
+  openrouter: 'openai/whisper-large-v3',
+  openai: 'gpt-transcribe'
+}
+const VOICE_KEY_PLACEHOLDER: Record<VoiceProvider, string> = {
+  openrouter: 'OpenRouter key sk-or-…',
+  openai: 'OpenAI key sk-…'
+}
 const EXPORT_UNAVAILABLE = 'Export needs the Orca desktop app'
 
 function clip(text: string): string {
@@ -129,6 +150,9 @@ function hydrateForm(state: BridgeState, force = false): void {
   set(replyLanguageDraft, bridge.config.replyLanguage)
   set(allowGroupsDraft, bridge.config.allowGroups)
   set(groupModeDraft, bridge.config.groupMode)
+  set(voiceEnabledDraft, bridge.config.voiceEnabled)
+  set(voiceProviderDraft, bridge.config.voiceProvider)
+  set(voiceModelDraft, bridge.config.voiceModel)
   set(hydratedFor, id)
   set(formDirty, false)
 }
@@ -137,6 +161,7 @@ function openEditor(state: BridgeState, bridgeId: string): void {
   set(editingBridgeId, bridgeId)
   set(confirmRemoveId, null)
   set(tokenDraft, '')
+  set(voiceKeyDraft, '')
   hydrateForm(state, true)
 }
 
@@ -144,6 +169,7 @@ function closeEditor(): void {
   set(editingBridgeId, null)
   set(hydratedFor, null)
   set(tokenDraft, '')
+  set(voiceKeyDraft, '')
   set(formDirty, false)
 }
 
@@ -216,6 +242,7 @@ async function saveConfig(bridge: BridgeView): Promise<void> {
   try {
     const parsedTimeout = Number.parseInt(read(timeoutDraft), 10)
     const cleanToken = read(tokenDraft).trim()
+    const cleanVoiceKey = read(voiceKeyDraft).trim()
     const payload: SaveConfigInput = {
       bridgeId: bridge.id,
       name: read(nameDraft).trim() || bridge.name,
@@ -227,10 +254,15 @@ async function saveConfig(bridge: BridgeView): Promise<void> {
       replyLanguage: read(replyLanguageDraft),
       allowGroups: read(allowGroupsDraft),
       groupMode: read(groupModeDraft),
-      ...(cleanToken ? { botToken: cleanToken } : {})
+      voiceEnabled: read(voiceEnabledDraft),
+      voiceProvider: read(voiceProviderDraft),
+      voiceModel: read(voiceModelDraft).trim(),
+      ...(cleanToken ? { botToken: cleanToken } : {}),
+      ...(cleanVoiceKey ? { voiceApiKey: cleanVoiceKey } : {})
     }
     const next = await plugin.request('bridge.saveConfig', payload)
     set(tokenDraft, '')
+    set(voiceKeyDraft, '')
     set(bridgeState, next)
     hydrateForm(next, true)
     set(feedback, { tone: 'success', text: 'Settings saved.' })
@@ -452,6 +484,11 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean, confirming: boolean) {
               ? 'Groups: messages for the bot'
               : `Groups: all messages${openToEveryone ? ' (open: messages for the bot)' : ''}`}
         </Text>
+        <Text muted size="xs">
+          {!bridge.config.voiceEnabled
+            ? 'Voice: off'
+            : `Voice: ${VOICE_PROVIDER_LABEL[bridge.config.voiceProvider]} (${bridge.config.voiceModel || 'default'})${bridge.config.hasVoiceKey ? '' : ' – no API key'}`}
+        </Text>
         {bridge.lastError && (
           <Callout tone="danger" title="Connection Error" icon="error">
             <Text size="xs">{clip(bridge.lastError)}</Text>
@@ -557,6 +594,7 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean) {
     botOptions.push({ value: draftBot, label: clip(draftBot) })
   }
   const openToEveryone = !hasAllowedIds(bridge.config.allowedUserIds)
+  const voiceProvider = read(voiceProviderDraft)
 
   return (
     <Card
@@ -647,6 +685,44 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean) {
           <Text muted size="xs">
             {'Privacy mode is on: in groups the bot receives only commands and replies to its messages; @mentions and All messages need /setprivacy -> Disable in @BotFather, then add the bot to the group again.'}
           </Text>
+        )}
+        <Switch
+          label="Voice messages"
+          checked={read(voiceEnabledDraft)}
+          onChange={(v) => edit(voiceEnabledDraft, v)}
+        />
+        {read(voiceEnabledDraft) && (
+          <Stack gap="sm">
+            <Select
+              label="Transcription provider"
+              value={voiceProvider}
+              options={VOICE_PROVIDER_OPTIONS}
+              onChange={(v) => edit(voiceProviderDraft, v as VoiceProvider)}
+            />
+            <Input
+              label="Transcription model"
+              value={read(voiceModelDraft)}
+              placeholder={VOICE_DEFAULT_MODEL[voiceProvider]}
+              onChange={(v) => edit(voiceModelDraft, v)}
+            />
+            <Input
+              label="Transcription API key"
+              type="password"
+              value={read(voiceKeyDraft)}
+              placeholder={
+                bridge.config.hasVoiceKey ? '•••• (saved)' : VOICE_KEY_PLACEHOLDER[voiceProvider]
+              }
+              onChange={(v) => edit(voiceKeyDraft, v)}
+            />
+            <Text muted size="xs">
+              {`Voice messages and audio files are sent to ${VOICE_PROVIDER_LABEL[voiceProvider]} to be transcribed, then the text goes to the Orca bot. The provider charges per minute of audio.`}
+            </Text>
+            {!bridge.config.hasVoiceKey && !read(voiceKeyDraft).trim() && (
+              <Text muted size="xs">
+                {'Add an API key, or voice messages get a "not enabled" reply.'}
+              </Text>
+            )}
+          </Stack>
         )}
         <Row gap="xs" wrap>
           <Button size="sm" disabled={isBusy} onPress={() => saveConfig(bridge)}>

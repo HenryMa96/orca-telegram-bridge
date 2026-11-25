@@ -45,6 +45,10 @@ function makeBridge(id: string, overrides: BridgeOverrides = {}): BridgeView {
       replyLanguage: 'en',
       allowGroups: false,
       groupMode: 'addressed',
+      voiceEnabled: false,
+      voiceProvider: 'openrouter',
+      voiceModel: '',
+      hasVoiceKey: false,
       ...config
     }
   }
@@ -274,7 +278,10 @@ test('Save sends the edited bridge id and never the on/off state', async () => {
       syncOrcaOutbound: false,
       replyLanguage: 'en',
       allowGroups: false,
-      groupMode: 'addressed'
+      groupMode: 'addressed',
+      voiceEnabled: false,
+      voiceProvider: 'openrouter',
+      voiceModel: ''
     }
   ])
   assert.deepEqual(view.errors, [])
@@ -450,6 +457,114 @@ test('the reply language select shows the saved language and saves the chosen on
   await view.press({ text: 'Save Settings' })
   assert.equal(saved[0].replyLanguage, 'pt-BR')
   assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+function savingHost(state: BridgeState, saved: SaveConfigInput[]) {
+  return mockHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': (input: SaveConfigInput) => {
+        saved.push(input)
+        // Answer like the worker: the state after the save, or the editor reloads the old values.
+        const bridge = state.bridges.find((b) => b.id === input.bridgeId)!
+        bridge.config = {
+          ...bridge.config,
+          voiceEnabled: input.voiceEnabled ?? bridge.config.voiceEnabled,
+          voiceProvider: input.voiceProvider ?? bridge.config.voiceProvider,
+          voiceModel: input.voiceModel ?? bridge.config.voiceModel,
+          hasVoiceKey: bridge.config.hasVoiceKey || Boolean(input.voiceApiKey)
+        }
+        return state
+      }
+    }
+  })
+}
+
+test('voice options are hidden while off and shown after turning Voice messages on', async () => {
+  const view = await mount(panel, { host: savingHost(makeState(), []) })
+  await openEditor(view, 'b1')
+  assert.equal(view.find({ label: 'Transcription provider' }), null)
+  assert.equal(view.find({ label: 'Transcription API key' }), null)
+  await view.toggle({ label: 'Voice messages' })
+  assert.equal(view.valueOf({ label: 'Transcription provider' }), 'openrouter')
+  assert.ok(view.find({ label: 'Transcription model' }))
+  assert.ok(view.find({ text: /sent to OpenRouter to be transcribed/ }))
+  assert.ok(view.find({ text: /Add an API key/ }))
+  await view.type({ label: 'Transcription API key' }, 'sk-or-abc')
+  assert.equal(view.find({ text: /Add an API key/ }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Save sends the voice fields and the typed key, then clears the key field', async () => {
+  const saved: SaveConfigInput[] = []
+  const view = await mount(panel, { host: savingHost(makeState(), saved) })
+  await openEditor(view, 'b1')
+  await view.toggle({ label: 'Voice messages' })
+  await view.select({ label: 'Transcription provider' }, 'openai')
+  await view.type({ label: 'Transcription model' }, 'whisper-1')
+  await view.type({ label: 'Transcription API key' }, '  sk-secret  ')
+  await view.press({ text: 'Save Settings' })
+  assert.equal(saved[0].voiceEnabled, true)
+  assert.equal(saved[0].voiceProvider, 'openai')
+  assert.equal(saved[0].voiceModel, 'whisper-1')
+  assert.equal(saved[0].voiceApiKey, 'sk-secret')
+  assert.equal(view.valueOf({ label: 'Transcription API key' }), '')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Save leaves out the voice key when the key field is empty', async () => {
+  const saved: SaveConfigInput[] = []
+  const state = makeState({
+    bridges: [makeBridge('b1', { config: { voiceEnabled: true, hasVoiceKey: true } })]
+  })
+  const view = await mount(panel, { host: savingHost(state, saved) })
+  await openEditor(view, 'b1')
+  await view.press({ text: 'Save Settings' })
+  assert.equal(saved[0].voiceEnabled, true)
+  assert.equal('voiceApiKey' in saved[0], false)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('switching the provider changes the model and key placeholders', async () => {
+  const state = makeState({ bridges: [makeBridge('b1', { config: { voiceEnabled: true } })] })
+  const view = await mount(panel, { host: savingHost(state, []) })
+  await openEditor(view, 'b1')
+  assert.equal(view.find({ label: 'Transcription model' })!.props.placeholder, 'openai/whisper-large-v3')
+  assert.equal(view.find({ label: 'Transcription API key' })!.props.placeholder, 'OpenRouter key sk-or-…')
+  await view.select({ label: 'Transcription provider' }, 'openai')
+  assert.equal(view.find({ label: 'Transcription model' })!.props.placeholder, 'gpt-transcribe')
+  assert.equal(view.find({ label: 'Transcription API key' })!.props.placeholder, 'OpenAI key sk-…')
+  assert.ok(view.find({ text: /sent to OpenAI to be transcribed/ }))
+  await view.unmount()
+})
+
+test('the key placeholder says saved when a voice key is stored', async () => {
+  const state = makeState({
+    bridges: [makeBridge('b1', { config: { voiceEnabled: true, hasVoiceKey: true } })]
+  })
+  const view = await mount(panel, { host: savingHost(state, []) })
+  await openEditor(view, 'b1')
+  assert.equal(view.find({ label: 'Transcription API key' })!.props.placeholder, '•••• (saved)')
+  assert.equal(view.find({ text: /Add an API key/ }), null)
+  await view.unmount()
+})
+
+test('the bridge card shows the voice provider, model and the no-key hint', async () => {
+  const state = makeState({
+    bridges: [
+      makeBridge('a', { name: 'A' }),
+      makeBridge('b', { name: 'B', config: { voiceEnabled: true, voiceProvider: 'openai', voiceModel: 'whisper-1', hasVoiceKey: true } }),
+      makeBridge('c', { name: 'C', config: { voiceEnabled: true } })
+    ]
+  })
+  const view = await mount(panel, { host: savingHost(state, []) })
+  assert.ok(view.find({ text: 'Voice: off' }))
+  assert.ok(view.find({ text: 'Voice: OpenAI (whisper-1)' }))
+  assert.ok(view.find({ text: 'Voice: OpenRouter (default) – no API key' }))
   await view.unmount()
 })
 

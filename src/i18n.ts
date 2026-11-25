@@ -43,6 +43,11 @@ export type Messages = {
   callbackUnauthorized: string
   unsupportedImage: string
   processingFailed: (detail: string) => string
+  voiceDisabled: string
+  voiceFailed: (reason: string) => string
+  // Short reasons for voiceFailed.
+  voiceTooLarge: string
+  voiceEmpty: string
   actionFailed: (detail: string) => string
   noBotsAvailable: string
   shortenedNote: string
@@ -113,6 +118,10 @@ const en: Messages = {
   callbackUnauthorized: 'Access denied. Add your ID to the allowlist first.',
   unsupportedImage: 'This image format is not supported. Send a JPG, PNG, WEBP, GIF or BMP image.',
   processingFailed: (detail) => `Processing failed: ${detail}`,
+  voiceDisabled: 'Voice messages are not enabled for this bot. Please send text.',
+  voiceFailed: (reason) => `Could not transcribe the voice message: ${reason}`,
+  voiceTooLarge: 'the file is larger than 25 MB',
+  voiceEmpty: 'no speech was recognized',
   actionFailed: (detail) => `Action failed: ${detail}`,
   noBotsAvailable: 'No Orca bot found. Create at least one bot in Orca first.',
   shortenedNote: '(The reply was too long and was shortened. Open Orca to see the full text.)',
@@ -209,6 +218,10 @@ const ptBR: Messages = {
   callbackUnauthorized: 'Acesso negado. Adicione seu ID à lista de permitidos primeiro.',
   unsupportedImage: 'Formato de imagem não suportado. Envie uma imagem JPG, PNG, WEBP, GIF ou BMP.',
   processingFailed: (detail) => `Falha no processamento: ${detail}`,
+  voiceDisabled: 'Mensagens de voz não estão ativadas para este bot. Envie texto.',
+  voiceFailed: (reason) => `Não foi possível transcrever a mensagem de voz: ${reason}`,
+  voiceTooLarge: 'o arquivo passa de 25 MB',
+  voiceEmpty: 'nenhuma fala foi reconhecida',
   actionFailed: (detail) => `Falha na ação: ${detail}`,
   noBotsAvailable: 'Nenhum bot do Orca encontrado. Crie pelo menos um bot no Orca primeiro.',
   shortenedNote: '(A resposta era longa demais e foi encurtada. Abra o Orca para ver o texto completo.)',
@@ -304,6 +317,10 @@ const zhCN: Messages = {
   callbackUnauthorized: '未授权访问，请先加入白名单。',
   unsupportedImage: '暂不支持该图片格式，请发送 JPG、PNG、WEBP、GIF 或 BMP 图片。',
   processingFailed: (detail) => `处理失败：${detail}`,
+  voiceDisabled: '此机器人未启用语音消息，请发送文字。',
+  voiceFailed: (reason) => `语音消息转写失败：${reason}`,
+  voiceTooLarge: '文件超过 25 MB',
+  voiceEmpty: '未识别到语音内容',
   actionFailed: (detail) => `操作失败：${detail}`,
   noBotsAvailable: '当前未检测到可用的 Orca Bot，请先在 Orca 中创建至少一个 Bot。',
   shortenedNote: '（回复过长已截断，请在 Orca 中查看完整内容）',

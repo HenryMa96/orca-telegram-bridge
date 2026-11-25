@@ -39,6 +39,7 @@ import {
   markdownToTelegramHtml,
   splitTelegramMessage,
   TelegramApiError,
+  type TelegramAudio,
   type TelegramBotCommand,
   type TelegramCallbackQuery,
   type TelegramChat,
@@ -50,8 +51,15 @@ import {
   type TelegramUpdate,
   type TelegramUser
 } from './telegram-api'
+import {
+  DEFAULT_VOICE_MODELS,
+  MAX_TRANSCRIBE_BYTES,
+  transcribeAudio,
+  type Transcriber
+} from './transcribe'
 
-// Each bridge's token is the secret `botToken.<id>`; its runtime state lives under `tg.<id>.*`.
+// Each bridge's token is the secret `botToken.<id>`, its voice API key `voiceKey.<id>`; its runtime
+// state lives under `tg.<id>.*`.
 const STORAGE_BRIDGES = 'bridges'
 const STORAGE_LOGS = 'tg.logs'
 const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked'] as const
@@ -76,6 +84,9 @@ const STACK_DETAIL_LINES = 8
 const SLOW_CLI_CALL_MS = 2000
 const LOG_FLUSH_MS = 1000
 const BLOCK_LOG_INTERVAL_MS = 60_000
+const TRANSCRIBE_TIMEOUT_MS = 60_000
+// Starts the text sent to the Orca bot in place of a voice message or audio file.
+const VOICE_PREFIX = '[Voice message, transcribed]'
 
 type SyncCursor = {
   tailHashes: string[]
@@ -93,6 +104,8 @@ export type BridgeDeps = {
   retryBackoffMs?: number
   // Delay before stored logs are written; 0 writes on every entry (tests).
   logFlushMs?: number
+  // Speech-to-text for voice messages; tests inject a fake.
+  transcribe?: Transcriber
 }
 
 type IncomingTelegramImage = {
@@ -348,6 +361,10 @@ function bridgeSecretKey(bridgeId: string): string {
   return `botToken.${bridgeId}`
 }
 
+function voiceSecretKey(bridgeId: string): string {
+  return `voiceKey.${bridgeId}`
+}
+
 const BRIDGE_ID_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
 
 function newBridgeId(taken: Set<string>): string {
@@ -358,8 +375,8 @@ function newBridgeId(taken: Set<string>): string {
   }
 }
 
-// A bridge's config as stored in `bridges`: everything but the token, which is a secret.
-type StoredBridge = Omit<BridgeConfig, 'hasToken'>
+// A bridge's config as stored in `bridges`: everything but the token and voice key, which are secrets.
+type StoredBridge = Omit<BridgeConfig, 'hasToken' | 'hasVoiceKey'>
 
 function clampTimeout(value: unknown): number {
   const n = typeof value === 'number' && Number.isFinite(value) ? value : 300
@@ -381,7 +398,10 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
     syncOrcaOutbound: typeof raw.syncOrcaOutbound === 'boolean' ? raw.syncOrcaOutbound : false,
     replyLanguage: normalizeLanguage(raw.replyLanguage),
     allowGroups: typeof raw.allowGroups === 'boolean' ? raw.allowGroups : true,
-    groupMode: raw.groupMode === 'all' ? 'all' : 'addressed'
+    groupMode: raw.groupMode === 'all' ? 'all' : 'addressed',
+    voiceEnabled: typeof raw.voiceEnabled === 'boolean' ? raw.voiceEnabled : false,
+    voiceProvider: raw.voiceProvider === 'openai' ? 'openai' : 'openrouter',
+    voiceModel: text(raw.voiceModel)
   }
 }
 
@@ -549,6 +569,9 @@ export class BridgeRuntime {
   private cachedToken: string | null = null
   // The token that updateOffset, botUsername and commandsRegistered belong to.
   private identityToken: string | null = null
+  private cachedVoiceKey: string | null = null
+  // deps.transcribe (or the real one), traced like the Telegram and CLI calls.
+  private readonly transcribe: Transcriber
   private commandsRegistered = false
   private pollAbort: AbortController | null = null
   private pollLoopPromise: Promise<void> | null = null
@@ -571,7 +594,7 @@ export class BridgeRuntime {
     this.manager = manager
     this.orca = manager.orca
     this.id = stored.id
-    this.config = { ...stored, hasToken: false }
+    this.config = { ...stored, hasToken: false, hasVoiceKey: false }
     const tracer: Tracer = {
       enabled: () => manager.debugLogging,
       log: (level, scope, message, details) => this.appendLog(level, scope, message, details)
@@ -581,11 +604,19 @@ export class BridgeRuntime {
       telegram: traceTelegram(manager.deps.telegram, tracer),
       orcaCli: traceOrcaCli(manager.deps.orcaCli, tracer)
     }
+    const transcribe = manager.deps.transcribe ?? transcribeAudio
+    // Provider, model and size only: never the transcript.
+    this.transcribe = (params) =>
+      traceCall(tracer, 'bridge', 'transcribe', () => transcribe(params), () =>
+        `${params.provider} ${params.model || DEFAULT_VOICE_MODELS[params.provider]}, ${params.audio.length} bytes`
+      )
   }
 
   async init(): Promise<void> {
     this.cachedToken = await this.readToken()
     this.config.hasToken = Boolean(this.cachedToken)
+    this.cachedVoiceKey = await this.readVoiceKey()
+    this.config.hasVoiceKey = Boolean(this.cachedVoiceKey)
     await this.loadRuntimeState()
     this.identityToken = this.cachedToken
     this.updateInitialStatus()
@@ -621,7 +652,7 @@ export class BridgeRuntime {
   }
 
   stored(): StoredBridge {
-    const { hasToken: _hasToken, ...stored } = this.config
+    const { hasToken: _hasToken, hasVoiceKey: _hasVoiceKey, ...stored } = this.config
     return stored
   }
 
@@ -651,6 +682,11 @@ export class BridgeRuntime {
     return this.cachedToken === token || this.identityToken === token
   }
 
+  // The voice API key, redacted by the manager like the tokens.
+  voiceKeys(): string[] {
+    return this.cachedVoiceKey ? [this.cachedVoiceKey] : []
+  }
+
   // Texts for Telegram, in the language this bridge uses.
   private get i18n(): Messages {
     return t(this.config.replyLanguage)
@@ -678,6 +714,7 @@ export class BridgeRuntime {
   private async saveConfigNow(input: SaveConfigInput): Promise<void> {
     const prev = { ...this.config }
     const prevToken = this.cachedToken
+    const prevVoiceKey = this.cachedVoiceKey
     if (input.clearToken) {
       try {
         await this.orca.secrets.delete(bridgeSecretKey(this.id))
@@ -689,6 +726,19 @@ export class BridgeRuntime {
       const cleanToken = input.botToken.trim()
       await this.orca.secrets.set(bridgeSecretKey(this.id), cleanToken)
       this.cachedToken = cleanToken
+    }
+    if (input.clearVoiceKey) {
+      try {
+        await this.orca.secrets.delete(voiceSecretKey(this.id))
+      } catch (err) {
+        await this.appendLog('debug', 'config', 'Deleting the stored voice API key failed', describeError(err))
+      }
+      this.retireVoiceKey()
+    } else if (input.voiceApiKey && input.voiceApiKey.trim()) {
+      const cleanKey = input.voiceApiKey.trim()
+      await this.orca.secrets.set(voiceSecretKey(this.id), cleanKey)
+      if (cleanKey !== this.cachedVoiceKey) this.retireVoiceKey()
+      this.cachedVoiceKey = cleanKey
     }
 
     const replyLanguage =
@@ -705,7 +755,12 @@ export class BridgeRuntime {
       syncOrcaOutbound: Boolean(input.syncOrcaOutbound),
       replyLanguage,
       allowGroups: input.allowGroups ?? prev.allowGroups,
-      groupMode: input.groupMode === undefined ? prev.groupMode : input.groupMode === 'all' ? 'all' : 'addressed'
+      groupMode: input.groupMode === undefined ? prev.groupMode : input.groupMode === 'all' ? 'all' : 'addressed',
+      voiceEnabled: input.voiceEnabled ?? prev.voiceEnabled,
+      voiceProvider:
+        input.voiceProvider === undefined ? prev.voiceProvider : input.voiceProvider === 'openai' ? 'openai' : 'openrouter',
+      voiceModel: input.voiceModel === undefined ? prev.voiceModel : input.voiceModel.trim(),
+      hasVoiceKey: Boolean(this.cachedVoiceKey)
     }
     await this.manager.saveBridges()
     if (prev.orcaBot !== this.config.orcaBot) {
@@ -723,6 +778,7 @@ export class BridgeRuntime {
     await this.appendLog('info', 'config', 'Configuration saved.')
     const changed = changedConfigFields(prev, this.config)
     if (prevToken !== this.cachedToken) changed.push('botToken')
+    if (prevVoiceKey !== this.cachedVoiceKey) changed.push('voiceApiKey')
     await this.appendLog('debug', 'config', `Config changed: ${changed.join(', ') || 'nothing'}`)
     await this.logSyncPausedWhileOpen(changed)
 
@@ -893,7 +949,8 @@ export class BridgeRuntime {
     const image = extractIncomingImage(msg)
     const unsupportedImage =
       !image && Boolean(msg.document?.mime_type?.toLowerCase().startsWith('image/'))
-    const group = inGroup ? this.groupMessageText(msg, Boolean(image)) : null
+    const voice = msg.voice ?? msg.audio ?? null
+    const group = inGroup ? this.groupMessageText(msg, Boolean(image || voice)) : null
     const text = inGroup ? (group?.text ?? null) : (msg.text ?? msg.caption ?? '').trim()
     if (text === null) {
       await this.appendLog(
@@ -903,7 +960,7 @@ export class BridgeRuntime {
       )
       return null
     }
-    if (!text && !image && !unsupportedImage) return null
+    if (!text && !image && !unsupportedImage && !voice) return null
 
     const fromId = msg.from ? String(msg.from.id) : tgChatId
     const allowed = parseAllowedIds(this.config.allowedUserIds)
@@ -950,6 +1007,10 @@ export class BridgeRuntime {
               msg.message_id
             )
           }
+          return
+        }
+        if (voice) {
+          await this.processVoiceMessage(msg, voice, text, signal, update.update_id)
           return
         }
         await this.processAuthorizedMessage(msg, text, image, signal, update.update_id)
@@ -1121,7 +1182,9 @@ export class BridgeRuntime {
     text: string,
     image: IncomingTelegramImage | null,
     signal: AbortSignal | undefined,
-    updateId: number
+    updateId: number,
+    // A transcript is sent as is, even when it starts with '/'.
+    fromVoice = false
   ): Promise<void> {
     const token = await this.readToken()
     if (!token) return
@@ -1130,7 +1193,7 @@ export class BridgeRuntime {
     const fromId = msg.from ? String(msg.from.id) : tgChatId
     const senderLabel = formatSenderLabel(msg)
 
-    if (!image && text.startsWith('/')) {
+    if (!image && !fromVoice && text.startsWith('/')) {
       const handled = await this.handleSlashCommand(token, msg, text)
       if (handled) return
     }
@@ -1148,7 +1211,10 @@ export class BridgeRuntime {
       return
     }
     // Only the length of what the user wrote is logged, never the text.
-    const content = [text ? `text ${text.length} chars` : '', image ? 'image' : ''].filter(Boolean).join(' + ')
+    const content = [
+      text ? `${fromVoice ? 'transcript' : 'text'} ${text.length} chars` : '',
+      image ? 'image' : ''
+    ].filter(Boolean).join(' + ')
     await this.appendLog('info', 'dispatch', `[TG ${senderLabel} -> ${binding.botName}] ${content}`)
     this.emitState()
 
@@ -1258,6 +1324,120 @@ export class BridgeRuntime {
         this.activeTelegramOrcaChats.delete(boundOrcaChatId)
       }
     }
+  }
+
+  // A voice note or audio file is transcribed, then handled like the text the sender would have
+  // typed. Voice off, no API key or a failed transcription: the sender is told; nothing is dispatched.
+  private async processVoiceMessage(
+    msg: TelegramMessage,
+    voice: TelegramAudio,
+    caption: string,
+    signal: AbortSignal | undefined,
+    updateId: number
+  ): Promise<void> {
+    const token = await this.readToken()
+    if (!token) return
+    const tgChatId = String(msg.chat.id)
+    const apiKey = this.config.voiceEnabled ? await this.readVoiceKey() : null
+    if (!apiKey) {
+      await this.appendLog(
+        'debug',
+        'bridge',
+        `Voice message ${msg.message_id} in chat ${tgChatId} not transcribed: voice messages are ${
+          this.config.voiceEnabled ? 'on but have no API key' : 'off'
+        }.`
+      )
+      await this.safeSendTelegram(token, msg.chat.id, this.i18n.voiceDisabled, msg.message_id)
+      return
+    }
+
+    const provider = this.config.voiceProvider
+    const model = this.config.voiceModel || DEFAULT_VOICE_MODELS[provider]
+    const startedAt = Date.now()
+    let bytes = voice.file_size ?? 0
+    let transcript = ''
+    let failure: unknown = null
+    // English for the log, localized for the sender.
+    let logReason: string | null = null
+    let replyReason = ''
+    if (bytes > MAX_TRANSCRIBE_BYTES) {
+      logReason = 'the file is over 25 MB'
+      replyReason = this.i18n.voiceTooLarge
+    } else {
+      try {
+        await this.sendTypingAction(token, msg.chat.id)
+        const fileMeta = await this.deps.telegram.getFile(token, voice.file_id, {
+          proxyUrl: this.config.proxyUrl,
+          timeoutMs: 15_000,
+          signal
+        })
+        if (!fileMeta.file_path) {
+          throw new Error('Telegram did not return a downloadable file_path for this audio.')
+        }
+        const audio = await this.deps.telegram.downloadFile(token, fileMeta.file_path, {
+          proxyUrl: this.config.proxyUrl,
+          timeoutMs: 30_000,
+          signal
+        })
+        bytes = audio.length
+        // The providers tell the format by the file name's extension.
+        const fileName = msg.voice
+          ? 'voice.ogg'
+          : voice.file_name || `audio${path.extname(fileMeta.file_path) || '.ogg'}`
+        transcript = (
+          await this.transcribe({
+            provider,
+            model: this.config.voiceModel,
+            apiKey,
+            audio,
+            fileName,
+            mimeType: voice.mime_type || (msg.voice ? 'audio/ogg' : 'application/octet-stream'),
+            proxyUrl: this.config.proxyUrl,
+            timeoutMs: TRANSCRIBE_TIMEOUT_MS,
+            signal
+          })
+        ).trim()
+        if (!transcript) {
+          logReason = 'the transcript is empty'
+          replyReason = this.i18n.voiceEmpty
+        }
+      } catch (err) {
+        failure = err
+        logReason = err instanceof Error ? err.message : String(err)
+        replyReason = truncateText(this.redact(logReason), 200)
+      }
+    }
+
+    if (logReason !== null) {
+      await this.appendLog(
+        'warn',
+        'bridge',
+        `Voice message ${msg.message_id} in chat ${tgChatId} not transcribed: ${logReason}`,
+        describeError(failure ?? logReason, {
+          bridge: this.id,
+          tgChatId,
+          updateId,
+          messageId: msg.message_id,
+          durationSec: voice.duration,
+          bytes,
+          provider,
+          model,
+          elapsedMs: Date.now() - startedAt
+        })
+      )
+      this.emitState()
+      await this.safeSendTelegram(token, msg.chat.id, this.i18n.voiceFailed(replyReason), msg.message_id)
+      return
+    }
+
+    // Only sizes and times are logged, never the transcript.
+    await this.appendLog(
+      'info',
+      'bridge',
+      `Transcribed voice message ${msg.message_id} in chat ${tgChatId}: ${voice.duration} s, ${bytes} bytes, ${provider} ${model}, ${Date.now() - startedAt} ms.`
+    )
+    const text = `${caption ? `${caption}\n` : ''}${VOICE_PREFIX} ${transcript}`
+    await this.processAuthorizedMessage(msg, text, null, signal, updateId, true)
   }
 
   private async sendTypingAction(token: string, chatId: number): Promise<void> {
@@ -2496,6 +2676,25 @@ export class BridgeRuntime {
     }
   }
 
+  private async readVoiceKey(): Promise<string | null> {
+    try {
+      const value = (await this.orca.secrets.get(voiceSecretKey(this.id)))?.trim() || null
+      if (value !== this.cachedVoiceKey) this.retireVoiceKey()
+      this.cachedVoiceKey = value
+      this.config.hasVoiceKey = Boolean(value)
+      return value
+    } catch (err) {
+      await this.appendLog('debug', 'config', 'Reading the voice API key failed; using the cached one', describeError(err))
+      return this.cachedVoiceKey
+    }
+  }
+
+  // A replaced voice key stays redacted: an error from a call still using it must not leak it.
+  private retireVoiceKey(): void {
+    if (this.cachedVoiceKey) this.manager.formerVoiceKeys.push(this.cachedVoiceKey)
+    this.cachedVoiceKey = null
+  }
+
   // updateOffset, the @username and the command menu belong to one bot; a new token starts them over.
   private async adoptToken(token: string | null): Promise<void> {
     if (token === this.identityToken) return
@@ -2672,6 +2871,8 @@ export class BridgeManager {
   private pluginKey: string | null = null
   // Tokens of removed bridges: an error raised by their last calls must not leak them either.
   private readonly formerTokens: string[] = []
+  // Replaced voice API keys and those of removed bridges, redacted for the same reason.
+  readonly formerVoiceKeys: string[] = []
   private readonly lastFailures = new Map<string, string>()
   private disposed = false
 
@@ -2842,9 +3043,11 @@ export class BridgeManager {
     const runtime = this.bridge(bridgeId)
     await runtime.runConfigOp(() => runtime.dispose())
     this.formerTokens.push(...runtime.tokens())
+    this.formerVoiceKeys.push(...runtime.voiceKeys())
     this.runtimes = this.runtimes.filter((r) => r !== runtime)
     await this.saveBridges()
     await this.orca.secrets.delete(bridgeSecretKey(bridgeId))
+    await this.orca.secrets.delete(voiceSecretKey(bridgeId))
     for (const name of BRIDGE_STORAGE_NAMES) {
       await this.orca.storage.delete(bridgeStorageKey(bridgeId, name))
     }
@@ -3054,11 +3257,15 @@ export class BridgeManager {
     }
   }
 
-  // No bot token of any bridge may reach a log line, a detail, a Telegram reply or an export.
+  // No bot token or voice API key of any bridge may reach a log line, a detail, a Telegram reply or
+  // an export.
   redact(text: string): string {
     let out = text.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>')
     for (const token of [...this.runtimes.flatMap((r) => r.tokens()), ...this.formerTokens]) {
       out = out.split(token).join('bot<redacted>')
+    }
+    for (const key of [...this.runtimes.flatMap((r) => r.voiceKeys()), ...this.formerVoiceKeys]) {
+      out = out.split(key).join('<redacted>')
     }
     return out
   }

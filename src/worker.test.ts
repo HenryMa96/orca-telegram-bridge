@@ -29,6 +29,7 @@ import {
 } from './telegram-api'
 import * as main from './worker'
 import type { BridgeDeps, BridgeManager, BridgeRuntime } from './worker'
+import type { TranscribeParams } from './transcribe'
 
 function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; orcaCli: Partial<OrcaCliRunner> }> = {}) {
   const sentMessages: {
@@ -1492,6 +1493,7 @@ const REAL_TOKEN = '7251846039:AAH3kVx9QzLm2pR8sT4uW6yZ0bC1dE5fG7h'
 type BridgeSeed = {
   id: string
   token?: string
+  voiceKey?: string
   config?: Record<string, JsonValue>
   state?: Partial<Record<'offset' | 'bindings' | 'syncCursors' | 'lastBlocked', JsonValue>>
 }
@@ -1516,6 +1518,7 @@ function bridgesHost(
   }))
   for (const seed of seeds) {
     if (seed.token) secrets[`botToken.${seed.id}`] = seed.token
+    if (seed.voiceKey) secrets[`voiceKey.${seed.id}`] = seed.voiceKey
     for (const [name, value] of Object.entries(seed.state ?? {})) {
       if (value !== undefined) storage[`tg.${seed.id}.${name}`] = value
     }
@@ -2296,7 +2299,12 @@ test('a 0.4.0 setup becomes "Bridge 1" with its token, settings, chats and offse
       replyLanguage: 'pt-BR',
       // 0.4.0 answered in groups; the update keeps that.
       allowGroups: true,
-      groupMode: 'addressed'
+      groupMode: 'addressed',
+      // Voice did not exist in 0.4.0: off, provider default, no key.
+      voiceEnabled: false,
+      voiceProvider: 'openrouter',
+      voiceModel: '',
+      hasVoiceKey: false
     })
     assert.equal(view.lastBlockedUserId, '999')
     assert.deepEqual(view.bindings, [legacyBinding])
@@ -2840,4 +2848,192 @@ test('a bridge stored without group options keeps groups on, and a save without 
   } finally {
     await worker.deactivate()
   }
+})
+
+const VOICE_KEY = 'sk-or-v1-VOICEKEY0123456789abcdef'
+
+function voiceUpdate(
+  updateId: number,
+  kind: 'voice' | 'audio',
+  extra: Partial<TelegramMessage> = {},
+  fileSize = 4000
+): TelegramUpdate {
+  const media = { file_id: `${kind}-file-${updateId}`, file_unique_id: `u-${updateId}`, duration: 3, file_size: fileSize }
+  return {
+    update_id: updateId,
+    message: {
+      message_id: 100 + updateId,
+      from: { id: 777888, is_bot: false, first_name: 'User' },
+      chat: { id: 777888, type: 'private' },
+      date: 1000,
+      ...(kind === 'voice'
+        ? { voice: { ...media, mime_type: 'audio/ogg' } }
+        : { audio: { ...media, mime_type: 'audio/mpeg', file_name: 'memo.mp3' } }),
+      ...extra
+    }
+  }
+}
+
+// A bridge in the 0.5.0 layout with voice options and key as given; `transcribe` records each call.
+async function withVoiceBridge(
+  options: { config?: Record<string, JsonValue>; voiceKey?: string; transcribe?: (p: TranscribeParams) => Promise<string> },
+  run: (ctx: {
+    controller: BridgeRuntime
+    manager: BridgeManager
+    deps: ReturnType<typeof makeMockDeps>
+    host: MockHost
+    calls: TranscribeParams[]
+    worker: Awaited<ReturnType<typeof mountBridge>>['worker']
+  }) => Promise<void>
+): Promise<void> {
+  const host = bridgesHost(
+    [{ id: 'b-voice001', token: REAL_TOKEN, voiceKey: options.voiceKey, config: options.config ?? {} }],
+    { debugLogging: true }
+  )
+  const deps = makeMockDeps()
+  const calls: TranscribeParams[] = []
+  const { manager, controller, worker } = await mountBridge(host, deps, {
+    transcribe: async (params) => {
+      calls.push(params)
+      return options.transcribe ? options.transcribe(params) : 'turn on the lights'
+    }
+  })
+  try {
+    await run({ controller, manager, deps, host, calls, worker })
+  } finally {
+    await worker.deactivate()
+  }
+}
+
+const VOICE_ON = { voiceEnabled: true, voiceProvider: 'openai', voiceModel: 'gpt-transcribe' }
+
+test('a voice message on a bridge with voice on reaches the Orca bot as the prefixed transcript', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, deps, calls }) => {
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice'))
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].provider, 'openai')
+    assert.equal(calls[0].apiKey, VOICE_KEY)
+    assert.equal(calls[0].fileName, 'voice.ogg')
+    assert.equal(calls[0].audio.toString(), 'fake-image-bytes')
+    assert.equal(lastBodyLine(deps), '[Voice message, transcribed] turn on the lights')
+    assert.ok(deps.sentActions.some((a) => a.action === 'typing'), 'no typing action while transcribing')
+  })
+})
+
+test('an audio file is transcribed under its own file name and dispatched like a voice message', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, deps, calls }) => {
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'audio'))
+    assert.equal(calls[0].fileName, 'memo.mp3')
+    assert.equal(calls[0].mimeType, 'audio/mpeg')
+    assert.equal(lastBodyLine(deps), '[Voice message, transcribed] turn on the lights')
+  })
+})
+
+test('a voice caption comes first on its own line, then the transcript', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, deps }) => {
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice', { caption: '/new please' }))
+    const body = deps.sentToBots.at(-1)?.body ?? ''
+    assert.ok(body.endsWith('/new please\n[Voice message, transcribed] turn on the lights'), body)
+  })
+})
+
+test('with voice off, or on without a key, the sender is told and nothing reaches the Orca bot', async () => {
+  for (const options of [{ voiceKey: VOICE_KEY }, { config: VOICE_ON }]) {
+    await withVoiceBridge(options, async ({ controller, deps, calls }) => {
+      await controller.handleIncomingUpdate(voiceUpdate(1, 'voice'))
+      assert.equal(calls.length, 0)
+      assert.equal(deps.sentToBots.length, 0)
+      assert.equal(deps.sentMessages.at(-1)?.text, t('en').voiceDisabled)
+    })
+  }
+})
+
+test('a failing transcription answers with the reason, dispatches nothing and never logs the key', async () => {
+  await withVoiceBridge(
+    {
+      config: VOICE_ON,
+      voiceKey: VOICE_KEY,
+      transcribe: async () => {
+        throw new Error(`OpenAI error 401: Incorrect API key provided: ${VOICE_KEY}`)
+      }
+    },
+    async ({ controller, manager, deps, host, worker }) => {
+      await controller.handleIncomingUpdate(voiceUpdate(1, 'voice'))
+      assert.equal(deps.sentToBots.length, 0)
+      const reply = deps.sentMessages.at(-1)?.text ?? ''
+      assert.match(reply, /^Could not transcribe the voice message: OpenAI error 401/)
+      assert.ok(!reply.includes(VOICE_KEY), 'the Telegram reply holds the voice key')
+      const warn = storedLogs(host).find((e) => e.level === 'warn' && /not transcribed/.test(e.message))
+      assert.ok(warn, 'no warn entry for the failed transcription')
+      assert.match(warn?.details ?? '', /provider=openai/)
+      assert.match(warn?.details ?? '', /bytes=16/)
+      const surfaces = [
+        JSON.stringify(manager.getState()),
+        JSON.stringify(host.data().storage),
+        worker.logs.join('\n'),
+        (await manager.exportLogs()).text
+      ]
+      for (const text of surfaces) assert.ok(!text.includes(VOICE_KEY), 'a surface holds the voice key')
+    }
+  )
+})
+
+test('a voice file over 25 MB is refused before downloading', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, deps, calls }) => {
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice', {}, 26 * 1024 * 1024))
+    assert.equal(calls.length, 0)
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.at(-1)?.text, t('en').voiceFailed(t('en').voiceTooLarge))
+  })
+})
+
+test('an empty transcript is answered as such and dispatches nothing', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY, transcribe: async () => '  ' }, async ({ controller, deps }) => {
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice'))
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.at(-1)?.text, t('en').voiceFailed(t('en').voiceEmpty))
+  })
+})
+
+test('the transcript text never reaches the logs, even with debug logging on', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, host }) => {
+    await controller.handleIncomingUpdate(voiceUpdate(1, 'voice'))
+    const logs = JSON.stringify(storedLogs(host))
+    assert.ok(!logs.includes('turn on the lights'), 'a log entry holds the transcript')
+    assert.match(logs, /transcribe ok in \d+ ms: openai gpt-transcribe, 16 bytes/)
+  })
+})
+
+test('voice settings: a save without them keeps them, a new key is stored, the panel sees only hasVoiceKey', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ controller, manager, host }) => {
+    assert.equal(controller.view().config.hasVoiceKey, true)
+    await manager.saveConfig(saveInput(controller, { name: 'Renamed' }))
+    const { config } = controller.view()
+    assert.deepEqual([config.voiceEnabled, config.voiceProvider, config.voiceModel, config.hasVoiceKey], [true, 'openai', 'gpt-transcribe', true])
+    assert.equal(host.data().secrets['voiceKey.b-voice001'], VOICE_KEY)
+
+    await manager.saveConfig(saveInput(controller, { voiceProvider: 'openrouter', voiceModel: '', voiceApiKey: ' sk-new ' }))
+    assert.equal(host.data().secrets['voiceKey.b-voice001'], 'sk-new')
+    assert.equal(controller.view().config.voiceProvider, 'openrouter')
+    assert.ok(!JSON.stringify(manager.getState()).includes('sk-new'), 'the panel state holds the voice key')
+    assert.ok(!JSON.stringify(host.data().storage).includes('sk-new'), 'storage holds the voice key')
+
+    await manager.saveConfig(saveInput(controller, { clearVoiceKey: true }))
+    assert.equal(host.data().secrets['voiceKey.b-voice001'], undefined)
+    assert.equal(controller.view().config.hasVoiceKey, false)
+  })
+})
+
+test('a bridge stored without voice options reads them as off, OpenRouter, default model', async () => {
+  await withVoiceBridge({}, async ({ controller }) => {
+    const { config } = controller.view()
+    assert.deepEqual([config.voiceEnabled, config.voiceProvider, config.voiceModel, config.hasVoiceKey], [false, 'openrouter', '', false])
+  })
+})
+
+test('removing a bridge deletes its voice key', async () => {
+  await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ worker, host }) => {
+    await within(worker.request('bridge.remove', { bridgeId: 'b-voice001' }), 'remove')
+    assert.equal(host.data().secrets['voiceKey.b-voice001'], undefined)
+  })
 })

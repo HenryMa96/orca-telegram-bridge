@@ -8,7 +8,8 @@ export default defineCheck({
       debugLogging: true
     },
     secrets: {
-      'botToken.b1': '123456:CHECK_TOKEN'
+      'botToken.b1': '123456:CHECK_TOKEN',
+      'voiceKey.b1': 'sk-CHECK_VOICE_KEY'
     },
     storage: {
       bridges: [
@@ -23,6 +24,9 @@ export default defineCheck({
           syncOrcaOutbound: true,
           replyLanguage: 'pt-BR',
           allowGroups: true,
+          voiceEnabled: true,
+          voiceProvider: 'openai',
+          voiceModel: '',
           groupMode: 'all'
         },
         {
@@ -36,6 +40,9 @@ export default defineCheck({
           syncOrcaOutbound: false,
           replyLanguage: 'en',
           allowGroups: false,
+          voiceEnabled: false,
+          voiceProvider: 'openrouter',
+          voiceModel: '',
           groupMode: 'addressed'
         }
       ],

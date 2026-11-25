@@ -46,6 +46,9 @@ export type BotSummary = {
 // In a group: only messages for the bot (commands for it, replies to it, @mentions), or every message.
 export type GroupMode = 'addressed' | 'all'
 
+// Where voice messages are transcribed; both speak OpenAI's /audio/transcriptions API.
+export type VoiceProvider = 'openrouter' | 'openai'
+
 // One bridge: one Telegram bot token and the one Orca bot it talks to. Everything here is per bridge.
 export type BridgeConfig = {
   id: string
@@ -63,6 +66,12 @@ export type BridgeConfig = {
   allowGroups: boolean
   // 'all' takes effect only with a restricted allowedUserIds; while open it acts as 'addressed'.
   groupMode: GroupMode
+  // Voice messages and audio files are transcribed, then sent to the Orca bot as text.
+  voiceEnabled: boolean
+  voiceProvider: VoiceProvider
+  // '' = the provider's default model.
+  voiceModel: string
+  hasVoiceKey: boolean
 }
 
 export type BridgeView = {
@@ -112,6 +121,12 @@ export type SaveConfigInput = {
   // Absent keeps the current value.
   allowGroups?: boolean
   groupMode?: GroupMode
+  voiceEnabled?: boolean
+  voiceProvider?: VoiceProvider
+  voiceModel?: string
+  // Empty or absent keeps the saved key.
+  voiceApiKey?: string
+  clearVoiceKey?: boolean
 }
 
 export type TestConnectionResult = {

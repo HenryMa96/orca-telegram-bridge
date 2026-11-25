@@ -14,6 +14,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
 - **Telegram → Orca image forwarding** — downloads compressed photos and uncompressed image documents locally and passes their file path(s) to the Orca bot (with optional caption)
+- **Voice messages**: per bridge, voice messages and audio files are transcribed with OpenRouter or OpenAI and reach the Orca bot as text
 - **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram
 - **Telegram `/` command menu** (`setMyCommands`) + **interactive inline buttons**: `/help`, `/new`, `/home`, `/bots`, `/use`, `/chats`, `/bind`, `/rename`, `/sync`, `/automations`, `/run`, `/status`
 - **Rich Markdown + Table PNG rendering**:
@@ -178,6 +179,24 @@ Then:
 3. To restrict access to this group, add the group's ID to **Allowed Telegram IDs**. The group's ID appears in the **Chats** tab (`TG -100… -> …`) after the bot answers there once. In restricted mode, a blocked group message also logs it in the **Logs** tab: `Blocked unauthorized Telegram user <ID> (…) in group -100…`.
 
 In a group, everyone sees the bot's replies, and the whole group shares one Orca chat: `/new`, `/bind` and `/home` change it for everyone in that group.
+
+## Voice messages
+
+Orca bots run agent CLIs that read text, so the plugin transcribes voice messages first. Turn it on per bridge in the Setup tab → the bridge's **Edit**:
+
+1. Switch on **Voice messages**.
+2. Choose the **Transcription provider**:
+   - **OpenRouter**: one key for several speech-to-text models; default model `openai/whisper-large-v3`. Key from [openrouter.ai/keys](https://openrouter.ai/keys).
+   - **OpenAI**: default model `gpt-transcribe`. Key from [platform.openai.com/api-keys](https://platform.openai.com/api-keys).
+3. Optional: another **Transcription model** of that provider. Leave it empty for the default.
+4. Paste the **Transcription API key** and click **Save**. Orca keeps it encrypted, like the bot token.
+
+Then a voice message, or an audio file (mp3, m4a, ogg, wav, flac, webm), reaches the Orca bot as `[Voice message, transcribed] <text>`, after the caption if there is one. The bot answers the text; the transcript is not posted back to Telegram and never written to the logs.
+
+- The audio goes to the chosen provider, which charges per minute of audio. Files over 25 MB are refused.
+- The bridge's HTTP proxy, when set, is used for the transcription too.
+- With **Voice messages** off, or on without a key, the sender gets a short reply that voice messages are not enabled for this bot.
+- If the transcription fails, the sender gets a short reply with the reason, and the Logs tab has the details.
 
 ## Telegram Commands
 
