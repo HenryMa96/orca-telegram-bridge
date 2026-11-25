@@ -1,16 +1,48 @@
-import { assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
+import {
+  assert,
+  mockHost,
+  mount,
+  test,
+  type MockHostOptions,
+  type TestPanel
+} from 'orca/testing'
 import * as panel from './panel'
 import type {
   BridgeConfig,
   BridgeState,
   BridgeView,
   ChatBinding,
+  FocusedBot,
   SaveConfigInput
 } from './protocol'
 
-const ORCA_BOT_LABEL = 'Orca bot (this Telegram bot talks only to it)'
+const SELECT_BOT_HINT = 'Select a bot in the left sidebar to see its Telegram bridge.'
+const ALL_BRIDGES_NOTE = 'Showing all bridges: Orca did not say which bot is selected.'
+const TABS = { label: 'Telegram Bridge sections' }
 
 type BridgeOverrides = Partial<Omit<BridgeView, 'config'>> & { config?: Partial<BridgeConfig> }
+
+function botFocus(name: string): FocusedBot {
+  return { kind: 'bot', bot: { id: `bot-${name}`, name } }
+}
+
+// What the worker answers for the bot selected in Orca's sidebar; `selectInSidebar` changes it.
+let focused: FocusedBot = botFocus('Assistant')
+
+// A mock host whose worker answers `bridge.focusedBot` with the sidebar selection, Assistant by
+// default; the test's own `requests` answer the rest.
+function panelHost(options: MockHostOptions = {}, focus: FocusedBot = botFocus('Assistant')) {
+  focused = focus
+  return mockHost({ ...options, requests: { 'bridge.focusedBot': () => focused, ...options.requests } })
+}
+
+// As a click in Orca's sidebar: Orca tells the panel the focus changed, and the panel asks the worker.
+async function selectInSidebar(view: TestPanel, next: FocusedBot): Promise<void> {
+  focused = next
+  await view.emit('workspace.changed', {
+    context: next.kind === 'none' ? null : { workspaceId: 'folder:1', branch: '', displayName: '', terminals: [] }
+  })
+}
 
 function binding(tgChatId: string, botName: string, orcaChatId: string | null): ChatBinding {
   return { tgChatId, botId: `bot-${botName}`, botName, orcaChatId, updatedAt: Date.now() }
@@ -79,7 +111,8 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
   }
 }
 
-// @ci_bot is pinned to CIWatcher and restricted; @dev_bot is pinned to the first Orca bot and open.
+// @ci_bot is pinned to CIWatcher and restricted; @dev_bot is pinned to the first Orca bot
+// (Assistant) and open. DevHelper has no bridge.
 function twoBridges(): BridgeView[] {
   return [
     makeBridge('ci', {
@@ -116,12 +149,16 @@ async function openAdvanced(view: TestPanel): Promise<void> {
   await view.toggle({ type: 'Collapsible', label: 'Advanced' })
 }
 
+function cardLabels(view: TestPanel): (string | undefined)[] {
+  return view.findAll({ type: 'Card' }).map((c) => c.label)
+}
+
 test('renders bridge status, allows saving config, and handles unauthorized user banner', async () => {
   let currentState = makeState({ bridges: [makeBridge('b1', { lastBlockedUserId: '999000' })] })
   const allowed: Array<{ bridgeId: string; userId: string }> = []
   const saved: SaveConfigInput[] = []
   const tested: Array<{ bridgeId: string }> = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => currentState,
       'bridge.saveConfig': (input: SaveConfigInput) => {
@@ -172,32 +209,223 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   await view.unmount()
 })
 
-test('two bridges render one card each titled by @username with the pinned Orca bot', async () => {
-  const host = mockHost({
-    requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) }
+test("only the selected bot's bridge, chats and logs show; selecting another bot switches them", async () => {
+  const at = Date.now()
+  const state = makeState({
+    bridges: twoBridges(),
+    logTotal: 3,
+    logs: [
+      { id: 'c', at, level: 'info', scope: 'telegram', bridgeId: 'ci', message: 'CI polled' },
+      { id: 'd', at, level: 'info', scope: 'telegram', bridgeId: 'dev', message: 'Dev polled' },
+      { id: 'p', at, level: 'info', scope: 'config', message: 'Plugin started' }
+    ]
   })
+  const host = panelHost({ requests: { 'bridge.getState': () => state } }, botFocus('CIWatcher'))
   const view = await mount(panel, { host })
-  const cards = view.findAll({ type: 'Card' })
-  assert.deepEqual(
-    cards.map((c) => c.label),
-    ['@ci_bot', '@dev_bot']
-  )
-  assert.deepEqual(
-    cards.map((c) => c.props.description),
-    ['→ CIWatcher', '→ first Orca bot']
-  )
-  assert.equal(view.findAll({ label: 'Active' }).length, 2)
+  assert.deepEqual(cardLabels(view), ['@ci_bot'])
+  assert.equal(view.find({ type: 'Card', label: '@ci_bot' })!.props.description, '→ CIWatcher')
+  assert.equal(view.findAll({ label: 'Active' }).length, 1)
   // the card offers only Edit; Remove lives in the editor
   assert.equal(view.find({ testId: 'remove:ci' }), null)
+  assert.equal(view.find({ text: SELECT_BOT_HINT }), null)
+
+  await view.select(TABS, 'bindings')
+  assert.ok(view.find({ label: 'TG 111 -> CIWatcher' }))
+  assert.equal(view.find({ label: 'TG 222 -> Assistant' }), null)
+
+  await view.select(TABS, 'logs')
+  assert.ok(view.find({ label: 'CI polled' }))
+  assert.equal(view.find({ label: 'Dev polled' }), null)
+  assert.equal(view.find({ label: 'Plugin started' }), null)
+  // the logs are this bridge's: no bridge filter, and no bridge name on each entry
+  assert.equal(view.find({ label: 'Bridge' }), null)
+  assert.equal(view.find({ label: 'CI polled' })!.props.description, 'INFO · telegram')
+  assert.ok(view.find({ text: 'Showing 1 of 1 entries' }))
+
+  // the bridge stored with '' follows the first Orca bot, Assistant
+  await selectInSidebar(view, botFocus('Assistant'))
+  assert.ok(view.find({ label: 'Dev polled' }))
+  assert.equal(view.find({ label: 'CI polled' }), null)
+  await view.select(TABS, 'bindings')
+  assert.ok(view.find({ label: 'TG 222 -> Assistant' }))
+  assert.equal(view.find({ label: 'TG 111 -> CIWatcher' }), null)
+  await view.select(TABS, 'setup')
+  assert.deepEqual(cardLabels(view), ['@dev_bot'])
+  assert.equal(view.find({ type: 'Card', label: '@dev_bot' })!.props.description, '→ Assistant')
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
   await view.unmount()
 })
 
-test('Active on one bridge switches only that bridge', async () => {
+test('selecting another bot closes the open editor', async () => {
+  const host = panelHost({ requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) } }, botFocus('CIWatcher'))
+  const view = await mount(panel, { host })
+  await openEditor(view, 'ci')
+  assert.ok(view.find({ type: 'Card', label: 'Edit @ci_bot' }))
+  await selectInSidebar(view, botFocus('Assistant'))
+  assert.equal(view.find({ type: 'Card', label: 'Edit @ci_bot' }), null)
+  assert.equal(view.find({ type: 'Card', label: 'Edit @dev_bot' }), null)
+  await selectInSidebar(view, botFocus('CIWatcher'))
+  assert.equal(view.find({ type: 'Card', label: 'Edit @ci_bot' }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('outside a bot only the hint shows; bridges whose bot is gone are listed to edit', async () => {
+  const state = makeState({
+    bridges: [
+      ...twoBridges(),
+      makeBridge('gone', { name: 'Gone', botUsername: 'gone_bot', config: { orcaBot: 'OldBot' } })
+    ]
+  })
+  const host = panelHost({ requests: { 'bridge.getState': () => state } }, botFocus('CIWatcher'))
+  const view = await mount(panel, { host })
+  assert.deepEqual(cardLabels(view), ['@ci_bot'])
+
+  // a project workspace: the worker answers none
+  await selectInSidebar(view, { kind: 'none' })
+  assert.ok(view.find({ type: 'EmptyState', label: SELECT_BOT_HINT }))
+  assert.equal(view.find({ type: 'Tabs' }), null)
+  assert.equal(view.find({ text: 'Add bridge' }), null)
+  // @ci_bot and @dev_bot ('' with bots listed) have a bot; only the bridge to OldBot is lost
+  assert.deepEqual(cardLabels(view), ['@gone_bot'])
+  assert.ok(view.find({ type: 'Heading', text: 'Bridges without an Orca bot' }))
+  await openEditor(view, 'gone')
+  assert.ok(view.find({ text: 'Orca bot: OldBot. This Telegram bot talks only to it.' }))
+  assert.ok(view.find({ testId: 'remove:gone' }))
+
+  // back on a bot, its bridge shows again
+  await selectInSidebar(view, botFocus('CIWatcher'))
+  assert.deepEqual(cardLabels(view), ['@ci_bot'])
+  assert.equal(view.find({ text: SELECT_BOT_HINT }), null)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('without lost bridges the hint is all a non-bot focus shows', async () => {
+  const host = panelHost({ requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) } }, { kind: 'none' })
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ type: 'EmptyState', label: SELECT_BOT_HINT }))
+  assert.equal(view.findAll({ type: 'Card' }).length, 0)
+  assert.equal(view.find({ type: 'Tabs' }), null)
+  assert.equal(view.find({ text: 'Refresh' }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('an answer for an earlier focus is dropped when the focus moved on', async () => {
+  const state = makeState({ bridges: twoBridges() })
+  const slow = Promise.withResolvers<void>()
+  let asked = 0
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.focusedBot': async (): Promise<FocusedBot> => {
+        asked += 1
+        // setup asks first (Assistant); the next answer (CIWatcher) comes after a later click's.
+        if (asked === 1) return botFocus('Assistant')
+        if (asked === 2) {
+          await slow.promise
+          return botFocus('CIWatcher')
+        }
+        return botFocus('DevHelper')
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.deepEqual(cardLabels(view), ['@dev_bot'])
+  const context = { workspaceId: 'folder:1', branch: '', displayName: '', terminals: [] }
+  const first = view.emit('workspace.changed', { context })
+  const second = view.emit('workspace.changed', { context })
+  slow.resolve()
+  await Promise.all([first, second])
+  assert.equal(asked, 3)
+  assert.ok(view.find({ type: 'EmptyState', label: 'No Telegram bridge for DevHelper' }))
+  assert.equal(view.find({ type: 'Card', label: '@ci_bot' }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('when Orca cannot say which bot is selected every bridge shows, with the bridge filter', async () => {
+  const at = Date.now()
+  const saved: SaveConfigInput[] = []
+  const state = makeState({
+    bridges: twoBridges(),
+    logTotal: 3,
+    logs: [
+      { id: 'c', at, level: 'info', scope: 'telegram', bridgeId: 'ci', message: 'CI polled' },
+      { id: 'd', at, level: 'info', scope: 'telegram', bridgeId: 'dev', message: 'Dev polled' },
+      { id: 'p', at, level: 'info', scope: 'config', message: 'Plugin started' }
+    ]
+  })
+  const host = panelHost(
+    {
+      requests: {
+        'bridge.getState': () => state,
+        'bridge.saveConfig': (input: SaveConfigInput) => {
+          saved.push(input)
+          return state
+        }
+      }
+    },
+    { kind: 'unknown', reason: 'This Orca does not name the focused workspace.' }
+  )
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ text: ALL_BRIDGES_NOTE }))
+  assert.equal(view.find({ text: SELECT_BOT_HINT }), null)
+  assert.deepEqual(cardLabels(view), ['@ci_bot', '@dev_bot'])
+  assert.deepEqual(
+    view.findAll({ type: 'Card' }).map((c) => c.props.description),
+    ['→ CIWatcher', '→ first Orca bot']
+  )
+  assert.equal(view.findAll({ label: 'Active' }).length, 2)
+  assert.ok(view.find({ text: 'Add bridge' }))
+
+  // the editor keeps the bridge on its own bot
+  await openEditor(view, 'dev')
+  await view.press({ text: 'Save' })
+  assert.equal(saved[0].orcaBot, '')
+
+  await view.select(TABS, 'bindings')
+  const headings = view
+    .findAll({ type: 'Heading' })
+    .filter((h) => h.props.level === 3)
+    .map((h) => h.text)
+  assert.deepEqual(headings, ['@ci_bot', '@dev_bot'])
+
+  await view.select(TABS, 'logs')
+  assert.ok(view.find({ text: 'Showing 3 of 3 entries' }))
+  assert.equal(view.find({ label: 'Dev polled' })!.props.description, 'INFO · telegram · @dev_bot')
+  await view.select({ label: 'Bridge' }, 'dev')
+  assert.ok(view.find({ label: 'Dev polled' }))
+  assert.equal(view.find({ label: 'CI polled' }), null)
+  assert.equal(view.find({ label: 'Plugin started' }), null)
+  assert.ok(view.find({ text: 'Showing 1 of 3 entries' }))
+  await view.select({ label: 'Bridge' }, '__plugin__')
+  assert.ok(view.find({ label: 'Plugin started' }))
+  assert.equal(view.find({ label: 'Dev polled' }), null)
+  await view.select({ label: 'Bridge' }, 'all')
+  assert.ok(view.find({ text: 'Showing 3 of 3 entries' }))
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('a worker that cannot answer the focus also shows every bridge', async () => {
+  // No bridge.focusedBot handler: the request fails like an older worker's would.
+  const host = mockHost({ requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) } })
+  const view = await mount(panel, { host })
+  assert.ok(view.find({ text: ALL_BRIDGES_NOTE }))
+  assert.deepEqual(cardLabels(view), ['@ci_bot', '@dev_bot'])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('Active switches the shown bridge only', async () => {
   let current = makeState({ bridges: twoBridges() })
   const sent: Array<{ bridgeId: string; enabled: boolean }> = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => current,
       'bridge.setEnabled': (input: { bridgeId: string; enabled: boolean }) => {
@@ -215,40 +443,52 @@ test('Active on one bridge switches only that bridge', async () => {
   await view.toggle({ testId: 'active:dev' })
   assert.deepEqual(sent, [{ bridgeId: 'dev', enabled: false }])
   assert.equal(view.valueOf({ testId: 'active:dev' }), false)
-  assert.equal(view.valueOf({ testId: 'active:ci' }), true)
+  assert.equal(view.find({ testId: 'active:ci' }), null)
   assert.ok(view.find({ text: 'Paused' }))
-  assert.ok(view.find({ text: 'Connected' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
-test('Add bridge asks the worker and opens the new bridge in the editor', async () => {
+test('a bot without a bridge shows only Add bridge, which pins the new bridge to it and opens its editor', async () => {
   let current = makeState({ bridges: twoBridges() })
-  const added: unknown[] = []
-  const host = mockHost({
-    requests: {
-      'bridge.getState': () => current,
-      'bridge.add': (input: { name?: string }) => {
-        added.push(input)
-        const fresh = makeBridge('b3', {
-          name: 'Bridge 3',
-          status: 'needs_token',
-          polling: false,
-          botUsername: null,
-          bindings: [],
-          config: { hasToken: false, enabled: false, orcaBot: '', allowedUserIds: '' }
-        })
-        current = { ...current, bridges: [...current.bridges, fresh] }
-        return { bridgeId: 'b3', state: current }
+  const added: Array<{ name?: string; orcaBot?: string }> = []
+  const host = panelHost(
+    {
+      requests: {
+        'bridge.getState': () => current,
+        'bridge.add': (input: { name?: string; orcaBot?: string }) => {
+          added.push(input)
+          const fresh = makeBridge('b3', {
+            name: 'Bridge 3',
+            status: 'needs_token',
+            polling: false,
+            botUsername: null,
+            bindings: [],
+            config: { hasToken: false, enabled: false, orcaBot: input.orcaBot ?? '', allowedUserIds: '' }
+          })
+          current = { ...current, bridges: [...current.bridges, fresh] }
+          return { bridgeId: 'b3', state: current }
+        }
       }
-    }
-  })
+    },
+    botFocus('DevHelper')
+  )
   const view = await mount(panel, { host })
+  assert.equal(view.findAll({ type: 'Card' }).length, 0)
+  assert.ok(view.find({ type: 'EmptyState', label: 'No Telegram bridge for DevHelper' }))
+  assert.equal(view.findAll({ type: 'Button', text: 'Add bridge' }).length, 1)
+  await view.select(TABS, 'bindings')
+  assert.ok(view.find({ type: 'EmptyState', label: 'No active Telegram chats yet' }))
+  await view.select(TABS, 'logs')
+  assert.ok(view.find({ type: 'EmptyState', label: 'No activity logs yet' }))
+  await view.select(TABS, 'setup')
+
   await view.press({ text: 'Add bridge' })
-  assert.equal(added.length, 1)
+  assert.deepEqual(added, [{ orcaBot: 'DevHelper' }])
   // before the token is checked the bot has no @username, so the card says what it is
-  assert.ok(view.find({ type: 'Card', label: 'New Telegram bot' }))
+  assert.equal(view.find({ type: 'Card', label: 'New Telegram bot' })!.props.description, '→ DevHelper')
   assert.ok(view.find({ type: 'Card', label: 'Edit New Telegram bot' }))
+  assert.equal(view.find({ text: 'Add bridge' }), null)
   assert.equal(view.find({ label: 'Name' }), null)
   // a new bridge has no token yet, so it cannot be tested or switched on
   assert.equal(view.find({ text: 'Test connection' })!.disabled, true)
@@ -257,10 +497,10 @@ test('Add bridge asks the worker and opens the new bridge in the editor', async 
   await view.unmount()
 })
 
-test('Save sends the edited bridge id and never the on/off state or a name', async () => {
+test('Save sends the edited bridge id and never the on/off state or a name; it pins a bridge on "" to the bot', async () => {
   const state = makeState({ bridges: twoBridges() })
   const saved: SaveConfigInput[] = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.saveConfig': (input: SaveConfigInput) => {
@@ -273,12 +513,11 @@ test('Save sends the edited bridge id and never the on/off state or a name', asy
   await openEditor(view, 'dev')
   // the bot's @username names it; there is no Name field and no name in the payload
   assert.equal(view.find({ label: 'Name' }), null)
-  await view.select({ label: ORCA_BOT_LABEL }, 'DevHelper')
   await view.press({ text: 'Save' })
   assert.deepEqual(saved, [
     {
       bridgeId: 'dev',
-      orcaBot: 'DevHelper',
+      orcaBot: 'Assistant',
       allowedUserIds: '',
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
@@ -298,7 +537,7 @@ test('Save sends the edited bridge id and never the on/off state or a name', asy
 
 test('a duplicate token refused by the worker shows in feedback and keeps the editor', async () => {
   const state = makeState({ bridges: twoBridges() })
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.saveConfig': () => {
@@ -319,19 +558,22 @@ test('a duplicate token refused by the worker shows in feedback and keeps the ed
   await view.unmount()
 })
 
-test('Remove sits in the editor and needs a second press on Confirm remove', async () => {
+test('Remove sits in the editor, needs a second press, and leaves the bot with Add bridge', async () => {
   let current = makeState({ bridges: twoBridges() })
   const removed: Array<{ bridgeId: string }> = []
-  const host = mockHost({
-    requests: {
-      'bridge.getState': () => current,
-      'bridge.remove': (input: { bridgeId: string }) => {
-        removed.push(input)
-        current = { ...current, bridges: current.bridges.filter((b) => b.id !== input.bridgeId) }
-        return current
+  const host = panelHost(
+    {
+      requests: {
+        'bridge.getState': () => current,
+        'bridge.remove': (input: { bridgeId: string }) => {
+          removed.push(input)
+          current = { ...current, bridges: current.bridges.filter((b) => b.id !== input.bridgeId) }
+          return current
+        }
       }
-    }
-  })
+    },
+    botFocus('CIWatcher')
+  )
   const view = await mount(panel, { host })
 
   await openEditor(view, 'ci')
@@ -340,24 +582,23 @@ test('Remove sits in the editor and needs a second press on Confirm remove', asy
   await view.press({ testId: 'keep:ci' })
   assert.equal(view.find({ testId: 'confirm-remove:ci' }), null)
 
-  await openEditor(view, 'dev')
-  await view.press({ testId: 'remove:dev' })
+  await view.press({ testId: 'remove:ci' })
   assert.deepEqual(removed, [])
-  assert.equal(view.find({ testId: 'confirm-remove:dev' })!.text, 'Confirm remove')
-  await view.press({ testId: 'confirm-remove:dev' })
-  assert.deepEqual(removed, [{ bridgeId: 'dev' }])
-  assert.equal(view.find({ type: 'Card', label: '@dev_bot' }), null)
-  assert.equal(view.find({ type: 'Card', label: 'Edit @dev_bot' }), null)
-  assert.ok(view.find({ type: 'Card', label: '@ci_bot' }))
-  assert.ok(view.find({ text: 'Removed @dev_bot.' }))
+  assert.equal(view.find({ testId: 'confirm-remove:ci' })!.text, 'Confirm remove')
+  await view.press({ testId: 'confirm-remove:ci' })
+  assert.deepEqual(removed, [{ bridgeId: 'ci' }])
+  assert.equal(view.find({ type: 'Card', label: '@ci_bot' }), null)
+  assert.equal(view.find({ type: 'Card', label: 'Edit @ci_bot' }), null)
+  assert.ok(view.find({ type: 'EmptyState', label: 'No Telegram bridge for CIWatcher' }))
+  assert.ok(view.find({ text: 'Removed @ci_bot.' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
-test('Chats tab groups bindings under each bridge and resets on the right bridge', async () => {
+test("Chats shows the shown bridge's chats and resets on that bridge", async () => {
   const state = makeState({ bridges: twoBridges() })
   const resets: Array<{ bridgeId: string; tgChatId: string }> = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.resetBinding': (input: { bridgeId: string; tgChatId: string }) => {
@@ -367,14 +608,12 @@ test('Chats tab groups bindings under each bridge and resets on the right bridge
     }
   })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'bindings')
-  const headings = view
-    .findAll({ type: 'Heading' })
-    .filter((h) => h.props.level === 3)
-    .map((h) => h.text)
-  assert.deepEqual(headings, ['@ci_bot', '@dev_bot'])
+  await view.select(TABS, 'bindings')
+  // one bridge's chats need no heading per bridge
+  assert.equal(view.findAll({ type: 'Heading' }).filter((h) => h.props.level === 3).length, 0)
   assert.ok(view.find({ label: 'TG 222 -> Assistant' }))
-  assert.ok(view.find({ label: 'TG 111 -> CIWatcher' }))
+  assert.ok(view.find({ label: 'TG 333 -> Assistant' }))
+  assert.equal(view.find({ label: 'TG 111 -> CIWatcher' }), null)
 
   await view.press({ testId: 'reset:dev:222' })
   assert.deepEqual(resets, [{ bridgeId: 'dev', tgChatId: '222' }])
@@ -382,68 +621,16 @@ test('Chats tab groups bindings under each bridge and resets on the right bridge
   await view.unmount()
 })
 
-test('logs bridge filter shows one bridge, or plugin entries without a bridge', async () => {
-  const at = Date.now()
-  const host = mockHost({
-    requests: {
-      'bridge.getState': () =>
-        makeState({
-          bridges: twoBridges(),
-          logTotal: 3,
-          logs: [
-            { id: 'c', at, level: 'info', scope: 'telegram', bridgeId: 'ci', message: 'CI polled' },
-            { id: 'd', at, level: 'info', scope: 'telegram', bridgeId: 'dev', message: 'Dev polled' },
-            { id: 'p', at, level: 'info', scope: 'config', message: 'Plugin started' }
-          ]
-        })
-    }
-  })
-  const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
-  assert.ok(view.find({ text: 'Showing 3 of 3 entries' }))
-  assert.equal(view.find({ label: 'Dev polled' })!.props.description, 'INFO · telegram · @dev_bot')
-
-  await view.select({ label: 'Bridge' }, 'dev')
-  assert.ok(view.find({ label: 'Dev polled' }))
-  assert.equal(view.find({ label: 'CI polled' }), null)
-  assert.equal(view.find({ label: 'Plugin started' }), null)
-  assert.ok(view.find({ text: 'Showing 1 of 3 entries' }))
-
-  await view.select({ label: 'Bridge' }, '__plugin__')
-  assert.ok(view.find({ label: 'Plugin started' }))
-  assert.equal(view.find({ label: 'Dev polled' }), null)
-  assert.equal(view.find({ label: 'CI polled' }), null)
-
-  await view.select({ label: 'Bridge' }, 'all')
-  assert.ok(view.find({ text: 'Showing 3 of 3 entries' }))
-  assert.deepEqual(view.errors, [])
-  assert.deepEqual(view.warnings, [])
-  await view.unmount()
-})
-
-test('default bot select offers auto with a non-empty value and saves it as empty orcaBot', async () => {
-  const saved: SaveConfigInput[] = []
-  const state = makeState({ bridges: [makeBridge('b1', { config: { orcaBot: '' } })] })
-  const host = mockHost({
-    requests: {
-      'bridge.getState': () => state,
-      'bridge.saveConfig': (input: SaveConfigInput) => {
-        saved.push(input)
-        return state
-      }
-    }
-  })
+test('the editor names the Orca bot as text: no bot select and no Auto option', async () => {
+  const state = makeState()
+  const host = panelHost({ requests: { 'bridge.getState': () => state } })
   const view = await mount(panel, { host })
   await openEditor(view, 'b1')
-  const options = view.find({ label: ORCA_BOT_LABEL })!.props.options as Array<{ value: string }>
-  assert.ok(options.length >= 2)
-  assert.equal(options.some((o) => o.value === ''), false)
-  assert.equal(view.valueOf({ label: ORCA_BOT_LABEL }), '__auto__')
-
-  await view.select({ label: ORCA_BOT_LABEL }, 'Assistant')
-  await view.select({ label: ORCA_BOT_LABEL }, '__auto__')
-  await view.press({ text: 'Save' })
-  assert.equal(saved[0].orcaBot, '')
+  assert.equal(view.find({ label: 'Orca bot (this Telegram bot talks only to it)' }), null)
+  assert.equal(view.find({ text: /Auto-select/ }), null)
+  // Voice is off and Advanced is closed, so the editor shows no Select at all.
+  assert.equal(view.findAll({ type: 'Select' }).length, 0)
+  assert.ok(view.find({ text: 'Orca bot: Assistant. This Telegram bot talks only to it.' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -451,7 +638,7 @@ test('default bot select offers auto with a non-empty value and saves it as empt
 test('the reply language select shows the saved language and saves the chosen one', async () => {
   const saved: SaveConfigInput[] = []
   const state = makeState({ bridges: [makeBridge('b1', { config: { replyLanguage: 'zh-CN' } })] })
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.saveConfig': (input: SaveConfigInput) => {
@@ -473,7 +660,7 @@ test('the reply language select shows the saved language and saves the chosen on
 })
 
 function savingHost(state: BridgeState, saved: SaveConfigInput[]) {
-  return mockHost({
+  return panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.saveConfig': (input: SaveConfigInput) => {
@@ -574,20 +761,25 @@ test('the bridge card shows the voice provider and the no-key hint', async () =>
   const state = makeState({
     bridges: [
       makeBridge('a', { name: 'A' }),
-      makeBridge('b', { name: 'B', config: { voiceEnabled: true, voiceProvider: 'openai', voiceModel: 'whisper-1', hasVoiceKey: true } }),
-      makeBridge('c', { name: 'C', config: { voiceEnabled: true } })
+      makeBridge('b', {
+        name: 'B',
+        config: { orcaBot: 'CIWatcher', voiceEnabled: true, voiceProvider: 'openai', voiceModel: 'whisper-1', hasVoiceKey: true }
+      }),
+      makeBridge('c', { name: 'C', config: { orcaBot: 'DevHelper', voiceEnabled: true } })
     ]
   })
   const view = await mount(panel, { host: savingHost(state, []) })
   assert.ok(view.find({ text: 'Voice: off' }))
+  await selectInSidebar(view, botFocus('CIWatcher'))
   assert.ok(view.find({ text: 'Voice: OpenAI' }))
+  await selectInSidebar(view, botFocus('DevHelper'))
   assert.ok(view.find({ text: 'Voice: OpenRouter – no API key' }))
   await view.unmount()
 })
 
 test('failing worker request shows feedback and refresh keeps unsaved edits', async () => {
   let failSetEnabled = true
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => makeState(),
       'bridge.setEnabled': () => {
@@ -617,7 +809,7 @@ test('failing worker request shows feedback and refresh keeps unsaved edits', as
 test('turning Active off asks the worker at once and shows the paused state', async () => {
   let current = makeState()
   const sent: Array<{ bridgeId: string; enabled: boolean }> = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => current,
       'bridge.setEnabled': (input: { bridgeId: string; enabled: boolean }) => {
@@ -647,7 +839,7 @@ test('turning Active off asks the worker at once and shows the paused state', as
 })
 
 test('bot on/off has one control per bridge: no polling button and no switch in the editor', async () => {
-  const host = mockHost({
+  const host = panelHost({
     requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) }
   })
   const view = await mount(panel, { host })
@@ -655,7 +847,7 @@ test('bot on/off has one control per bridge: no polling button and no switch in 
   assert.equal(view.find({ text: 'Pause Polling' }), null)
   assert.equal(view.find({ text: 'Start Polling' }), null)
   assert.equal(view.find({ label: 'Enable automatic polling' }), null)
-  assert.equal(view.findAll({ label: 'Active' }).length, 2)
+  assert.equal(view.findAll({ label: 'Active' }).length, 1)
   await view.unmount()
 })
 
@@ -670,7 +862,7 @@ test('without a saved token the Active switch is disabled and says why', async (
       })
     ]
   })
-  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const host = panelHost({ requests: { 'bridge.getState': () => state } })
   const view = await mount(panel, { host })
   assert.equal(view.find({ label: 'Active' })!.props.disabled, true)
   assert.ok(view.find({ text: 'Save a bot token first.' }))
@@ -680,14 +872,14 @@ test('without a saved token the Active switch is disabled and says why', async (
 
 test('long log messages are truncated below the label limit', async () => {
   const long = 'x'.repeat(5000)
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () =>
-        makeState({ logs: [{ id: '1', at: Date.now(), level: 'error', message: long }] })
+        makeState({ logs: [{ id: '1', at: Date.now(), level: 'error', bridgeId: 'b1', message: long }] })
     }
   })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  await view.select(TABS, 'logs')
   const item = view.find({ label: /^x+…$/ })
   assert.ok(item)
   assert.deepEqual(view.warnings, [])
@@ -697,22 +889,22 @@ test('long log messages are truncated below the label limit', async () => {
 
 test('log level filter hides entries outside the chosen level', async () => {
   const at = Date.now()
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () =>
         makeState({
           logTotal: 4,
           logs: [
-            { id: 'e', at, level: 'error', scope: 'orca-cli', message: 'Orca CLI call failed' },
-            { id: 'w', at, level: 'warn', scope: 'telegram', message: 'Telegram answered slowly' },
-            { id: 'i', at, level: 'info', scope: 'bridge', message: 'Polling started' },
-            { id: 'd', at, level: 'debug', scope: 'dispatch', message: 'Dispatch finished in 12 ms' }
+            { id: 'e', at, level: 'error', scope: 'orca-cli', bridgeId: 'b1', message: 'Orca CLI call failed' },
+            { id: 'w', at, level: 'warn', scope: 'telegram', bridgeId: 'b1', message: 'Telegram answered slowly' },
+            { id: 'i', at, level: 'info', scope: 'bridge', bridgeId: 'b1', message: 'Polling started' },
+            { id: 'd', at, level: 'debug', scope: 'dispatch', bridgeId: 'b1', message: 'Dispatch finished in 12 ms' }
           ]
         })
     }
   })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  await view.select(TABS, 'logs')
   assert.ok(view.find({ label: 'Polling started' }))
   assert.ok(view.find({ text: 'Showing 4 of 4 entries' }))
 
@@ -738,21 +930,21 @@ test('log level filter hides entries outside the chosen level', async () => {
 test('an entry with details shows them after expanding, between plain entries', async () => {
   const at = Date.now()
   const details = 'OrcaCliError: orca exited with code 2\nargs: bot send --json\nexitCode: 2\nstderr: unknown bot'
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () =>
         makeState({
           logTotal: 3,
           logs: [
-            { id: 'a', at, level: 'info', scope: 'dispatch', message: 'Reply sent' },
-            { id: 'b', at, level: 'error', scope: 'orca-cli', message: 'Orca CLI call failed', details },
-            { id: 'c', at, level: 'info', scope: 'bridge', message: 'Polling started' }
+            { id: 'a', at, level: 'info', scope: 'dispatch', bridgeId: 'b1', message: 'Reply sent' },
+            { id: 'b', at, level: 'error', scope: 'orca-cli', bridgeId: 'b1', message: 'Orca CLI call failed', details },
+            { id: 'c', at, level: 'info', scope: 'bridge', bridgeId: 'b1', message: 'Polling started' }
           ]
         })
     }
   })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  await view.select(TABS, 'logs')
   assert.ok(view.find({ label: 'Reply sent' }))
   assert.ok(view.find({ label: 'Polling started' }))
   assert.equal(view.find({ type: 'CodeView' }), null)
@@ -772,7 +964,7 @@ test('an entry with details shows them after expanding, between plain entries', 
 test('export logs saves the worker text as a file and reports only a real save', async () => {
   const exported = { fileName: 'telegram-bridge-logs-2026-11-25.txt', text: 'Telegram Bridge 0.2.0\n\n[error] boom' }
   let exportCalls = 0
-  const host = mockHost({
+  const host = panelHost({
     results: { 'files.saveAs': { status: 'cancelled' } },
     requests: {
       'bridge.getState': () => makeState(),
@@ -783,7 +975,7 @@ test('export logs saves the worker text as a file and reports only a real save',
     }
   })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  await view.select(TABS, 'logs')
 
   await view.press({ text: 'Export logs' })
   assert.equal(exportCalls, 1)
@@ -805,7 +997,7 @@ test('export logs saves the worker text as a file and reports only a real save',
 test('debug logging switch asks the worker to turn global debug logging on', async () => {
   let current = makeState()
   const sent: Array<{ enabled: boolean }> = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => current,
       'bridge.setDebugLogging': (input: { enabled: boolean }) => {
@@ -816,7 +1008,7 @@ test('debug logging switch asks the worker to turn global debug logging on', asy
     }
   })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  await view.select(TABS, 'logs')
   assert.equal(view.valueOf({ label: 'Debug logging' }), false)
 
   await view.toggle({ label: 'Debug logging' })
@@ -826,17 +1018,21 @@ test('debug logging switch asks the worker to turn global debug logging on', asy
   await view.unmount()
 })
 
+// Entries stored before 0.5.0 name no bridge, so only the every-bridge view shows them.
 test('entries stored by 0.2.0 without scope render as bridge entries', async () => {
-  const host = mockHost({
-    requests: {
-      'bridge.getState': () =>
-        makeState({
-          logs: [{ id: 'old', at: Date.now(), level: 'warn', message: 'Telegram polling paused.' }]
-        })
-    }
-  })
+  const host = panelHost(
+    {
+      requests: {
+        'bridge.getState': () =>
+          makeState({
+            logs: [{ id: 'old', at: Date.now(), level: 'warn', message: 'Telegram polling paused.' }]
+          })
+      }
+    },
+    { kind: 'unknown', reason: 'test' }
+  )
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  await view.select(TABS, 'logs')
   const item = view.find({ label: 'Telegram polling paused.' })
   assert.ok(item)
   assert.equal(item!.props.description, 'WARN · bridge')
@@ -849,9 +1045,9 @@ async function mountWithAllowed(allowedUserIds: string, syncOrcaOutbound = false
   const state = makeState({
     bridges: [makeBridge('b1', { config: { allowedUserIds, syncOrcaOutbound } })]
   })
-  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const host = panelHost({ requests: { 'bridge.getState': () => state } })
   const view = await mount(panel, { host })
-  await view.select({ label: 'Telegram Bridge sections' }, 'setup')
+  await view.select(TABS, 'setup')
   await openEditor(view, 'b1')
   return view
 }
@@ -868,7 +1064,7 @@ function openWarnings(view: TestPanel) {
 test('an empty allowlist shows the open to everyone warning naming the bot', async () => {
   const view = await mountWithAllowed('')
   assert.equal(openWarnings(view).length, 1)
-  assert.ok(view.find({ text: /Anyone who finds @demo_orca_bot on Telegram/ }))
+  assert.ok(view.find({ text: /Anyone who finds @demo_orca_bot on Telegram can chat with Assistant/ }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -886,13 +1082,16 @@ test('an allowlist with no valid ID still counts as open', async () => {
 })
 
 test('the open warning is per bridge: only the open bridge shows it', async () => {
-  const host = mockHost({
-    requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) }
-  })
+  const host = panelHost(
+    { requests: { 'bridge.getState': () => makeState({ bridges: twoBridges() }) } },
+    botFocus('CIWatcher')
+  )
   const view = await mount(panel, { host })
+  assert.equal(openWarnings(view).length, 0)
+  assert.equal(view.find({ text: /Anyone who finds @ci_bot/ }), null)
+  await selectInSidebar(view, botFocus('Assistant'))
   assert.equal(openWarnings(view).length, 1)
   assert.ok(view.find({ text: /Anyone who finds @dev_bot on Telegram/ }))
-  assert.equal(view.find({ text: /Anyone who finds @ci_bot/ }), null)
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
@@ -913,7 +1112,7 @@ test('sync on with an open allowlist says sync is paused, restricted list does n
 })
 
 function savedInputs(state: BridgeState, saved: SaveConfigInput[]) {
-  return mockHost({
+  return panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.saveConfig': (input: SaveConfigInput) => {
@@ -936,6 +1135,7 @@ test('Anyone on Telegram saves an empty allowlist', async () => {
   await view.select({ label: 'Who can talk' }, 'open')
   assert.equal(view.find({ label: 'Telegram user and group IDs' }), null)
   assert.equal(calloutsTitled(view, 'Anyone can use this bot').length, 1)
+  assert.ok(view.find({ text: /Anyone who finds this bot can chat with Assistant/ }))
   // going back shows the IDs typed before
   await view.select({ label: 'Who can talk' }, 'restricted')
   assert.equal(view.valueOf({ label: 'Telegram user and group IDs' }), '123456')
@@ -1012,7 +1212,7 @@ async function mountGroups(
   telegramCaps: BridgeView['telegramCaps'] = { canJoinGroups: true, canReadAllGroupMessages: true }
 ) {
   const state = makeState({ bridges: [makeBridge('b1', { telegramCaps, config })] })
-  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const host = panelHost({ requests: { 'bridge.getState': () => state } })
   const view = await mount(panel, { host })
   await openEditor(view, 'b1')
   return view
@@ -1021,7 +1221,7 @@ async function mountGroups(
 test('one group choice says what the bot reads and when it answers, and Save maps it to the three fields', async () => {
   const state = makeState()
   const saved: SaveConfigInput[] = []
-  const host = mockHost({
+  const host = panelHost({
     requests: {
       'bridge.getState': () => state,
       'bridge.saveConfig': (input: SaveConfigInput) => {
@@ -1077,28 +1277,36 @@ test('one group choice says what the bot reads and when it answers, and Save map
 })
 
 test('each bridge card says how it reads groups', async () => {
+  // One bridge per Orca bot, so each bot's view shows one of the five group setups.
+  const setups: Array<{ bot: string; config: Partial<BridgeConfig>; summary: string }> = [
+    { bot: 'Off', config: {}, summary: 'Groups: off' },
+    { bot: 'Addressed', config: { allowGroups: true }, summary: 'Groups: answers when called' },
+    {
+      bot: 'All',
+      config: { allowGroups: true, groupMode: 'all' },
+      summary: 'Groups: follows the conversation, answers when called'
+    },
+    {
+      bot: 'Help',
+      config: { allowGroups: true, groupMode: 'all', groupReply: 'helpful' },
+      summary: 'Groups: follows the conversation, joins in when useful'
+    },
+    {
+      bot: 'Open',
+      config: { allowGroups: true, groupMode: 'all', allowedUserIds: '' },
+      summary: 'Groups: answers when called (following the conversation needs an ID list)'
+    }
+  ]
   const state = makeState({
-    bridges: [
-      makeBridge('off', { name: 'Off' }),
-      makeBridge('addr', { name: 'Addressed', config: { allowGroups: true } }),
-      makeBridge('all', { name: 'All', config: { allowGroups: true, groupMode: 'all' } }),
-      makeBridge('help', {
-        name: 'Help',
-        config: { allowGroups: true, groupMode: 'all', groupReply: 'helpful' }
-      }),
-      makeBridge('open', {
-        name: 'Open',
-        config: { allowGroups: true, groupMode: 'all', allowedUserIds: '' }
-      })
-    ]
+    bridges: setups.map((s) => makeBridge(s.bot.toLowerCase(), { name: s.bot, config: { ...s.config, orcaBot: s.bot } })),
+    bots: setups.map((s) => ({ id: `bot-${s.bot}`, name: s.bot, specialty: '', agent: 'claude' }))
   })
-  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const host = panelHost({ requests: { 'bridge.getState': () => state } }, botFocus('Off'))
   const view = await mount(panel, { host })
-  assert.ok(view.find({ text: 'Groups: off' }))
-  assert.ok(view.find({ text: 'Groups: answers when called' }))
-  assert.ok(view.find({ text: 'Groups: follows the conversation, answers when called' }))
-  assert.ok(view.find({ text: 'Groups: follows the conversation, joins in when useful' }))
-  assert.ok(view.find({ text: 'Groups: answers when called (following the conversation needs an ID list)' }))
+  for (const setup of setups) {
+    await selectInSidebar(view, botFocus(setup.bot))
+    assert.ok(view.find({ text: setup.summary }), setup.bot)
+  }
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

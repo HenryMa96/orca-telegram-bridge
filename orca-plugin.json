@@ -128,6 +128,9 @@
     },
     {
       "kind": "settings:own"
+    },
+    {
+      "kind": "workspace:read"
     }
   ]
 }

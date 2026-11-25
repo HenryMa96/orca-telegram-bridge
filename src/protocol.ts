@@ -149,11 +149,21 @@ export type ExportLogsResult = {
   text: string
 }
 
+// The Orca bot selected in Orca's sidebar. `none`: Orca answered and the focus is not a bot (no
+// workspace, a worktree, a folder without bot.json). `unknown`: the worker could not find out.
+export type FocusedBot =
+  | { kind: 'bot'; bot: { id: string; name: string } }
+  | { kind: 'none' }
+  | { kind: 'unknown'; reason: string }
+
 declare module 'orca' {
   interface PluginRequests {
     'bridge.getState': { output: BridgeState }
-    // A new bridge starts without a token and switched off.
-    'bridge.add': { input: { name?: string }; output: { bridgeId: string; state: BridgeState } }
+    // A new bridge starts without a token and switched off; `orcaBot` pins it to that Orca bot.
+    'bridge.add': {
+      input: { name?: string; orcaBot?: string }
+      output: { bridgeId: string; state: BridgeState }
+    }
     'bridge.remove': { input: { bridgeId: string }; output: BridgeState }
     'bridge.saveConfig': { input: SaveConfigInput; output: BridgeState }
     'bridge.testConnection': { input: { bridgeId: string }; output: TestConnectionResult }
@@ -163,6 +173,7 @@ declare module 'orca' {
     'bridge.clearLogs': { output: BridgeState }
     'bridge.setDebugLogging': { input: { enabled: boolean }; output: BridgeState }
     'bridge.exportLogs': { output: ExportLogsResult }
+    'bridge.focusedBot': { output: FocusedBot }
   }
   interface PluginPanelEvents {
     'bridge.stateChanged': BridgeState

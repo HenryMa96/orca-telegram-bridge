@@ -14,7 +14,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 
 ## Features
 
-- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, language, proxy and on/off switch
+- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, language, proxy and on/off switch. The Telegram panel follows the bot selected in Orca's left sidebar and shows only that bot's bridge, chats and logs
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
 - **Open or restricted access**: open to everyone while the ID list is empty; add Telegram user or group IDs to restrict it, with one-click **Allow** in the sidebar panel
 - **Telegram groups**: in a group the bot answers commands addressed to it, replies to its own messages and, with Telegram privacy mode off, `@yourbot` mentions
@@ -130,15 +130,14 @@ The upstream plugin has the key `henryma96.telegram-bridge`. This fork has a dif
 
 ## Setup
 
-Do these steps after the plugin is installed and approved. Repeat steps 2–7 for each Telegram bot you want to connect.
+Do these steps after the plugin is installed and approved (it asks to read your workspaces, so the panel can follow the bot you select). Repeat them for each Orca bot you want on Telegram; each Orca bot has at most one bridge.
 
-1. Open the **Telegram** sidebar panel in Orca. The **TG** item in Orca's status bar shows the bridges' state (`TG: 2/2` = 2 of 2 active bridges connected); click it to open this panel.
-2. In the Setup tab, click **Edit** on a bridge, or **Add bridge** for a new one. A bridge is shown by its Telegram bot's `@username` ("New Telegram bot" until its token is checked). An update from 0.4.0 or older already has one bridge with your previous settings.
+1. Click an Orca bot in Orca's left sidebar, then open the **Telegram** panel in the right sidebar. The panel follows the selected bot: **Setup**, **Chats** and **Logs** show only that bot's bridge. With a project or workspace selected instead, the panel only asks you to select a bot (plus any bridge whose Orca bot no longer exists, so you can still remove it). If Orca cannot tell the panel which bot is selected, it shows every bridge. The **TG** item in Orca's status bar shows all bridges' state (`TG: 2/2` = 2 of 2 active bridges connected); click it to open this panel.
+2. A bot without a bridge shows **Add bridge**: click it. The new bridge talks only to this Orca bot; `/use` cannot switch it. A bridge is shown by its Telegram bot's `@username` ("New Telegram bot" until its token is checked). An update from 0.4.0 or older already has one bridge with your previous settings.
 3. **Connection:** paste the `@BotFather` bot token. Each Telegram bot token can belong to one bridge only.
-4. Choose the **Orca bot** this Telegram bot talks to, or keep **(Auto-select first Orca bot)**. The list shows the bots on this computer (the folders in `~/.orca/bots`). The Telegram bot talks only to this Orca bot; `/use` cannot switch it.
-5. **Who can talk:** choose **Only these people and groups** and type the IDs, or **Anyone on Telegram**. See [Who can talk to the bot](#who-can-talk-to-the-bot).
-6. Click **Save**, then **Test connection**. The **Active** switch on the bridge's card turns it on or off at once; no Save needed.
-7. Optional: **Groups** (see [Use the bot in a group](#use-the-bot-in-a-group)), **Features** (voice messages, Orca-side sync) and **Advanced**, closed by default: the **Telegram reply language** (English, Português (Brasil) or 中文) for the bot's own replies and command menu, the reply timeout, an HTTP proxy (e.g. `http://127.0.0.1:7890`) and the transcription model. The Orca bot's answers keep the language the Orca bot writes in.
+4. **Who can talk:** choose **Only these people and groups** and type the IDs, or **Anyone on Telegram**. See [Who can talk to the bot](#who-can-talk-to-the-bot).
+5. Click **Save**, then **Test connection**. The **Active** switch on the bridge's card turns it on or off at once; no Save needed.
+6. Optional: **Groups** (see [Use the bot in a group](#use-the-bot-in-a-group)), **Features** (voice messages, Orca-side sync) and **Advanced**, closed by default: the **Telegram reply language** (English, Português (Brasil) or 中文) for the bot's own replies and command menu, the reply timeout, an HTTP proxy (e.g. `http://127.0.0.1:7890`) and the transcription model. The Orca bot's answers keep the language the Orca bot writes in.
 
 To remove a bridge, open its editor, click **Remove**, then **Confirm remove**. Orca forgets its token and its chats; its log entries stay in the Logs tab.
 

@@ -35,6 +35,7 @@ import type {
   BridgeView,
   ChatBinding,
   ExportLogsResult,
+  FocusedBot,
   LogScope,
   SaveConfigInput,
   TestConnectionResult
@@ -99,6 +100,9 @@ const TRANSCRIBE_TIMEOUT_MS = 60_000
 // Orca's page size for `automations runs`, and how recent a run must be to explain a chat message.
 const AUTOMATION_RUNS_LIMIT = 100
 const AUTOMATION_RUN_WINDOW_MS = 24 * 60 * 60 * 1000
+// Clicking through bots in Orca's sidebar asks for the focused bot each time; the workspace list
+// is reused this long so fast clicking does not ask Orca for it again and again.
+const WORKSPACE_LIST_CACHE_MS = 5000
 
 // A chat entry may differ from the stored prompt in line endings and outer whitespace.
 function normalizePrompt(text: string): string {
@@ -669,6 +673,11 @@ export class BridgeRuntime {
 
   get name(): string {
     return this.config.name
+  }
+
+  // The Orca bot name this bridge is pinned to ('' = the first Orca bot found).
+  get orcaBot(): string {
+    return this.config.orcaBot
   }
 
   // Switched on and able to poll.
@@ -3138,6 +3147,10 @@ export class BridgeManager {
   readonly formerVoiceKeys: string[] = []
   private readonly lastFailures = new Map<string, string>()
   private disposed = false
+  // The last `workspace.list` answer (or the call still running) and when it was asked.
+  private workspaceRows: { at: number; rows: Promise<{ id: string; kind: string; path: string }[]> } | null = null
+  // Why the focused bot could not be found, each logged once: the panel asks on every focus change.
+  private readonly focusProblems = new Set<string>()
 
   constructor(orca: OrcaWorkerApi, deps: BridgeDeps) {
     this.orca = orca
@@ -3286,13 +3299,28 @@ export class BridgeManager {
     return run
   }
 
-  async addBridge(name?: string): Promise<string> {
+  // One bridge per Orca bot: the panel shows a bot's one bridge, so a second one would be hidden.
+  // '' (the first Orca bot found) is not a name and never conflicts.
+  private bridgeOfBot(orcaBot: string, except?: BridgeRuntime): BridgeRuntime | undefined {
+    const name = orcaBot.trim()
+    return name ? this.runtimes.find((r) => r !== except && r.orcaBot === name) : undefined
+  }
+
+  private async refuseSecondBridge(orcaBot: string, owner: BridgeRuntime, bridgeId?: string): Promise<never> {
+    const name = orcaBot.trim()
+    await this.appendLog('warn', 'config', `Refused a second bridge for the Orca bot "${name}".`, undefined, bridgeId)
+    throw new Error(`The Orca bot "${name}" already has a Telegram bridge ("${owner.name}"). Each Orca bot gets one bridge.`)
+  }
+
+  async addBridge(name?: string, orcaBot = ''): Promise<string> {
+    const owner = this.bridgeOfBot(orcaBot)
+    if (owner) await this.refuseSecondBridge(orcaBot, owner)
     const id = newBridgeId(new Set(this.runtimes.map((r) => r.id)))
     const names = new Set(this.runtimes.map((r) => r.name))
     let n = this.runtimes.length + 1
     while (names.has(`Bridge ${n}`)) n++
     // A new bridge stays out of groups until the owner allows them.
-    const runtime = new BridgeRuntime(this, readStoredBridge({ name, allowGroups: false }, id, `Bridge ${n}`))
+    const runtime = new BridgeRuntime(this, readStoredBridge({ name, orcaBot, allowGroups: false }, id, `Bridge ${n}`))
     this.runtimes.push(runtime)
     await this.saveBridges()
     await runtime.init()
@@ -3319,8 +3347,12 @@ export class BridgeManager {
   }
 
   // Telegram lets one poller per token; two bridges on one token would steal each other's updates.
+  // Bridges that shared an Orca bot before the one-bridge-per-bot rule keep saving while their bot
+  // stays the same; only moving a bridge onto a bot another bridge has is refused.
   async saveConfig(input: SaveConfigInput): Promise<void> {
     const runtime = this.bridge(input.bridgeId)
+    const botOwner = input.orcaBot.trim() !== runtime.orcaBot ? this.bridgeOfBot(input.orcaBot, runtime) : undefined
+    if (botOwner) await this.refuseSecondBridge(input.orcaBot, botOwner, runtime.id)
     const token = input.clearToken ? '' : (input.botToken ?? '').trim()
     const owner = token ? this.runtimes.find((r) => r !== runtime && r.usesToken(token)) : undefined
     if (owner) {
@@ -3458,6 +3490,84 @@ export class BridgeManager {
     }
   }
 
+  // The Orca bot selected in Orca's sidebar: Orca focuses a bot's home, the folder workspace that
+  // holds its bot.json. The worker asks for the focus itself, so the id it matches against
+  // `workspace.list` is in the same form as the rows' ids (a panel frame may see another form).
+  async focusedBot(): Promise<FocusedBot> {
+    let workspaceId: string | undefined
+    try {
+      const context = await this.orca.host.call('workspace.readContext')
+      if (!context) return { kind: 'none' }
+      workspaceId = context.workspaceId
+    } catch (err) {
+      return this.focusUnknown('Orca did not tell which workspace is focused.', err)
+    }
+    if (!workspaceId) return this.focusUnknown('This Orca does not name the focused workspace.')
+    let rows: { id: string; kind: string; path: string }[]
+    try {
+      rows = await this.listWorkspaces()
+    } catch (err) {
+      return this.focusUnknown('Listing Orca workspaces failed.', err)
+    }
+    const row = rows.find((r) => r.id === workspaceId)
+    // An unlisted id means the two could not be matched, not that the focus is no bot.
+    if (!row) return this.focusUnknown('The focused workspace is not in Orca\'s workspace list.')
+    if (row.kind !== 'folder') return { kind: 'none' }
+    const file = path.join(row.path, 'bot.json')
+    let raw: string
+    try {
+      raw = await fs.readFile(file, 'utf8')
+    } catch (err) {
+      // A project folder has no bot.json: that only means it is not a bot.
+      const code = (err as NodeJS.ErrnoException | undefined)?.code
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { kind: 'none' }
+      return this.focusUnknown('Reading the focused folder\'s bot.json failed.', err)
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed === 'object' && parsed !== null) {
+        const { id, name } = parsed as { id?: unknown; name?: unknown }
+        if (typeof id === 'string' && id.trim() && typeof name === 'string' && name.trim()) {
+          return { kind: 'bot', bot: { id: id.trim(), name: name.trim() } }
+        }
+      }
+    } catch {
+      // Logged below with the other files that are no bot.json.
+    }
+    await this.appendLog('debug', 'bridge', `${file} has no string id and name; not treated as an Orca bot`)
+    return { kind: 'none' }
+  }
+
+  private async focusUnknown(reason: string, err?: unknown): Promise<FocusedBot> {
+    if (!this.focusProblems.has(reason)) {
+      this.focusProblems.add(reason)
+      await this.appendLog(
+        'warn',
+        'bridge',
+        `Cannot tell which Orca bot is selected; the panel shows every bridge. ${reason}`,
+        err === undefined ? undefined : describeError(err)
+      )
+    }
+    return { kind: 'unknown', reason }
+  }
+
+  private listWorkspaces(): Promise<{ id: string; kind: string; path: string }[]> {
+    const now = Date.now()
+    if (this.workspaceRows && now - this.workspaceRows.at < WORKSPACE_LIST_CACHE_MS) {
+      return this.workspaceRows.rows
+    }
+    const entry = {
+      at: now,
+      rows: this.orca.host.call('workspace.list').then((res) => res.workspaces)
+    }
+    this.workspaceRows = entry
+    // A failed list is not kept: the next focus change asks Orca again.
+    entry.rows.catch(() => {
+      if (this.workspaceRows === entry) this.workspaceRows = null
+    })
+    return entry.rows
+  }
+
   // `orca bot list` can hang for the full CLI timeout (30s), longer than the host's 10s
   // ready deadline. Startup and panel loads must not wait for it; message handling
   // refreshes bots itself. One shared call so repeated panel opens do not pile up CLI processes.
@@ -3589,7 +3699,7 @@ export async function activateWithDeps(orca: OrcaWorkerApi, deps: BridgeDeps): P
     return state()
   })
   orca.panels.handle('bridge.add', async (input) => {
-    const bridgeId = await manager.addBridge(input?.name)
+    const bridgeId = await manager.addBridge(input?.name, input?.orcaBot)
     return { bridgeId, state: state() }
   })
   orca.panels.handle('bridge.remove', async ({ bridgeId }) => {
@@ -3625,6 +3735,7 @@ export async function activateWithDeps(orca: OrcaWorkerApi, deps: BridgeDeps): P
     return state()
   })
   orca.panels.handle('bridge.exportLogs', () => manager.exportLogs())
+  orca.panels.handle('bridge.focusedBot', () => manager.focusedBot())
 
   orca.commands.register('telegram-bridge.togglePolling', () => manager.togglePolling())
   orca.commands.register('telegram-bridge.openPanel', () => manager.openPanel())

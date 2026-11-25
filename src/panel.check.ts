@@ -1,9 +1,19 @@
 import { defineCheck } from 'orca/testing'
+import type { FocusedBot } from './protocol'
+
+// The panel shows the bridges of the bot selected in Orca's sidebar; a check has no sidebar.
+const ASSISTANT_SELECTED: FocusedBot = { kind: 'bot', bot: { id: 'bot-1', name: 'Assistant' } }
+const FOCUS_UNKNOWN: FocusedBot = { kind: 'unknown', reason: 'This Orca does not name the focused workspace.' }
 
 export default defineCheck({
   // A new install: no bridges, no token, no logs.
   fresh: {},
+  // Orca did not say which bot is selected: every bridge, with the bridge filter in Logs.
+  focusUnknown: {
+    requests: { 'bridge.focusedBot': FOCUS_UNKNOWN }
+  },
   twoBridges: {
+    requests: { 'bridge.focusedBot': ASSISTANT_SELECTED },
     settings: {
       debugLogging: true
     },

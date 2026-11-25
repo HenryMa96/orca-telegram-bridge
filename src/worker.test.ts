@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { setImmediate as nextTurn } from 'node:timers/promises'
-import { assert, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
+import { assert, hostError, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
 import type { JsonValue } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { t } from './i18n'
@@ -2748,6 +2748,153 @@ test('adding a bridge creates one switched off, without a token, named by its pl
     assert.deepEqual(storedBridges(host).map((b) => b.name), ['Bridge 1', 'Bridge 2', 'Dev bot'])
   } finally {
     await worker.deactivate()
+  }
+})
+
+test('a second bridge for the same Orca bot is refused on add and on save', async () => {
+  const host = bridgesHost([
+    { id: 'b-first001', config: { orcaBot: 'Assistant' } },
+    { id: 'b-second01', config: { orcaBot: 'CIWatcher' } },
+    // Stored before one bridge per bot: it shares Assistant and still saves while it stays there.
+    { id: 'b-third001', config: { orcaBot: 'Assistant' } }
+  ])
+  const deps = makeMockDeps()
+  const { manager, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await assert.rejects(
+      worker.request('bridge.add', { orcaBot: ' Assistant ' }),
+      /The Orca bot "Assistant" already has a Telegram bridge \("Bridge 1"\)/
+    )
+    assert.equal(manager.bridges.length, 3)
+    await assert.rejects(
+      worker.request('bridge.saveConfig', saveInput(manager.bridge('b-second01'), { orcaBot: 'Assistant' })),
+      /The Orca bot "Assistant" already has a Telegram bridge/
+    )
+    assert.equal(manager.bridge('b-second01').orcaBot, 'CIWatcher')
+    await worker.request('bridge.saveConfig', saveInput(manager.bridge('b-third001'), { proxyUrl: 'http://127.0.0.1:1' }))
+
+    // A bot without a bridge gets one pinned to it; '' (the first Orca bot) is no name and never conflicts.
+    const added = await worker.request('bridge.add', { orcaBot: 'DevHelper' })
+    assert.equal(added.state.bridges.find((b) => b.id === added.bridgeId)?.config.orcaBot, 'DevHelper')
+    await worker.request('bridge.saveConfig', saveInput(manager.bridge('b-second01'), { orcaBot: '' }))
+    await worker.request('bridge.add', {})
+    assert.deepEqual(
+      manager.bridges.map((b) => b.orcaBot),
+      ['Assistant', '', 'Assistant', 'DevHelper', '']
+    )
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+function focusContext(workspaceId?: string) {
+  return { ...(workspaceId ? { workspaceId } : {}), branch: '', displayName: '', terminals: [] }
+}
+
+function workspaceRow(id: string, kind: 'folder' | 'worktree', dir: string) {
+  return { id, kind, name: path.basename(dir), path: dir, branch: kind === 'worktree' ? 'main' : null, hostId: 'local' }
+}
+
+// A host with no bridges whose Orca answers `results` (the focus and the workspace list).
+async function mountFocus(results: Record<string, unknown>, capabilities = [...CAPABILITIES, 'workspace:read']) {
+  const host = mockHost({ capabilities, storage: { bridges: [] }, results })
+  const deps = makeMockDeps()
+  const mounted = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+  return { host, ...mounted }
+}
+
+test("bridge.focusedBot finds the bot whose home folder holds bot.json, else none; the list is asked once", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-focus-'))
+  const folder = async (name: string, botJson?: string) => {
+    const dir = path.join(root, name)
+    await fs.mkdir(dir)
+    if (botJson !== undefined) await fs.writeFile(path.join(dir, 'bot.json'), botJson)
+    return dir
+  }
+  const rows = [
+    workspaceRow('folder:home', 'folder', await folder('assistant', JSON.stringify({ id: 'bot-1', name: 'Assistant', agent: 'claude' }))),
+    // A worktree is never a bot's home, even holding a bot.json.
+    workspaceRow('wt:repo', 'worktree', await folder('repo', JSON.stringify({ id: 'bot-9', name: 'Copied' }))),
+    workspaceRow('folder:project', 'folder', await folder('project')),
+    workspaceRow('folder:broken', 'folder', await folder('broken', '{ not json')),
+    workspaceRow('folder:nameless', 'folder', await folder('nameless', JSON.stringify({ id: 'bot-2' })))
+  ]
+  let focused: string | null = 'folder:home'
+  const { host, worker } = await mountFocus({
+    'workspace.readContext': () => (focused === null ? null : focusContext(focused)),
+    'workspace.list': { workspaces: rows, truncated: false }
+  })
+  try {
+    assert.deepEqual(await worker.request('bridge.focusedBot'), {
+      kind: 'bot',
+      bot: { id: 'bot-1', name: 'Assistant' }
+    })
+    for (const id of ['wt:repo', 'folder:project', 'folder:broken', 'folder:nameless']) {
+      focused = id
+      assert.deepEqual(await worker.request('bridge.focusedBot'), { kind: 'none' }, id)
+    }
+    focused = null
+    assert.deepEqual(await worker.request('bridge.focusedBot'), { kind: 'none' })
+    // Clicking through the sidebar reuses the list for a few seconds.
+    assert.equal(host.callsOf('workspace.list').length, 1)
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await worker.deactivate()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('bridge.focusedBot answers unknown when the lookup cannot run, and warns once per reason', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-focus-'))
+  // bot.json is a folder here: unreadable for another reason than missing.
+  const odd = path.join(root, 'odd')
+  await fs.mkdir(path.join(odd, 'bot.json'), { recursive: true })
+  const cases: { label: string; results: Record<string, unknown>; capabilities?: string[] }[] = [
+    { label: 'workspace:read refused', results: {}, capabilities: CAPABILITIES },
+    { label: 'no workspaceId', results: { 'workspace.readContext': focusContext() } },
+    {
+      label: 'list fails',
+      results: {
+        'workspace.readContext': focusContext('folder:odd'),
+        'workspace.list': () => {
+          throw hostError('unavailable', 'list down')
+        }
+      }
+    },
+    {
+      label: 'focus not listed',
+      results: {
+        'workspace.readContext': focusContext('folder:gone'),
+        'workspace.list': { workspaces: [], truncated: false }
+      }
+    },
+    {
+      label: 'bot.json unreadable',
+      results: {
+        'workspace.readContext': focusContext('folder:odd'),
+        'workspace.list': { workspaces: [workspaceRow('folder:odd', 'folder', odd)], truncated: false }
+      }
+    }
+  ]
+  try {
+    for (const { label, results, capabilities } of cases) {
+      const { host, manager, worker } = await mountFocus(results, capabilities)
+      try {
+        const first = await worker.request('bridge.focusedBot')
+        assert.equal(first.kind, 'unknown', label)
+        assert.deepEqual(await worker.request('bridge.focusedBot'), first, label)
+        const warnings = manager
+          .getState()
+          .logs.filter((e) => e.level === 'warn' && e.message.includes('Cannot tell which Orca bot is selected'))
+        assert.equal(warnings.length, 1, label)
+        // A failed list is not cached: the next focus change asks Orca again.
+        if (label === 'list fails') assert.equal(host.callsOf('workspace.list').length, 2)
+      } finally {
+        await worker.deactivate()
+      }
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
   }
 })
 

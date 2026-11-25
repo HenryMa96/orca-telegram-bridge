@@ -14,6 +14,7 @@ import {
   Input,
   List,
   ListItem,
+  on,
   plugin,
   RadioGroup,
   read,
@@ -36,6 +37,7 @@ import type {
   BridgeLogEntry,
   BridgeState,
   BridgeView,
+  FocusedBot,
   GroupMode,
   GroupReply,
   SaveConfigInput,
@@ -55,6 +57,10 @@ const bridgeState = atom<BridgeState | null>(null)
 const activeTab = atom<'setup' | 'bindings' | 'logs'>('setup', 'setup', { persist: 'plugin' })
 const logFilter = atom<LogFilter>('logFilter', 'all', { persist: 'plugin' })
 const logBridgeFilter = atom<string>('logBridgeFilter', ALL_BRIDGES, { persist: 'plugin' })
+// The bot selected in Orca's sidebar, as the worker found it; null until its first answer.
+const focus = atom<FocusedBot | null>(null)
+// Rises with each focus request; an answer to an older request is dropped.
+let focusRequest = 0
 
 // The bridge whose editor is open; one at a time.
 const editingBridgeId = atom<string | null>(null)
@@ -62,7 +68,6 @@ const editingBridgeId = atom<string | null>(null)
 const confirmRemoveId = atom<string | null>(null)
 
 const tokenDraft = atom('')
-const orcaBotDraft = atom('')
 const accessModeDraft = atom<AccessMode>('restricted')
 const allowedIdsDraft = atom('')
 // Shown under the IDs field when Save is refused because the list has no valid ID.
@@ -85,10 +90,7 @@ const hydratedFor = atom<string | null>(null)
 // Set by any form edit; worker refreshes must not overwrite unsaved drafts.
 const formDirty = atom(false)
 
-// Select option values must be non-empty; '' (auto) is stored as this sentinel in the draft.
-const AUTO_BOT = '__auto__'
 const MAX_LABEL = 500
-const ORCA_BOT_LABEL = 'Orca bot (this Telegram bot talks only to it)'
 const NEW_BOT_LABEL = 'New Telegram bot'
 const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
 const ALL_NEEDS_IDS =
@@ -180,7 +182,6 @@ function hydrateForm(state: BridgeState, force = false): void {
   const bridge = findBridge(state, id)
   if (!bridge) return
   if (!force && read(hydratedFor) === id) return
-  set(orcaBotDraft, bridge.config.orcaBot || AUTO_BOT)
   set(accessModeDraft, hasAllowedIds(bridge.config.allowedUserIds) ? 'restricted' : 'open')
   set(allowedIdsError, null)
   set(allowedIdsDraft, bridge.config.allowedUserIds)
@@ -250,11 +251,38 @@ async function refresh(): Promise<void> {
   }
 }
 
-async function addBridge(): Promise<void> {
+function focusKey(value: FocusedBot | null): string | null {
+  if (!value) return null
+  return value.kind === 'bot' ? `bot:${value.bot.name}` : value.kind
+}
+
+// The worker reads Orca's focus itself (its workspace ids match its workspace list), so a focus
+// change only says when to ask. A failed request counts as unknown: every bridge stays reachable.
+async function refreshFocus(): Promise<void> {
+  const request = ++focusRequest
+  let next: FocusedBot
+  try {
+    next = await plugin.request('bridge.focusedBot')
+  } catch (err) {
+    next = { kind: 'unknown', reason: errorText(err) }
+  }
+  if (request !== focusRequest) return
+  const before = read(focus)
+  // An editor, a pending Remove or a message belongs to the bot that was shown.
+  if (before && focusKey(before) !== focusKey(next)) {
+    closeEditor()
+    set(confirmRemoveId, null)
+    if (read(bridgeState)) set(feedback, null)
+  }
+  set(focus, next)
+}
+
+// `orcaBot` pins the new bridge to the bot it was added for.
+async function addBridge(orcaBot?: string): Promise<void> {
   set(busy, true)
   set(feedback, null)
   try {
-    const res = await plugin.request('bridge.add', {})
+    const res = await plugin.request('bridge.add', orcaBot ? { orcaBot } : {})
     set(bridgeState, res.state)
     openEditor(res.state, res.bridgeId)
   } catch (err) {
@@ -280,7 +308,8 @@ async function removeBridge(bridge: BridgeView): Promise<void> {
   }
 }
 
-async function saveConfig(bridge: BridgeView): Promise<void> {
+// The bridge's bot is fixed by where it is shown: the focused bot, or the bot it already has.
+async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
   const restricted = read(accessModeDraft) === 'restricted'
   if (restricted && !hasAllowedIds(read(allowedIdsDraft))) {
     set(allowedIdsError, NEEDS_ID)
@@ -294,7 +323,7 @@ async function saveConfig(bridge: BridgeView): Promise<void> {
     const cleanVoiceKey = read(voiceKeyDraft).trim()
     const payload: SaveConfigInput = {
       bridgeId: bridge.id,
-      orcaBot: read(orcaBotDraft) === AUTO_BOT ? '' : read(orcaBotDraft).trim(),
+      orcaBot,
       // An empty list is how the worker stores "anyone"; the typed IDs stay in the draft.
       allowedUserIds: restricted ? read(allowedIdsDraft).trim() : '',
       proxyUrl: read(proxyUrlDraft).trim(),
@@ -463,10 +492,11 @@ function levelIcon(level: BridgeLogEntry['level']): IconName {
   }
 }
 
-// Entries stored by 0.2.0 have no scope; they all came from the bridge itself.
-function logMeta(entry: BridgeLogEntry, bridgeNames: Map<string, string>): string {
+// Entries stored by 0.2.0 have no scope; they all came from the bridge itself. Without names (one
+// bridge's own log) the bridge is not repeated on each entry.
+function logMeta(entry: BridgeLogEntry, bridgeNames: Map<string, string> | null): string {
   const base = `${entry.level.toUpperCase()} · ${entry.scope ?? 'bridge'}`
-  if (!entry.bridgeId) return base
+  if (!entry.bridgeId || !bridgeNames) return base
   return `${base} · ${clip(bridgeNames.get(entry.bridgeId) ?? 'removed bridge')}`
 }
 
@@ -496,9 +526,11 @@ export function setup(ctx: PanelContext): void {
     plugin.on('bridge.stateChanged', (next) => {
       set(bridgeState, next)
       hydrateForm(next, false)
-    })
+    }),
+    on('workspace.changed', () => void refreshFocus())
   )
   void refresh()
+  void refreshFocus()
 }
 
 function hasAllowedIds(raw: string): boolean {
@@ -518,7 +550,8 @@ function groupsSummary(bridge: BridgeView, openToEveryone: boolean): string {
     : 'Groups: follows the conversation, answers when called'
 }
 
-function bridgeCard(bridge: BridgeView, isBusy: boolean) {
+// `botName` is the bridge's Orca bot; '' means the first Orca bot found.
+function bridgeCard(bridge: BridgeView, botName: string, isBusy: boolean) {
   const badge = statusMeta(bridge.status)
   const openToEveryone = !hasAllowedIds(bridge.config.allowedUserIds)
   const blockedUserId = bridge.lastBlockedUserId
@@ -526,7 +559,7 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean) {
     <Card
       key={`bridge:${bridge.id}`}
       title={clip(bridgeLabel(bridge))}
-      description={clip(`→ ${bridge.config.orcaBot || 'first Orca bot'}`)}
+      description={clip(`→ ${botName || 'first Orca bot'}`)}
     >
       <Stack gap="xs">
         <Row justify="between" align="center">
@@ -579,7 +612,7 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean) {
           <Callout tone="warning" title="Open to everyone" icon="warning">
             <Text size="xs">
               {clip(
-                `Anyone who finds ${bridge.botUsername ? `@${bridge.botUsername}` : 'this bot'} on Telegram can chat with ${bridge.config.orcaBot || 'your first Orca bot'} and use its commands with your rights. To limit it, press Edit and choose Only these people and groups.`
+                `Anyone who finds ${bridge.botUsername ? `@${bridge.botUsername}` : 'this bot'} on Telegram can chat with ${botName || 'your first Orca bot'} and use its commands with your rights. To limit it, press Edit and choose Only these people and groups.`
               )}
             </Text>
           </Callout>
@@ -604,20 +637,8 @@ function bridgeCard(bridge: BridgeView, isBusy: boolean) {
   )
 }
 
-function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, confirming: boolean) {
-  const botOptions = [
-    { value: AUTO_BOT, label: '(Auto-select first Orca bot)' },
-    ...state.bots
-      .filter((b) => b.name)
-      .map((b) => ({
-        value: b.name,
-        label: clip(b.specialty ? `${b.name} — ${b.specialty}` : b.name)
-      }))
-  ]
-  const draftBot = read(orcaBotDraft)
-  if (draftBot !== AUTO_BOT && !botOptions.some((o) => o.value === draftBot)) {
-    botOptions.push({ value: draftBot, label: clip(draftBot) })
-  }
+// The Orca bot is not chosen here: a bridge belongs to the bot it is shown for.
+function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, confirming: boolean) {
   const accessMode = read(accessModeDraft)
   const idsError = read(allowedIdsError)
   const groupChoice = groupBehavior(read(allowGroupsDraft), read(groupModeDraft), read(groupReplyDraft))
@@ -645,12 +666,9 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
             placeholder={bridge.config.hasToken ? '•••••••••••••••• (saved)' : '123456:ABC...'}
             onChange={(v) => edit(tokenDraft, v)}
           />
-          <Select
-            label={ORCA_BOT_LABEL}
-            value={draftBot}
-            options={botOptions}
-            onChange={(v) => edit(orcaBotDraft, v)}
-          />
+          <Text muted size="xs">
+            {clip(`Orca bot: ${botName || 'the first Orca bot found'}. This Telegram bot talks only to it.`)}
+          </Text>
         </Stack>
 
         <Stack gap="sm">
@@ -687,7 +705,7 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
             <Callout tone="warning" icon="warning" title="Anyone can use this bot">
               <Text size="xs">
                 {clip(
-                  `Anyone who finds this bot can chat with ${draftBot === AUTO_BOT ? 'your first Orca bot' : draftBot} and use its commands with your rights.`
+                  `Anyone who finds this bot can chat with ${botName || 'your first Orca bot'} and use its commands with your rights.`
                 )}
               </Text>
             </Callout>
@@ -832,7 +850,7 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
           )}
           <Row gap="xs" justify="between" wrap>
             <Row gap="xs">
-              <Button size="sm" disabled={isBusy} onPress={() => saveConfig(bridge)}>
+              <Button size="sm" disabled={isBusy} onPress={() => saveConfig(bridge, botName)}>
                 Save
               </Button>
               <Button size="sm" variant="ghost" disabled={isBusy} onPress={closeEditor}>
@@ -889,15 +907,246 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
   )
 }
 
+// A bridge whose Orca bot is gone shows under no bot, so the hint lists it to edit or remove. A
+// bridge on '' follows the first Orca bot and is lost only while there are no bots.
+function isOrphan(bridge: BridgeView, state: BridgeState): boolean {
+  const bot = bridge.config.orcaBot
+  return bot ? !state.bots.some((b) => b.name === bot) : state.bots.length === 0
+}
+
+// A bot's bridge is the one pinned to its name; one stored with '' (the first Orca bot found)
+// shows for the first bot of the list, as the worker routes it there.
+function bridgeOfBot(state: BridgeState, botName: string): BridgeView | undefined {
+  return (
+    state.bridges.find((b) => b.config.orcaBot === botName) ??
+    (state.bots[0]?.name === botName ? state.bridges.find((b) => b.config.orcaBot === '') : undefined)
+  )
+}
+
+// Each bridge's card, with its editor under it while open.
+function bridgeCards(bridges: BridgeView[], botNameOf: (bridge: BridgeView) => string, isBusy: boolean) {
+  const editing = read(editingBridgeId)
+  const confirming = read(confirmRemoveId)
+  return bridges.flatMap((bridge) => [
+    bridgeCard(bridge, botNameOf(bridge), isBusy),
+    ...(editing === bridge.id
+      ? [bridgeEditor(bridge, botNameOf(bridge), isBusy, confirming === bridge.id)]
+      : [])
+  ])
+}
+
+function refreshAll(): void {
+  void refresh()
+  void refreshFocus()
+}
+
+function panelHeader(lines: string[], isBusy: boolean) {
+  return (
+    <Row justify="between" align="center">
+      <Stack gap="xs">
+        <Heading level={2}>Telegram Bridge</Heading>
+        {lines.map((line, i) => (
+          <Text key={`header:${i}`} muted size="xs">
+            {clip(line)}
+          </Text>
+        ))}
+      </Stack>
+      <Button size="sm" variant="ghost" disabled={isBusy} onPress={refreshAll}>
+        Refresh
+      </Button>
+    </Row>
+  )
+}
+
+// `grouped` puts each bridge's chats under its name; one bridge's chats need no heading.
+function chatsTab(bridges: BridgeView[], grouped: boolean) {
+  const chatCount = bridges.reduce((sum, b) => sum + b.bindings.length, 0)
+  return (
+    <Tab value="bindings" label={`Chats (${chatCount})`}>
+      {chatCount === 0 ? (
+        <EmptyState
+          icon="bot"
+          title="No active Telegram chats yet"
+          description="Send a message to your Telegram bot after configuring your allowlist."
+        />
+      ) : (
+        <Stack gap="sm">
+          {bridges.flatMap((bridge) => [
+            ...(grouped
+              ? [
+                  <Heading key={`chats-title:${bridge.id}`} level={3}>
+                    {clip(bridgeLabel(bridge, bridge.name))}
+                  </Heading>
+                ]
+              : []),
+            bridge.bindings.length === 0 ? (
+              <Text key={`chats-empty:${bridge.id}`} muted size="xs">
+                No chats yet.
+              </Text>
+            ) : (
+              <List
+                key={`chats:${bridge.id}`}
+                label={clip(`${bridgeLabel(bridge, bridge.name)} chat bindings`)}
+              >
+                {bridge.bindings.map((b) => (
+                  <ListItem
+                    key={b.tgChatId}
+                    icon="bot"
+                    title={clip(`TG ${b.tgChatId} -> ${b.botName}`)}
+                    description={b.orcaChatId ? `Orca chat: ${b.orcaChatId}` : 'Next message opens new chat'}
+                  >
+                    <Row gap="xs" align="center">
+                      <RelativeTime at={b.updatedAt} muted />
+                      <Button
+                        key={`reset:${bridge.id}:${b.tgChatId}`}
+                        size="xs"
+                        variant="ghost"
+                        onPress={() => void resetBinding(bridge.id, b.tgChatId)}
+                      >
+                        Reset
+                      </Button>
+                    </Row>
+                  </ListItem>
+                ))}
+              </List>
+            )
+          ])}
+        </Stack>
+      )}
+    </Tab>
+  )
+}
+
+// `scoped`: one bridge's entries, with no bridge filter. null: every entry, with the bridge filter.
+function logsTab(state: BridgeState, scoped: BridgeLogEntry[] | null) {
+  const filter = read(logFilter)
+  const canExport = host.has('files.saveAs')
+  const bridgeNames = scoped ? null : new Map(state.bridges.map((b) => [b.id, bridgeLabel(b, b.name)]))
+  const bridgeFilterOptions = [
+    { value: ALL_BRIDGES, label: 'All bridges' },
+    { value: PLUGIN_LOGS, label: 'Plugin' },
+    ...state.bridges.map((b) => ({ value: b.id, label: clip(bridgeLabel(b, b.name)) }))
+  ]
+  // A persisted filter may name a bridge that was removed since.
+  const storedBridgeFilter = read(logBridgeFilter)
+  const bridgeFilter = bridgeFilterOptions.some((o) => o.value === storedBridgeFilter)
+    ? storedBridgeFilter
+    : ALL_BRIDGES
+  const entries = scoped ?? state.logs.filter((entry) => matchesBridge(entry, bridgeFilter))
+  const total = scoped ? scoped.length : state.logTotal
+  const hasEntries = scoped ? scoped.length > 0 : state.logs.length > 0
+  const shownLogs = entries.filter((entry) => matchesFilter(entry, filter))
+
+  return (
+    <Tab value="logs" label={`Logs (${total})`}>
+      <Stack gap="xs">
+        <Row gap="sm" align="end" justify="between" wrap>
+          <Switch
+            label="Debug logging"
+            checked={state.global.debugLogging}
+            onChange={(v) => void setDebugLogging(v)}
+          />
+          <Row gap="sm" align="end" wrap>
+            {!scoped && (
+              <Select
+                label="Bridge"
+                value={bridgeFilter}
+                options={bridgeFilterOptions}
+                onChange={(v) => set(logBridgeFilter, v)}
+              />
+            )}
+            <Select
+              label="Log level filter"
+              value={filter}
+              options={LOG_FILTERS}
+              onChange={(v) => set(logFilter, v as LogFilter)}
+            />
+          </Row>
+        </Row>
+        <Row gap="xs" justify="end">
+          {state.logs.length > 0 && (
+            <Button size="xs" variant="ghost" onPress={clearLogs}>
+              Clear logs
+            </Button>
+          )}
+          <Button
+            size="xs"
+            variant="outline"
+            icon="download"
+            disabled={!canExport}
+            tooltip={canExport ? undefined : EXPORT_UNAVAILABLE}
+            onPress={exportLogs}
+          >
+            Export logs
+          </Button>
+        </Row>
+        {!hasEntries ? (
+          <EmptyState
+            icon="info"
+            title="No activity logs yet"
+            description="Incoming Telegram messages and bridge events appear here."
+          />
+        ) : (
+          <Stack gap="xs">
+            <Text muted size="xs">
+              {`Showing ${shownLogs.length} of ${total} entries`}
+            </Text>
+            {shownLogs.length === 0 ? (
+              <EmptyState
+                icon="filter"
+                title="No entries match this filter"
+                description={
+                  filter === 'debug' && !state.global.debugLogging
+                    ? 'Turn on Debug logging to record debug entries.'
+                    : scoped
+                      ? 'Pick another level to see more entries.'
+                      : 'Pick another level or bridge to see more entries.'
+                }
+              />
+            ) : (
+              logBlocks(shownLogs).map((block) =>
+                Array.isArray(block) ? (
+                  <List key={`list-${block[0].id}`} label="Bridge activity logs">
+                    {block.map((entry) => (
+                      <ListItem
+                        key={entry.id}
+                        icon={levelIcon(entry.level)}
+                        title={clip(entry.message)}
+                        description={logMeta(entry, bridgeNames)}
+                      >
+                        <RelativeTime at={entry.at} muted />
+                      </ListItem>
+                    ))}
+                  </List>
+                ) : (
+                  <Collapsible
+                    key={`log-${block.entry.id}`}
+                    title={clip(block.entry.message)}
+                    description={`${logMeta(block.entry, bridgeNames)} · ${formatTime(block.entry.at)}`}
+                  >
+                    <CodeView code={block.details} label="Log details" wrap maxHeight="sm" />
+                  </Collapsible>
+                )
+              )
+            )}
+          </Stack>
+        )}
+      </Stack>
+    </Tab>
+  )
+}
+
+const SELECT_BOT_HINT = 'Select a bot in the left sidebar to see its Telegram bridge.'
+const ALL_BRIDGES_NOTE = 'Showing all bridges: Orca did not say which bot is selected.'
+
 export default function Panel() {
   const state = read(bridgeState)
-  const tab = read(activeTab)
+  const focused = read(focus)
   const isBusy = read(busy)
   const notice = read(feedback)
-  const filter = read(logFilter)
 
-  if (!state) {
-    if (notice) {
+  if (!state || !focused) {
+    if (!state && notice) {
       return (
         <Callout tone="danger" title="Telegram Bridge failed to load">
           <Text size="xs">{notice.text}</Text>
@@ -914,216 +1163,98 @@ export default function Panel() {
     )
   }
 
-  const editing = findBridge(state, read(editingBridgeId))
-  const confirming = read(confirmRemoveId)
-  const bridgeNames = new Map(state.bridges.map((b) => [b.id, bridgeLabel(b, b.name)]))
-  const bridgeFilterOptions = [
-    { value: ALL_BRIDGES, label: 'All bridges' },
-    { value: PLUGIN_LOGS, label: 'Plugin' },
-    ...state.bridges.map((b) => ({ value: b.id, label: clip(bridgeLabel(b, b.name)) }))
-  ]
-  // A persisted filter may name a bridge that was removed since.
-  const storedBridgeFilter = read(logBridgeFilter)
-  const bridgeFilter = bridgeFilterOptions.some((o) => o.value === storedBridgeFilter)
-    ? storedBridgeFilter
-    : ALL_BRIDGES
-  const shownLogs = state.logs.filter(
-    (entry) => matchesFilter(entry, filter) && matchesBridge(entry, bridgeFilter)
-  )
-  const canExport = host.has('files.saveAs')
-  const chatCount = state.bridges.reduce((sum, b) => sum + b.bindings.length, 0)
-  const connectedCount = state.bridges.filter((b) => b.status === 'connected').length
-  const summary =
-    state.bridges.length === 0
-      ? 'No bridges yet'
-      : `${state.bridges.length} ${state.bridges.length === 1 ? 'bridge' : 'bridges'} · ${connectedCount} connected`
+  const noticeCallout = notice && <Callout tone={notice.tone} title={clip(notice.text)} />
+  const selectTab = (v: string) => set(activeTab, v as 'setup' | 'bindings' | 'logs')
 
+  if (focused.kind === 'none') {
+    const orphans = state.bridges.filter((b) => isOrphan(b, state))
+    return (
+      <Stack gap="md">
+        <EmptyState icon="bot" title={SELECT_BOT_HINT} />
+        {orphans.length > 0 && noticeCallout}
+        {orphans.length > 0 && <Heading level={3}>Bridges without an Orca bot</Heading>}
+        {orphans.length > 0 && (
+          <Text muted size="xs">
+            Their Orca bot no longer exists. Edit or remove them.
+          </Text>
+        )}
+        {bridgeCards(orphans, (b) => b.config.orcaBot, isBusy)}
+      </Stack>
+    )
+  }
+
+  // Orca did not say which bot is selected: every bridge, as before bots scoped the panel, so the
+  // setup is never out of reach.
+  if (focused.kind === 'unknown') {
+    const connectedCount = state.bridges.filter((b) => b.status === 'connected').length
+    const summary =
+      state.bridges.length === 0
+        ? 'No bridges yet'
+        : `${state.bridges.length} ${state.bridges.length === 1 ? 'bridge' : 'bridges'} · ${connectedCount} connected`
+    return (
+      <Stack gap="md">
+        {panelHeader([summary, ALL_BRIDGES_NOTE], isBusy)}
+        {noticeCallout}
+        <Tabs label="Telegram Bridge sections" value={read(activeTab)} onChange={selectTab}>
+          <Tab value="setup" label="Setup">
+            <Stack gap="sm">
+              {state.bridges.length === 0 && (
+                <EmptyState
+                  icon="bot"
+                  title="No bridges yet"
+                  description="A bridge connects one Telegram bot to one Orca bot. Add one to start."
+                />
+              )}
+              {bridgeCards(state.bridges, (b) => b.config.orcaBot, isBusy)}
+              <Row gap="xs">
+                <Button size="sm" variant="outline" icon="add" disabled={isBusy} onPress={() => addBridge()}>
+                  Add bridge
+                </Button>
+              </Row>
+            </Stack>
+          </Tab>
+          {chatsTab(state.bridges, true)}
+          {logsTab(state, null)}
+        </Tabs>
+      </Stack>
+    )
+  }
+
+  const { bot } = focused
+  const bridge = bridgeOfBot(state, bot.name)
+  const bridges = bridge ? [bridge] : []
   return (
     <Stack gap="md">
-      <Row justify="between" align="center">
-        <Stack gap="xs">
-          <Heading level={2}>Telegram Bridge</Heading>
-          <Text muted size="xs">
-            {summary}
-          </Text>
-        </Stack>
-        <Button size="sm" variant="ghost" disabled={isBusy} onPress={refresh}>
-          Refresh
-        </Button>
-      </Row>
-
-      {notice && (
-        <Callout tone={notice.tone} title={clip(notice.text)} />
-      )}
-
-      <Tabs
-        label="Telegram Bridge sections"
-        value={tab}
-        onChange={(v) => set(activeTab, v as 'setup' | 'bindings' | 'logs')}
-      >
+      {panelHeader([`${bot.name} · ${bridge ? statusMeta(bridge.status).label : 'no bridge yet'}`], isBusy)}
+      {noticeCallout}
+      <Tabs label="Telegram Bridge sections" value={read(activeTab)} onChange={selectTab}>
         <Tab value="setup" label="Setup">
           <Stack gap="sm">
-            {state.bridges.length === 0 && (
+            {bridgeCards(bridges, () => bot.name, isBusy)}
+            {!bridge && (
               <EmptyState
                 icon="bot"
-                title="No bridges yet"
-                description="A bridge connects one Telegram bot to one Orca bot. Add one to start."
+                title={clip(`No Telegram bridge for ${bot.name}`)}
+                description="A bridge connects one Telegram bot to this Orca bot."
               />
             )}
-            {state.bridges.flatMap((bridge) => [
-              bridgeCard(bridge, isBusy),
-              ...(editing && editing.id === bridge.id
-                ? [bridgeEditor(bridge, state, isBusy, confirming === bridge.id)]
-                : [])
-            ])}
-            <Row gap="xs">
-              <Button size="sm" variant="outline" icon="add" disabled={isBusy} onPress={addBridge}>
-                Add bridge
-              </Button>
-            </Row>
-          </Stack>
-        </Tab>
-
-        <Tab value="bindings" label={`Chats (${chatCount})`}>
-          {chatCount === 0 ? (
-            <EmptyState
-              icon="bot"
-              title="No active Telegram chats yet"
-              description="Send a message to your Telegram bot after configuring your allowlist."
-            />
-          ) : (
-            <Stack gap="sm">
-              {state.bridges.flatMap((bridge) => [
-                <Heading key={`chats-title:${bridge.id}`} level={3}>
-                  {clip(bridgeLabel(bridge, bridge.name))}
-                </Heading>,
-                bridge.bindings.length === 0 ? (
-                  <Text key={`chats-empty:${bridge.id}`} muted size="xs">
-                    No chats yet.
-                  </Text>
-                ) : (
-                  <List
-                    key={`chats:${bridge.id}`}
-                    label={clip(`${bridgeLabel(bridge, bridge.name)} chat bindings`)}
-                  >
-                    {bridge.bindings.map((b) => (
-                      <ListItem
-                        key={b.tgChatId}
-                        icon="bot"
-                        title={clip(`TG ${b.tgChatId} -> ${b.botName}`)}
-                        description={b.orcaChatId ? `Orca chat: ${b.orcaChatId}` : 'Next message opens new chat'}
-                      >
-                        <Row gap="xs" align="center">
-                          <RelativeTime at={b.updatedAt} muted />
-                          <Button
-                            key={`reset:${bridge.id}:${b.tgChatId}`}
-                            size="xs"
-                            variant="ghost"
-                            onPress={() => void resetBinding(bridge.id, b.tgChatId)}
-                          >
-                            Reset
-                          </Button>
-                        </Row>
-                      </ListItem>
-                    ))}
-                  </List>
-                )
-              ])}
-            </Stack>
-          )}
-        </Tab>
-
-        <Tab value="logs" label={`Logs (${state.logTotal})`}>
-          <Stack gap="xs">
-            <Row gap="sm" align="end" justify="between" wrap>
-              <Switch
-                label="Debug logging"
-                checked={state.global.debugLogging}
-                onChange={(v) => void setDebugLogging(v)}
-              />
-              <Row gap="sm" align="end" wrap>
-                <Select
-                  label="Bridge"
-                  value={bridgeFilter}
-                  options={bridgeFilterOptions}
-                  onChange={(v) => set(logBridgeFilter, v)}
-                />
-                <Select
-                  label="Log level filter"
-                  value={filter}
-                  options={LOG_FILTERS}
-                  onChange={(v) => set(logFilter, v as LogFilter)}
-                />
-              </Row>
-            </Row>
-            <Row gap="xs" justify="end">
-              {state.logs.length > 0 && (
-                <Button size="xs" variant="ghost" onPress={clearLogs}>
-                  Clear logs
+            {!bridge && (
+              <Row gap="xs">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  icon="add"
+                  disabled={isBusy}
+                  onPress={() => addBridge(bot.name)}
+                >
+                  Add bridge
                 </Button>
-              )}
-              <Button
-                size="xs"
-                variant="outline"
-                icon="download"
-                disabled={!canExport}
-                tooltip={canExport ? undefined : EXPORT_UNAVAILABLE}
-                onPress={exportLogs}
-              >
-                Export logs
-              </Button>
-            </Row>
-            {state.logs.length === 0 ? (
-              <EmptyState
-                icon="info"
-                title="No activity logs yet"
-                description="Incoming Telegram messages and bridge events appear here."
-              />
-            ) : (
-              <Stack gap="xs">
-                <Text muted size="xs">
-                  {`Showing ${shownLogs.length} of ${state.logTotal} entries`}
-                </Text>
-                {shownLogs.length === 0 ? (
-                  <EmptyState
-                    icon="filter"
-                    title="No entries match this filter"
-                    description={
-                      filter === 'debug' && !state.global.debugLogging
-                        ? 'Turn on Debug logging to record debug entries.'
-                        : 'Pick another level or bridge to see more entries.'
-                    }
-                  />
-                ) : (
-                  logBlocks(shownLogs).map((block) =>
-                    Array.isArray(block) ? (
-                      <List key={`list-${block[0].id}`} label="Bridge activity logs">
-                        {block.map((entry) => (
-                          <ListItem
-                            key={entry.id}
-                            icon={levelIcon(entry.level)}
-                            title={clip(entry.message)}
-                            description={logMeta(entry, bridgeNames)}
-                          >
-                            <RelativeTime at={entry.at} muted />
-                          </ListItem>
-                        ))}
-                      </List>
-                    ) : (
-                      <Collapsible
-                        key={`log-${block.entry.id}`}
-                        title={clip(block.entry.message)}
-                        description={`${logMeta(block.entry, bridgeNames)} · ${formatTime(block.entry.at)}`}
-                      >
-                        <CodeView code={block.details} label="Log details" wrap maxHeight="sm" />
-                      </Collapsible>
-                    )
-                  )
-                )}
-              </Stack>
+              </Row>
             )}
           </Stack>
         </Tab>
+        {chatsTab(bridges, false)}
+        {logsTab(state, bridge ? state.logs.filter((entry) => entry.bridgeId === bridge.id) : [])}
       </Tabs>
     </Stack>
   )
