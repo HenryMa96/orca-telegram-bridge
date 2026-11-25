@@ -688,6 +688,12 @@ test('a failed save keeps the editor open and shows the reason next to the butto
   await view.press({ text: 'Save' })
   assert.ok(view.find({ text: 'Save' }), 'the editor is still open')
   assert.ok(view.find({ type: 'Text', text: /already used by the bridge "Other"/ }))
+  // Once, by the buttons: not repeated in a callout at the top of the panel.
+  assert.equal(view.findAll({ type: 'Callout' }).some((c) => /already used/.test(String(c.props.title))), false)
+  // Cancel and reopen: the old reason is gone.
+  await view.press({ text: 'Cancel' })
+  await openEditor(view, 'b1')
+  assert.equal(view.find({ type: 'Text', text: /already used by the bridge "Other"/ }), null)
   await view.unmount()
 })
 

@@ -72,6 +72,8 @@ const accessModeDraft = atom<AccessMode>('restricted')
 const allowedIdsDraft = atom('')
 // Shown under the IDs field when Save is refused because the list has no valid ID.
 const allowedIdsError = atom<string | null>(null)
+// Why the last Save failed; shown only next to the editor's buttons, not again at the top.
+const saveError = atom<string | null>(null)
 const proxyUrlDraft = atom('')
 const timeoutDraft = atom('300')
 const syncOrcaOutboundDraft = atom(false)
@@ -207,6 +209,7 @@ function openEditor(state: BridgeState, bridgeId: string): void {
   set(tokenDraft, '')
   set(voiceKeyDraft, '')
   set(allowedIdsError, null)
+  set(saveError, null)
   hydrateForm(state, true)
 }
 
@@ -216,6 +219,7 @@ function closeEditor(): void {
   set(tokenDraft, '')
   set(voiceKeyDraft, '')
   set(allowedIdsError, null)
+  set(saveError, null)
   set(formDirty, false)
 }
 
@@ -319,6 +323,7 @@ async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
   }
   set(busy, true)
   set(feedback, null)
+  set(saveError, null)
   try {
     const parsedTimeout = Number.parseInt(read(timeoutDraft), 10)
     const cleanToken = read(tokenDraft).trim()
@@ -347,10 +352,7 @@ async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
     closeEditor()
     set(feedback, { tone: 'success', text: 'Settings saved.' })
   } catch (err) {
-    set(feedback, {
-      tone: 'danger',
-      text: errorText(err)
-    })
+    set(saveError, errorText(err))
   } finally {
     set(busy, false)
   }
@@ -845,9 +847,9 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
 
         <Stack gap="xs">
           {/* A failed save keeps the editor open; its reason belongs next to the button pressed. */}
-          {read(feedback)?.tone === 'danger' && (
+          {read(saveError) && (
             <Text tone="danger" size="xs">
-              {clip(read(feedback)!.text)}
+              {clip(read(saveError)!)}
             </Text>
           )}
           {confirming && (
