@@ -247,11 +247,11 @@ Then a voice message, or an audio file (mp3, m4a, ogg, wav, flac, webm), reaches
   <img src="docs/images/logs-certificate-error.png" alt="The Logs tab with two warnings: voice messages not transcribed because the OpenRouter request failed with a self-signed certificate error" width="420">
 </p>
 
-**What it means.** Something between your computer and the service re-signs HTTPS with its own certificate: antivirus HTTPS scanning (Kaspersky, ESET, Avast, Bitdefender…), a VPN, or a corporate proxy. Windows trusts that certificate, so your browser works, but the Node runtime inside Orca has its own certificate list and refuses it. The scanner may pick some sites only; with Kaspersky we saw `openrouter.ai` intercepted while `api.telegram.org` and `api.openai.com` were not.
+**What it means.** Something between your computer and the service re-signs HTTPS with its own certificate: antivirus HTTPS scanning (Kaspersky, ESET, Avast, Bitdefender…), a VPN, or a corporate proxy. Your operating system (Windows, macOS or Linux) trusts that certificate, so your browser works, but the Node runtime inside Orca has its own certificate list and refuses it. The scanner may pick some sites only; with Kaspersky on Windows we saw `openrouter.ai` intercepted while `api.telegram.org` and `api.openai.com` were not.
 
 **What the plugin does.**
 
-- **Voice transcription** (OpenRouter, OpenAI) trusts Windows' certificates as well as Node's, like a browser, so it works through the scanner. The transcription API key then passes through the scanner.
+- **Voice transcription** (OpenRouter, OpenAI) trusts your operating system's certificate store (Windows, macOS or Linux) as well as Node's, like a browser, so it works through the scanner. The transcription API key then passes through the scanner.
 - **Telegram** keeps Node's own list on purpose, because every Telegram request carries the bot token. If the scanner intercepts `api.telegram.org`, the bridge stops with this error instead of handing the token to the scanner.
 
 **Bypass: exclude the hosts from HTTPS scanning.** This fixes Telegram, and keeps the transcription key out of the scanner too. Exclude:
