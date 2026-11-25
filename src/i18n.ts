@@ -1,9 +1,13 @@
 // Texts the bridge sends to Telegram, in the language each bridge's `replyLanguage` chose.
 // Log entries and the panel stay English; only what the Telegram user reads is translated.
 
-export type ReplyLanguage = 'en' | 'pt-BR' | 'zh-CN'
+export type ReplyLanguage = 'en' | 'pt-BR' | 'es' | 'zh-CN'
 
-export const REPLY_LANGUAGES: ReplyLanguage[] = ['en', 'pt-BR', 'zh-CN']
+export const REPLY_LANGUAGES: ReplyLanguage[] = ['en', 'pt-BR', 'es', 'zh-CN']
+
+// What a bridge stores: a fixed language, or 'auto' = each person's Telegram language for the
+// bridge's own texts, and the language of their message for the Orca bot's answer.
+export type ReplyLanguageSetting = ReplyLanguage | 'auto'
 
 // Telegram slash command menu, in menu order. `/use` is not listed: each Telegram bot is pinned
 // to one Orca bot, and `/use` only answers that.
@@ -322,6 +326,114 @@ const ptBR: Messages = {
   runFailed: (detail) => `Falha ao executar: ${detail}`
 }
 
+const esOnOff = (on: boolean) => (on ? 'activada' : 'desactivada')
+
+const es: Messages = {
+  commands: {
+    help: 'Mostrar los comandos disponibles',
+    new: 'Iniciar una nueva conversación en Orca',
+    home: 'Vincular el Home Chat del bot actual',
+    bots: 'Listar los bots de Orca',
+    chats: 'Listar y cambiar conversaciones recientes de Orca',
+    bind: 'Vincular a una conversación de Orca (/bind <id>)',
+    rename: 'Renombrar la conversación vinculada (/rename <título>)',
+    sync: 'Activar o desactivar la sincronización Orca -> TG (/sync on|off)',
+    automations: 'Listar y ejecutar automatizaciones de Orca',
+    run: 'Ejecutar una automatización ahora (/run <id>)',
+    status: 'Ver el estado de la conexión y de la conversación'
+  },
+  unauthorized: (userId) =>
+    `Sin autorización. Tu ID de Telegram es ${userId}. Pide al dueño del bot que lo agregue.`,
+  callbackUnauthorized: 'Acceso denegado. Primero agrega tu ID a la lista de permitidos.',
+  unsupportedImage: 'Formato de imagen no compatible. Envía una imagen JPG, PNG, WEBP, GIF o BMP.',
+  processingFailed: (detail) => `Error al procesar: ${detail}`,
+  voiceDisabled: 'Los mensajes de voz no están activados para este bot. Envía texto.',
+  voiceFailed: (reason) => `No se pudo transcribir el mensaje de voz: ${reason}`,
+  voiceTooLarge: 'el archivo supera los 20 MB',
+  voiceEmpty: 'no se reconoció ninguna voz',
+  attachmentFailed: (name, reason) => `No se pudo adjuntar ${name}: ${reason}`,
+  attachmentMissing: 'no se encontró el archivo',
+  attachmentUnreadable: 'no se pudo leer el archivo',
+  attachmentTooLarge: 'el archivo supera los 50 MB',
+  attachmentNotAllowed: 'este tipo de archivo o carpeta no está permitido',
+  attachmentNotImage: 'el archivo no es una imagen válida',
+  attachmentRejected: 'Telegram no lo aceptó',
+  attachmentNeedsAllowlist:
+    'Los archivos de esta computadora solo se envían cuando el bot está restringido a los IDs de Telegram permitidos.',
+  actionFailed: (detail) => `La acción falló: ${detail}`,
+  noBotsAvailable: 'No se encontró ningún bot de Orca. Crea al menos un bot en Orca primero.',
+  shortenedNote: '(La respuesta era demasiado larga y se acortó. Abre Orca para ver el texto completo.)',
+  tableMarker: (n) => `📊 **Tabla ${n}** (mira la imagen abajo)`,
+  tableCaption: (n) => `Tabla ${n}`,
+  orcaUserMessageHeader: (botName) => `🗣️ **Enviaste en Orca (${botName}):**`,
+  help: ({ botName, orcaChatId, syncOn }) =>
+    [
+      `Bot actual: ${botName || '(ninguno encontrado)'}`,
+      `Conversación actual: ${orcaChatId || '(nueva conversación, se crea con tu próximo mensaje)'}`,
+      `Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`,
+      '',
+      'Comandos:',
+      '/bots - Listar los bots de Orca (este bot de Telegram habla con uno de ellos)',
+      '/chats - Listar las conversaciones y tocar una para vincularla',
+      '/home - Vincular el Home Chat del bot actual',
+      '/new - Borrar el contexto e iniciar una nueva conversación',
+      '/bind <chatId> - Vincular a una conversación específica de Orca',
+      '/rename <nuevo título> - Renombrar la conversación vinculada',
+      '/sync [on|off] - Activar o desactivar la sincronización Orca -> Telegram',
+      '/automations - Listar y ejecutar automatizaciones',
+      '/run <id> - Ejecutar una automatización ahora',
+      '/status - Ver el estado de la conexión y de la conversación'
+    ].join('\n'),
+  status: ({ botUsername, botName, orcaChatId, syncOn, pollStatus }) =>
+    [
+      `Bot de Telegram: ${botUsername ? `@${botUsername}` : 'desconocido'}`,
+      `Bot de Orca de destino: ${botName}`,
+      `ID de la conversación vinculada: ${orcaChatId || '(ninguna todavía, tu próximo mensaje crea una)'}`,
+      `Sincronización bidireccional (Orca -> TG): ${esOnOff(syncOn)}`,
+      `Polling: ${pollStatus}`
+    ].join('\n'),
+  currentSuffix: ' (actual)',
+  linkedSuffix: ' (vinculado)',
+  noBotsFound: 'No se encontró ningún bot de Orca.',
+  botPinned: (botName) =>
+    `Este bot de Telegram está vinculado ${botName ? `a ${botName}` : 'al primer bot de Orca'}. Pide al dueño que lo cambie en Orca.`,
+  contextReset: (botName) => `Contexto borrado. Tu próximo mensaje inicia una nueva conversación en ${botName}.`,
+  contextResetToast: 'Contexto borrado',
+  homeChatNotFoundFor: (botName) => `No hay Home Chat disponible para ${botName}.`,
+  homeChatNotFound: 'No se encontró el Home Chat.',
+  boundHomeChat: (botName, chatId) => `Vinculado al Home Chat de ${botName} (${chatId}).`,
+  homeChatBoundToast: 'Home Chat vinculado',
+  untitledChat: '(sin título)',
+  noChats: 'No hay conversaciones disponibles.',
+  newChatButton: '➕ Nueva conversación',
+  bindUsage: 'Uso: /bind <chatId de Orca>',
+  chatNotFound: (botName, chatId) => `No se encontró una conversación abierta ${chatId} en ${botName}.`,
+  chatGoneRetry: 'La conversación se cerró o ya no existe. Ejecuta /chats de nuevo.',
+  boundChat: (botName, title) => `Vinculado a la conversación de ${botName}: ${title}`,
+  chatBoundToast: 'Conversación vinculada',
+  renameUsage: 'Uso: /rename <nuevo título>',
+  noBoundChat: 'Todavía no hay una conversación de Orca vinculada. Envía un mensaje primero o vincula una con /bind.',
+  renamed: (title) => `Conversación renombrada a: ${title}`,
+  renameFailed: (detail) => `Error al renombrar: ${detail}`,
+  syncState: (on) => `Sincronización bidireccional (Orca -> TG): ${esOnOff(on)}`,
+  syncOnButton: 'Activar sincronización',
+  syncOffButton: 'Desactivar sincronización',
+  syncEnabled: 'Sincronización Orca -> Telegram activada.',
+  syncDisabled: 'Sincronización Orca -> Telegram desactivada.',
+  syncOnToast: 'Sincronización activada',
+  syncOffToast: 'Sincronización desactivada',
+  syncUsage: 'Uso: /sync [on|off]',
+  noAutomations: 'No hay automatizaciones configuradas.',
+  automationState: (enabled, lastRunStatus) =>
+    `${esOnOff(enabled)}${lastRunStatus ? `, última ejecución: ${lastRunStatus}` : ''}`,
+  runButton: (name) => `▶️ Ejecutar: ${name}`,
+  automationsFailed: (detail) => `Error al listar las automatizaciones: ${detail}`,
+  runUsage: 'Uso: /run <automationId> (mira los IDs con /automations o toca un botón allí para ejecutarla)',
+  automationTriggered: (automationId) => `Automatización iniciada: ${automationId}`,
+  automationTriggeredToast: 'Automatización iniciada',
+  runFailed: (detail) => `Error al ejecutar: ${detail}`
+}
+
 const zhOnOff = (on: boolean) => (on ? '开启' : '关闭')
 
 const zhCN: Messages = {
@@ -432,11 +544,25 @@ const zhCN: Messages = {
 const CATALOG: Record<ReplyLanguage, Messages> = {
   en,
   'pt-BR': ptBR,
+  es,
   'zh-CN': zhCN
 }
 
 export function normalizeLanguage(value: unknown): ReplyLanguage {
   return REPLY_LANGUAGES.find((lang) => lang === value) ?? 'en'
+}
+
+export function normalizeLanguageSetting(value: unknown): ReplyLanguageSetting {
+  return value === 'auto' ? 'auto' : normalizeLanguage(value)
+}
+
+/** The catalog language for a Telegram user's `language_code` (IETF tag, e.g. `pt-br`, `es`, `zh-hans`); English otherwise. */
+export function languageFromTelegramCode(code: string | undefined): ReplyLanguage {
+  const base = (code ?? '').toLowerCase().split(/[-_]/)[0]
+  if (base === 'pt') return 'pt-BR'
+  if (base === 'es') return 'es'
+  if (base === 'zh') return 'zh-CN'
+  return 'en'
 }
 
 export function t(lang: ReplyLanguage): Messages {

@@ -8,6 +8,8 @@ export type TelegramUser = {
   is_bot: boolean
   first_name: string
   username?: string
+  // The language of the person's Telegram app (IETF tag); absent for some users.
+  language_code?: string
   // Only in getMe: what @BotFather allows this bot (`/setjoingroups`, `/setprivacy`).
   can_join_groups?: boolean
   can_read_all_group_messages?: boolean
@@ -152,7 +154,9 @@ export interface TelegramClient {
   setMyCommands(
     token: string,
     commands: TelegramBotCommand[],
-    options?: TelegramRequestOptions
+    options?: TelegramRequestOptions,
+    // Two-letter ISO 639-1 code: the menu for users with that app language; absent = everyone else.
+    languageCode?: string
   ): Promise<boolean>
   getUpdates(
     token: string,
@@ -706,8 +710,13 @@ export function createTelegramClient(): TelegramClient {
     getMe(token, options) {
       return callTelegramApi<TelegramUser>(token, 'getMe', undefined, options)
     },
-    setMyCommands(token, commands, options) {
-      return callTelegramApi<boolean>(token, 'setMyCommands', { commands }, options)
+    setMyCommands(token, commands, options, languageCode) {
+      return callTelegramApi<boolean>(
+        token,
+        'setMyCommands',
+        languageCode ? { commands, language_code: languageCode } : { commands },
+        options
+      )
     },
     getUpdates(token, params, options) {
       const timeoutSec = params.timeoutSec ?? 25

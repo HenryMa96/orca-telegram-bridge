@@ -1,5 +1,5 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
-import type { ReplyLanguage } from './i18n'
+import type { ReplyLanguageSetting } from './i18n'
 
 export {}
 
@@ -65,7 +65,7 @@ export type BridgeConfig = {
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
-  replyLanguage: ReplyLanguage
+  replyLanguage: ReplyLanguageSetting
   // Off: group messages are ignored and the bot leaves any group it is added to.
   allowGroups: boolean
   // 'all' takes effect only with a restricted allowedUserIds; while open it acts as 'addressed'.
@@ -123,7 +123,7 @@ export type SaveConfigInput = {
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
-  replyLanguage?: ReplyLanguage
+  replyLanguage?: ReplyLanguageSetting
   // Absent keeps the current value.
   allowGroups?: boolean
   groupMode?: GroupMode

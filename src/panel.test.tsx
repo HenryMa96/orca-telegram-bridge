@@ -651,10 +651,15 @@ test('the reply language select shows the saved language and saves the chosen on
   await openEditor(view, 'b1')
   await openAdvanced(view)
   assert.equal(view.valueOf({ label: 'Telegram reply language' }), 'zh-CN')
+  const options = view.find({ label: 'Telegram reply language' })!.props.options as { value: string }[]
+  assert.deepEqual(options.map((o) => o.value), ['auto', 'en', 'pt-BR', 'es', 'zh-CN'])
 
-  await view.select({ label: 'Telegram reply language' }, 'pt-BR')
+  await view.select({ label: 'Telegram reply language' }, 'es')
   await view.press({ text: 'Save' })
-  assert.equal(saved[0].replyLanguage, 'pt-BR')
+  assert.equal(saved[0].replyLanguage, 'es')
+  await view.select({ label: 'Telegram reply language' }, 'auto')
+  await view.press({ text: 'Save' })
+  assert.equal(saved[1].replyLanguage, 'auto')
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

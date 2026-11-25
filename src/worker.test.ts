@@ -63,7 +63,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
   const outbox: string[] = []
   const sentActions: { chatId: number | string; action: string }[] = []
   const answeredCallbacks: { callbackQueryId: string; text?: string; showAlert?: boolean }[] = []
+  // Default-language menus only (what most tests count); every menu with its language is in registeredMenus.
   const registeredCommands: TelegramBotCommand[][] = []
+  const registeredMenus: { languageCode: string | null; commands: TelegramBotCommand[] }[] = []
   const sentToBots: { botName: string; chatId: string; subject: string; body: string }[] = []
   const renamedChats: { sessionId: string; name: string }[] = []
   const triggeredAutomations: string[] = []
@@ -90,8 +92,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async getMe() {
       return { id: 100000001, is_bot: true, first_name: 'DemoBot', username: 'demo_orca_bot' }
     },
-    async setMyCommands(_token, commands) {
-      registeredCommands.push(commands)
+    async setMyCommands(_token, commands, _options, languageCode) {
+      registeredMenus.push({ languageCode: languageCode ?? null, commands })
+      if (!languageCode) registeredCommands.push(commands)
       return true
     },
     async getUpdates() {
@@ -273,6 +276,7 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     sentActions,
     answeredCallbacks,
     registeredCommands,
+    registeredMenus,
     sentToBots,
     renamedChats,
     triggeredAutomations,
@@ -2006,7 +2010,9 @@ const CJK = /[\u4e00-\u9fff]/
 
 // What a stranger reads after messaging the bot while the allowlist holds only someone else.
 async function unauthorizedReply(
-  replyLanguage?: string
+  replyLanguage?: string,
+  // The stranger's Telegram app language, which Auto follows.
+  languageCode?: string
 ): Promise<{ reply: string; language: string }> {
   const host = mockHost({
     capabilities: CAPABILITIES,
@@ -2023,7 +2029,9 @@ async function unauthorizedReply(
   const deps = makeMockDeps()
   const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
-    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
+    const update = textUpdate(1, 777888, 'hello')
+    if (languageCode) update.message!.from!.language_code = languageCode
+    await controller.handleIncomingUpdate(update)
     return { reply: deps.sentMessages[0]?.text ?? '', language: controller.view().config.replyLanguage }
   } finally {
     await controller.dispose()
@@ -2046,6 +2054,81 @@ test('with Portuguese chosen the bridge answers a stranger in Portuguese', async
 test('with Chinese chosen the bridge answers a stranger in Chinese', async () => {
   const { reply } = await unauthorizedReply('zh-CN')
   assert.equal(reply, '未获授权。你的 Telegram ID 是 777888，请联系机器人所有者添加。')
+})
+
+test('with Spanish chosen the bridge answers a stranger in Spanish', async () => {
+  const { reply } = await unauthorizedReply('es')
+  assert.match(reply, /^Sin autorización\. Tu ID de Telegram es 777888\./)
+})
+
+test("with Auto the bridge answers each stranger in their Telegram app's language, else English", async () => {
+  const spanish = await unauthorizedReply('auto', 'es-ES')
+  assert.equal(spanish.language, 'auto')
+  assert.match(spanish.reply, /^Sin autorización\./)
+  assert.match((await unauthorizedReply('auto', 'pt-br')).reply, /^Sem autorização\./)
+  assert.match((await unauthorizedReply('auto', 'zh-hans')).reply, /^未获授权/)
+  assert.match((await unauthorizedReply('auto', 'de')).reply, /^Not authorized\./)
+  assert.match((await unauthorizedReply('auto')).reply, /^Not authorized\./)
+})
+
+// Telegram shows each user the menu of their app language, else the default one.
+test('Auto sets a command menu per language; a fixed language sets every menu in that language', async () => {
+  const menusFor = async (replyLanguage: string) => {
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      secrets: { botToken: '123456:TEST_TOKEN' },
+      settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300, replyLanguage }
+    })
+    // A poll that answers at once would spin the loop on microtasks and starve the test; this one
+    // stays open until the bridge stops, as Telegram does while no message arrives.
+    const deps = makeMockDeps({
+      telegram: {
+        getUpdates(_token, _params, options) {
+          return new Promise((resolve) => {
+            options?.signal?.addEventListener('abort', () => resolve([]), { once: true })
+          })
+        }
+      }
+    })
+    const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+    try {
+      await until(() => deps.registeredMenus.length === 4, 'four command menus')
+      return deps.registeredMenus.map((m) => [m.languageCode, m.commands.find((c) => c.command === 'help')?.description])
+    } finally {
+      await controller.dispose()
+      await worker.deactivate()
+    }
+  }
+  assert.deepEqual(await menusFor('auto'), [
+    [null, 'Show available commands'],
+    ['pt', 'Mostrar os comandos disponíveis'],
+    ['es', 'Mostrar los comandos disponibles'],
+    ['zh', t('zh-CN').commands.help]
+  ])
+  const fixed = await menusFor('es')
+  assert.deepEqual(fixed.map(([code]) => code), [null, 'pt', 'es', 'zh'])
+  assert.ok(fixed.every(([, help]) => help === 'Mostrar los comandos disponibles'))
+})
+
+test("with Auto the Orca bot is told to answer in the user's language; a fixed language says nothing", async () => {
+  const bodyFor = async (replyLanguage: string) => {
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      secrets: { botToken: '123456:TEST_TOKEN' },
+      settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300, replyLanguage }
+    })
+    const deps = makeMockDeps()
+    const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+    try {
+      await within(controller.handleIncomingUpdate(textUpdate(1, 777888, '¿cuál es el saldo?')), 'message')
+      return deps.sentToBots[0]?.body ?? ''
+    } finally {
+      await within(controller.dispose(), 'dispose')
+      await worker.deactivate()
+    }
+  }
+  assert.ok((await bodyFor('auto')).includes("Answer in the language of the user's message."))
+  assert.equal((await bodyFor('pt-BR')).includes('Answer in the language'), false)
 })
 
 test('an unknown stored reply language falls back to English', async () => {

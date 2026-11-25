@@ -1,8 +1,16 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { normalizeLanguage, t, TELEGRAM_COMMAND_NAMES, type Messages } from './i18n'
+import {
+  languageFromTelegramCode,
+  normalizeLanguageSetting,
+  t,
+  TELEGRAM_COMMAND_NAMES,
+  type Messages,
+  type ReplyLanguage
+} from './i18n'
 import {
   computeTailHashes,
   createOrcaCliRunner,
@@ -111,6 +119,17 @@ function normalizePrompt(text: string): string {
 
 // Starts the text sent to the Orca bot in place of a voice message or audio file.
 const VOICE_PREFIX = '[Voice message, transcribed]'
+
+// With replyLanguage 'auto', the language of the Telegram user whose update is being handled. The
+// async context carries it into the chat's queued work, so chats handled side by side never mix.
+const messageLanguage = new AsyncLocalStorage<ReplyLanguage>()
+
+// Telegram shows the menu set for the user's app language, else the default (no code) one.
+const MENU_LANGUAGES: Array<[code: string, language: ReplyLanguage]> = [
+  ['pt', 'pt-BR'],
+  ['es', 'es'],
+  ['zh', 'zh-CN']
+]
 
 type SyncCursor = {
   tailHashes: string[]
@@ -421,7 +440,7 @@ function readStoredBridge(raw: Record<string, unknown>, id: string, fallbackName
     proxyUrl: text(raw.proxyUrl),
     replyTimeoutSec: clampTimeout(raw.replyTimeoutSec),
     syncOrcaOutbound: typeof raw.syncOrcaOutbound === 'boolean' ? raw.syncOrcaOutbound : false,
-    replyLanguage: normalizeLanguage(raw.replyLanguage),
+    replyLanguage: normalizeLanguageSetting(raw.replyLanguage),
     allowGroups: typeof raw.allowGroups === 'boolean' ? raw.allowGroups : true,
     groupMode: raw.groupMode === 'all' ? 'all' : 'addressed',
     // Before 0.8.0, 'all' answered every group message; such a bridge keeps answering ('helpful').
@@ -487,9 +506,9 @@ function traceTelegram(client: TelegramClient, tracer: Tracer): TelegramClient {
   return {
     getMe: (token, options) =>
       trace('getMe', () => client.getMe(token, options), (me) => `@${me.username ?? me.id}`),
-    setMyCommands: (token, commands, options) =>
-      trace(`setMyCommands (${commands.length} commands)`, () =>
-        client.setMyCommands(token, commands, options)
+    setMyCommands: (token, commands, options, languageCode) =>
+      trace(`setMyCommands (${commands.length} commands${languageCode ? `, ${languageCode}` : ''})`, () =>
+        client.setMyCommands(token, commands, options, languageCode)
       ),
     getUpdates: (token, params, options) =>
       trace(
@@ -620,6 +639,8 @@ export class BridgeRuntime {
   private readonly chatQueues = new Map<string, Promise<void>>()
   private readonly activeTelegramTgChats = new Set<string>()
   private readonly activeTelegramOrcaChats = new Set<string>()
+  // With 'auto': the last Telegram language seen per chat, for what sync sends there unprompted.
+  private readonly chatLanguages = new Map<string, ReplyLanguage>()
   private automationSnapshot: Promise<AutomationSnapshot | null> | null = null
   private readonly blockedLoggedAt = new Map<string, number>()
   // Groups this run already left because groups are off; a message there does not leave again.
@@ -735,7 +756,8 @@ export class BridgeRuntime {
 
   // Texts for Telegram, in the language this bridge uses.
   private get i18n(): Messages {
-    return t(this.config.replyLanguage)
+    const setting = this.config.replyLanguage
+    return t(setting === 'auto' ? (messageLanguage.getStore() ?? 'en') : setting)
   }
 
   private get bots(): BotSummary[] {
@@ -788,7 +810,7 @@ export class BridgeRuntime {
     }
 
     const replyLanguage =
-      input.replyLanguage === undefined ? prev.replyLanguage : normalizeLanguage(input.replyLanguage)
+      input.replyLanguage === undefined ? prev.replyLanguage : normalizeLanguageSetting(input.replyLanguage)
     this.config = {
       id: this.id,
       name: input.name?.trim() || prev.name,
@@ -966,9 +988,21 @@ export class BridgeRuntime {
     await accepted?.done
   }
 
+  // Runs the update in its sender's Telegram language, which 'auto' uses for everything it says.
+  private acceptIncomingUpdate(
+    update: TelegramUpdate,
+    signal?: AbortSignal
+  ): Promise<{ done: Promise<void> } | null> {
+    const from = update.message?.from ?? update.callback_query?.from
+    const language = languageFromTelegramCode(from?.language_code)
+    const chatId = update.message?.chat.id ?? update.callback_query?.message?.chat.id
+    if (from?.language_code && chatId !== undefined) this.chatLanguages.set(String(chatId), language)
+    return messageLanguage.run(language, () => this.acceptUpdateInLanguage(update, signal))
+  }
+
   // The ordered part of an update: offset, allowlist, then enqueue on the chat's queue. The queued
   // work is returned, not awaited, so the poll loop keeps serving other chats during a slow reply.
-  private async acceptIncomingUpdate(
+  private async acceptUpdateInLanguage(
     update: TelegramUpdate,
     signal?: AbortSignal
   ): Promise<{ done: Promise<void> } | null> {
@@ -1303,6 +1337,7 @@ export class BridgeRuntime {
         userText: text,
         imagePaths,
         unaddressedGroupReply: unaddressed ? this.config.groupReply : undefined,
+        answerInMessageLanguage: this.config.replyLanguage === 'auto',
         timeoutMs: this.config.replyTimeoutSec * 1000,
         pollIntervalMs: this.deps.pollIntervalMs,
         signal,
@@ -2409,22 +2444,27 @@ export class BridgeRuntime {
 
   private async ensureCommandsRegistered(token: string, signal?: AbortSignal): Promise<void> {
     if (this.commandsRegistered) return
-    const language = this.config.replyLanguage
-    const descriptions = t(language).commands
-    const commands: TelegramBotCommand[] = TELEGRAM_COMMAND_NAMES.map((command) => ({
-      command,
-      description: descriptions[command]
-    }))
+    const setting = this.config.replyLanguage
+    const commandsIn = (language: ReplyLanguage): TelegramBotCommand[] =>
+      TELEGRAM_COMMAND_NAMES.map((command) => ({ command, description: t(language).commands[command] }))
+    // Every language's menu is set each time, so leaving 'auto' replaces the per-language menus too.
+    const menus: Array<[code: string | undefined, language: ReplyLanguage]> = [
+      [undefined, setting === 'auto' ? 'en' : setting],
+      ...MENU_LANGUAGES.map(([code, language]): [string, ReplyLanguage] => [code, setting === 'auto' ? language : setting])
+    ]
     try {
-      await this.deps.telegram.setMyCommands(token, commands, {
-        proxyUrl: this.config.proxyUrl,
-        timeoutMs: 10_000,
-        signal
-      })
-      // A language change during the call leaves the flag unset, so the next poll sends the new menu.
-      this.commandsRegistered = language === this.config.replyLanguage
+      for (const [code, language] of menus) {
+        await this.deps.telegram.setMyCommands(
+          token,
+          commandsIn(language),
+          { proxyUrl: this.config.proxyUrl, timeoutMs: 10_000, signal },
+          code
+        )
+      }
+      // A language change during the calls leaves the flag unset, so the next poll sends the new menus.
+      this.commandsRegistered = setting === this.config.replyLanguage
       this.lastFailures.delete('setMyCommands')
-      await this.appendLog('info', 'telegram', `Registered Telegram slash command menu (${language}).`)
+      await this.appendLog('info', 'telegram', `Registered Telegram slash command menu (${setting}).`)
     } catch (err) {
       // Retried on every poll until it works; logged again only when the failure changes.
       if (this.isRepeatedFailure('setMyCommands', err)) return
@@ -2583,7 +2623,10 @@ export class BridgeRuntime {
           }
           const chatMeta = chatMap.get(orcaChatId)
           if (!chatMeta || chatMeta.closed) continue
-          await this.syncSingleBoundChat(token, binding, orcaChatId, chatMeta.lastActivityAt)
+          // Sync speaks unprompted, so 'auto' uses the chat's last seen Telegram language.
+          await messageLanguage.run(this.chatLanguages.get(binding.tgChatId) ?? 'en', () =>
+            this.syncSingleBoundChat(token, binding, orcaChatId, chatMeta.lastActivityAt)
+          )
         }
       }
     } finally {

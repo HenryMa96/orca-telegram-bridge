@@ -43,7 +43,7 @@ import type {
   SaveConfigInput,
   VoiceProvider
 } from './protocol'
-import type { ReplyLanguage } from './i18n'
+import type { ReplyLanguageSetting } from './i18n'
 
 type LogFilter = 'all' | 'errors' | 'warnings' | 'debug'
 // Who can talk to the bot: only the listed Telegram IDs, or anyone (saved as an empty list).
@@ -75,7 +75,7 @@ const allowedIdsError = atom<string | null>(null)
 const proxyUrlDraft = atom('')
 const timeoutDraft = atom('300')
 const syncOrcaOutboundDraft = atom(false)
-const replyLanguageDraft = atom<ReplyLanguage>('en')
+const replyLanguageDraft = atom<ReplyLanguageSetting>('en')
 const allowGroupsDraft = atom(false)
 const groupModeDraft = atom<GroupMode>('addressed')
 const groupReplyDraft = atom<GroupReply>('mentioned')
@@ -102,9 +102,11 @@ const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
   { value: 'warnings', label: 'Warnings and errors' },
   { value: 'debug', label: 'Debug only' }
 ]
-const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguage; label: string }> = [
+const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguageSetting; label: string }> = [
+  { value: 'auto', label: 'Auto (language of each message)' },
   { value: 'en', label: 'English' },
   { value: 'pt-BR', label: 'Português (Brasil)' },
+  { value: 'es', label: 'Español' },
   { value: 'zh-CN', label: '中文' }
 ]
 const ACCESS_OPTIONS: Array<{ value: AccessMode; label: string }> = [
@@ -813,7 +815,7 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
               label="Telegram reply language"
               value={read(replyLanguageDraft)}
               options={REPLY_LANGUAGE_OPTIONS}
-              onChange={(v) => edit(replyLanguageDraft, v as ReplyLanguage)}
+              onChange={(v) => edit(replyLanguageDraft, v as ReplyLanguageSetting)}
             />
             <Input
               label="Reply timeout (seconds)"
