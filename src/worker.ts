@@ -125,13 +125,54 @@ function resolveSafeImageExt(filePath: string | undefined, fallbackExt: string):
   return ALLOWED_IMAGE_EXTS.has(fromPath) ? fromPath : fallbackExt
 }
 
+// User ids are positive; group and supergroup chat ids are negative.
 function parseAllowedIds(raw: string): Set<string> {
   return new Set(
     raw
       .split(/[\s,;]+/)
       .map((s) => s.trim())
-      .filter((s) => /^\d+$/.test(s))
+      .filter((s) => /^-?\d+$/.test(s))
   )
+}
+
+// An empty allowlist opens the bridge to everyone; otherwise the sender or the chat must be listed.
+function isAllowed(allowed: Set<string>, fromId: string, tgChatId: string): boolean {
+  return allowed.size === 0 || allowed.has(fromId) || allowed.has(tgChatId)
+}
+
+// Removes text[start, end) and the space it leaves behind: 'a @bot b' -> 'a b', 'hi @bot, x' -> 'hi, x'.
+function cutSpan(text: string, start: number, end: number): string {
+  const before = text.slice(0, start)
+  const after = text.slice(end)
+  if (!/\s$/.test(before)) return before + after
+  if (/^\s/.test(after)) return before + after.slice(1)
+  return /^[,.!?;:]/.test(after) ? before.slice(0, -1) + after : before + after
+}
+
+// Finds '@username' mentions of this bot: from the message entities when Telegram sent them,
+// else by plain text. Returns the text without those mentions.
+function stripBotMention(
+  msg: TelegramMessage,
+  username: string
+): { mentioned: boolean; text: string } {
+  const raw = msg.text ?? msg.caption ?? ''
+  const handle = `@${username.toLowerCase()}`
+  const entities = (msg.text !== undefined ? msg.entities : msg.caption_entities) ?? []
+  const starts = entities
+    .filter(
+      (e) =>
+        e.type === 'mention' && raw.slice(e.offset, e.offset + e.length).toLowerCase() === handle
+    )
+    .map((e) => e.offset)
+  if (starts.length === 0) {
+    const pattern = new RegExp(`(?<![\\w@])@${username}(?!\\w)`, 'gi')
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(raw)) !== null) starts.push(match.index)
+  }
+  starts.sort((a, b) => b - a)
+  let text = raw
+  for (const start of starts) text = cutSpan(text, start, start + handle.length)
+  return { mentioned: starts.length > 0, text: text.trim() }
 }
 
 function formatSenderLabel(msg: TelegramMessage): string {
@@ -285,6 +326,7 @@ export class TelegramBridgeController {
 
   private status: BridgeConnectionStatus = 'needs_token'
   private botUsername: string | null = null
+  private botUserId: number | null = null
   private botDisplayName: string | null = null
   private lastError: string | null = null
   private lastBlockedUserId: string | null = null
@@ -406,6 +448,7 @@ export class TelegramBridgeController {
     if (changed.length > 0) {
       await this.appendLog('debug', 'config', `Settings reloaded; changed: ${changed.join(', ')}`)
     }
+    await this.logSyncPausedWhileOpen(changed)
     this.refreshBotsInBackground()
     if (!prevSync && this.config.syncOrcaOutbound) {
       await this.resetSyncCursors()
@@ -418,6 +461,7 @@ export class TelegramBridgeController {
       await this.stopPolling()
       this.status = 'needs_token'
       this.botUsername = null
+      this.botUserId = null
       this.botDisplayName = null
       this.emitState()
       return
@@ -496,6 +540,7 @@ export class TelegramBridgeController {
     const changed = changedConfigFields(prev, this.config)
     if (prevToken !== this.cachedToken) changed.push('botToken')
     await this.appendLog('debug', 'config', `Config changed: ${changed.join(', ') || 'nothing'}`)
+    await this.logSyncPausedWhileOpen(changed)
 
     const tokenChanged = this.cachedToken !== this.identityToken
     // Restarting aborts in-flight replies, so restart only when the Telegram connection itself changes.
@@ -531,6 +576,7 @@ export class TelegramBridgeController {
         timeoutMs: 12_000
       })
       this.botUsername = me.username || null
+      this.botUserId = me.id
       this.botDisplayName = me.first_name
       this.lastError = null
       await this.ensureCommandsRegistered(token)
@@ -579,7 +625,7 @@ export class TelegramBridgeController {
 
   async allowUserId(userId: string): Promise<BridgeState> {
     const clean = userId.trim()
-    if (!/^\d+$/.test(clean)) {
+    if (!/^-?\d+$/.test(clean)) {
       return this.getState()
     }
     const existing = parseAllowedIds(this.config.allowedUserIds)
@@ -682,24 +728,34 @@ export class TelegramBridgeController {
 
     const msg = update.message
     if (!msg) return null
-    const text = (msg.text ?? msg.caption ?? '').trim()
     const image = extractIncomingImage(msg)
     const unsupportedImage =
       !image && Boolean(msg.document?.mime_type?.toLowerCase().startsWith('image/'))
+    const tgChatId = String(msg.chat.id)
+    const text = msg.chat.type === 'group' || msg.chat.type === 'supergroup'
+      ? this.groupMessageText(msg, Boolean(image))
+      : (msg.text ?? msg.caption ?? '').trim()
+    if (text === null) {
+      await this.appendLog(
+        'debug',
+        'bridge',
+        `Ignored message ${msg.message_id} in group ${tgChatId}: not a command, mention or reply to the bot.`
+      )
+      return null
+    }
     if (!text && !image && !unsupportedImage) return null
 
-    const tgChatId = String(msg.chat.id)
     const fromId = msg.from ? String(msg.from.id) : tgChatId
     const allowed = parseAllowedIds(this.config.allowedUserIds)
 
-    if (!allowed.has(fromId) && !allowed.has(tgChatId)) {
-      await this.recordBlockedUser(
+    if (!isAllowed(allowed, fromId, tgChatId)) {
+      const firstInWindow = await this.recordBlockedUser(
         fromId,
         `Blocked unauthorized Telegram user ${fromId} (${formatSenderLabel(msg)}).`
       )
-
-      const token = await this.readToken()
-      if (token && allowed.size === 0) {
+      // The same window as the log line, so a stranger cannot make the bot spam a chat.
+      const token = firstInWindow ? await this.readToken() : null
+      if (token) {
         await this.safeSendTelegram(
           token,
           msg.chat.id,
@@ -756,7 +812,7 @@ export class TelegramBridgeController {
     const allowed = parseAllowedIds(this.config.allowedUserIds)
     const token = await this.readToken()
 
-    if (!allowed.has(fromId) && !allowed.has(tgChatId)) {
+    if (!isAllowed(allowed, fromId, tgChatId)) {
       await this.recordBlockedUser(fromId, `Blocked unauthorized Telegram callback from ${fromId}.`)
       if (token) {
         await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.callbackUnauthorized, true)
@@ -814,17 +870,37 @@ export class TelegramBridgeController {
   }
 
   // Any stranger can flood the bot; log and post each blocked id at most once a minute.
-  private async recordBlockedUser(fromId: string, logMessage: string): Promise<void> {
+  // Returns false while the id is still inside that window.
+  private async recordBlockedUser(fromId: string, logMessage: string): Promise<boolean> {
     const now = Date.now()
     for (const [id, at] of this.blockedLoggedAt) {
       if (now - at >= BLOCK_LOG_INTERVAL_MS) this.blockedLoggedAt.delete(id)
     }
-    if (this.blockedLoggedAt.has(fromId)) return
+    if (this.blockedLoggedAt.has(fromId)) return false
     this.blockedLoggedAt.set(fromId, now)
     this.lastBlockedUserId = fromId
     await this.orca.storage.set(STORAGE_LAST_BLOCKED, fromId)
     await this.appendLog('warn', 'bridge', logMessage)
     this.emitState()
+    return true
+  }
+
+  // In groups the bot answers only commands for it, mentions of @botUsername and replies to its
+  // own messages. Returns the text to process (mention removed), or null to ignore the message.
+  private groupMessageText(msg: TelegramMessage, hasImage: boolean): string | null {
+    const username = this.botUsername
+    if (!username) return null
+    const raw = (msg.text ?? msg.caption ?? '').trim()
+    if (!hasImage && raw.startsWith('/')) {
+      const rawCmd = raw.split(/\s+/)[0]
+      const at = rawCmd.indexOf('@')
+      // '/cmd@other_bot' is for another bot in the same group.
+      return at === -1 || rawCmd.slice(at + 1).toLowerCase() === username.toLowerCase() ? raw : null
+    }
+    const { mentioned, text } = stripBotMention(msg, username)
+    const replyToBot =
+      this.botUserId !== null && msg.reply_to_message?.from?.id === this.botUserId
+    return mentioned || replyToBot ? text : null
   }
 
   private async processAuthorizedMessage(
@@ -1871,14 +1947,26 @@ export class TelegramBridgeController {
     }
   }
 
+  // Outbound sync never runs while the allowlist is empty; say so once when that state begins.
+  private async logSyncPausedWhileOpen(changed: string[]): Promise<void> {
+    if (!this.config.syncOrcaOutbound || parseAllowedIds(this.config.allowedUserIds).size > 0) return
+    if (!changed.includes('syncOrcaOutbound') && !changed.includes('allowedUserIds')) return
+    await this.appendLog(
+      'info',
+      'sync',
+      'Orca outbound sync is paused: the allowlist is empty, so the bridge is open to everyone. Add your Telegram ID to use sync.'
+    )
+  }
+
   async syncOrcaBoundChatsOnce(): Promise<void> {
     if (this.disposed || !this.config.syncOrcaOutbound || this.outboundSyncRunning) return
     const token = await this.readToken()
     if (!token) return
     const allowed = parseAllowedIds(this.config.allowedUserIds)
+    // Open mode lets anyone /bind an Orca chat; syncing would push the owner's Orca messages to them.
     if (allowed.size === 0) return
 
-    // Sync only to chats whose Telegram user is still on the allowlist.
+    // Sync only to chats whose Telegram user (or group) is still on the allowlist.
     const boundList = this.bindings.filter(
       (b) =>
         Boolean(b.orcaChatId) &&
@@ -2153,6 +2241,7 @@ export class TelegramBridgeController {
             signal: abort.signal
           })
           this.botUsername = me.username || null
+          this.botUserId = me.id
           this.botDisplayName = me.first_name
         }
 
@@ -2280,6 +2369,7 @@ export class TelegramBridgeController {
     this.identityToken = token
     this.updateOffset = 0
     this.botUsername = null
+    this.botUserId = null
     this.botDisplayName = null
     this.commandsRegistered = false
     await this.orca.storage.set(STORAGE_OFFSET, 0)

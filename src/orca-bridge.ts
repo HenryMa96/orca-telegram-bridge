@@ -514,8 +514,9 @@ export function computeTailHashes(items: OrcaMessageItem[], limit = TAIL_HASH_LI
 }
 
 export function isTelegramOriginatedUserMessage(text: string): boolean {
-  // Greedy `.*` so sender labels such as `Ann (123)` still match.
-  return /^Telegram message from owner \(.*, chat [^)]*\) \[tg:[^:\]]+:\d+\]\./.test(text.trim())
+  // Greedy `.*` so sender labels such as `Ann (123)` still match. `owner` is the pre-0.3.0 wording,
+  // still in older chat histories.
+  return /^Telegram message from (?:user|owner) \(.*, chat [^)]*\) \[tg:[^:\]]+:\d+\]\./.test(text.trim())
 }
 
 /**
@@ -630,7 +631,9 @@ export async function dispatchToOrcaBotAndWait(
   const subject = targetChatId === 'new' ? `Telegram: ${preview}` : `Telegram reply: ${preview}`
   const requestMarker = `[tg:${params.tgChatId}:${Date.now()}]`
   const bodyParts = [
-    `Telegram message from owner (${params.senderLabel}, chat ${params.tgChatId}) ${requestMarker}.`,
+    // Not "owner": with open access and groups the sender can be anyone, and the Orca bot must not
+    // give them the owner's trust.
+    `Telegram message from user (${params.senderLabel}, chat ${params.tgChatId}) ${requestMarker}.`,
     'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).'
   ]
   if (imagePaths.length > 0) {

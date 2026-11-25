@@ -318,6 +318,10 @@ export function setup(ctx: PanelContext): void {
   void refresh()
 }
 
+function hasAllowedIds(raw: string): boolean {
+  return raw.split(/[\s,;]+/).some((id) => /^-?\d+$/.test(id))
+}
+
 export default function Panel() {
   const state = read(bridgeState)
   const tab = read(activeTab)
@@ -361,6 +365,7 @@ export default function Panel() {
   }
 
   const targetDisplay = state.config.defaultBot || 'auto'
+  const openToEveryone = !hasAllowedIds(state.config.allowedUserIds)
 
   return (
     <Stack gap="md">
@@ -434,6 +439,13 @@ export default function Panel() {
       >
         <Tab value="setup" label="Setup">
           <Stack gap="sm">
+            {openToEveryone && (
+              <Callout tone="warning" title="Open to everyone" icon="warning">
+                <Text size="xs">
+                  {`Anyone who finds ${state.botUsername ? `@${state.botUsername}` : 'your bot'} on Telegram can chat with your Orca bots and use their commands with your rights. Add Telegram IDs to restrict access.`}
+                </Text>
+              </Callout>
+            )}
             <Card
               title="Bot Credentials & Routing"
               description={
@@ -457,9 +469,9 @@ export default function Panel() {
                   onChange={(v) => edit(defaultBotDraft, v)}
                 />
                 <Input
-                  label="Allowed Telegram User IDs"
+                  label="Allowed Telegram IDs (empty = everyone)"
                   value={read(allowedIdsDraft)}
-                  placeholder="Comma-separated numeric IDs, e.g. 123456789"
+                  placeholder="Empty = open to everyone. Or user/group IDs, e.g. 123456789, -1001234567890"
                   onChange={(v) => edit(allowedIdsDraft, v)}
                 />
                 <Input
@@ -490,6 +502,11 @@ export default function Panel() {
                   checked={read(syncOrcaOutboundDraft)}
                   onChange={(v) => edit(syncOrcaOutboundDraft, v)}
                 />
+                {openToEveryone && state.config.syncOrcaOutbound && (
+                  <Text muted size="xs">
+                    Sync is paused while the bot is open to everyone. Add Telegram IDs to use it.
+                  </Text>
+                )}
                 <Row gap="xs">
                   <Button size="sm" disabled={isBusy} onPress={saveConfig}>
                     Save Settings

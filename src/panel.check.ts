@@ -20,7 +20,7 @@ export default defineCheck({
     settings: {
       enabled: false,
       defaultBot: 'Assistant',
-      allowedUserIds: '123456789',
+      allowedUserIds: '123456789, -1001234567890',
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
       syncOrcaOutbound: true,

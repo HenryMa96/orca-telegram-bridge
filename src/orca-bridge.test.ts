@@ -210,6 +210,9 @@ test('bridge-sent message is recognised when the sender label contains parenthes
   await dispatchToOrcaBotAndWait(runner, dispatchParams)
 
   assert.equal(isTelegramOriginatedUserMessage(sentBodies[0]), true)
+  assert.match(sentBodies[0], /^Telegram message from user \(/)
+  // Chat histories written before 0.3.0 still hold the old wording and must stay recognised.
+  assert.equal(isTelegramOriginatedUserMessage('Telegram message from owner (Ann (123), chat 1) [tg:1:2].'), true)
   assert.equal(
     isTelegramOriginatedUserMessage('Did the Telegram message from owner (Ann, chat 1) [tg:1:2]. arrive?'),
     false

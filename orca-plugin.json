@@ -67,8 +67,8 @@
       },
       {
         "key": "allowedUserIds",
-        "title": "Allowed Telegram User IDs",
-        "description": "Comma-separated numeric Telegram user IDs allowed to drive your Orca bots.",
+        "title": "Allowed Telegram IDs",
+        "description": "Leave empty to let everyone use the bot. Add Telegram user IDs or group IDs (negative, e.g. -1001234567890), separated by commas, to allow only them.",
         "type": "string",
         "default": "",
         "placeholder": "123456789"

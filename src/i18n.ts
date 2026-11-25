@@ -112,7 +112,7 @@ const en: Messages = {
     status: 'Show connection and session status'
   },
   unauthorized: (userId) =>
-    `Access denied. Your Telegram ID is ${userId}. Add it to the allowlist in Orca's Telegram panel first.`,
+    `Not authorized. Your Telegram ID is ${userId}. Ask the bot owner to add it.`,
   callbackUnauthorized: 'Access denied. Add your ID to the allowlist first.',
   unsupportedImage: 'This image format is not supported. Send a JPG, PNG, WEBP, GIF or BMP image.',
   processingFailed: (detail) => `Processing failed: ${detail}`,
@@ -213,7 +213,7 @@ const ptBR: Messages = {
     status: 'Ver o status da conexão e da conversa'
   },
   unauthorized: (userId) =>
-    `Acesso negado. Seu ID do Telegram é ${userId}. Adicione-o à lista de permitidos no painel Telegram do Orca.`,
+    `Sem autorização. Seu ID do Telegram é ${userId}. Peça ao dono do bot para adicioná-lo.`,
   callbackUnauthorized: 'Acesso negado. Adicione seu ID à lista de permitidos primeiro.',
   unsupportedImage: 'Formato de imagem não suportado. Envie uma imagem JPG, PNG, WEBP, GIF ou BMP.',
   processingFailed: (detail) => `Falha no processamento: ${detail}`,
@@ -313,7 +313,7 @@ const zhCN: Messages = {
     status: '查看连接与会话状态'
   },
   unauthorized: (userId) =>
-    `未授权访问。你的 Telegram ID 是 ${userId}，请先在 Orca 的 Telegram 面板中将其加入白名单。`,
+    `未获授权。你的 Telegram ID 是 ${userId}，请联系机器人所有者添加。`,
   callbackUnauthorized: '未授权访问，请先加入白名单。',
   unsupportedImage: '暂不支持该图片格式，请发送 JPG、PNG、WEBP、GIF 或 BMP 图片。',
   processingFailed: (detail) => `处理失败：${detail}`,

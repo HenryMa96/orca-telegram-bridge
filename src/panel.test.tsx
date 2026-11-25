@@ -1,4 +1,4 @@
-import { assert, mockHost, mount, test } from 'orca/testing'
+import { assert, mockHost, mount, test, type TestPanel } from 'orca/testing'
 import * as panel from './panel'
 import type { BridgeState } from './protocol'
 
@@ -348,4 +348,52 @@ test('entries stored by 0.2.0 without scope render as bridge entries', async () 
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
   await view.unmount()
+})
+
+async function mountWithAllowed(allowedUserIds: string, syncOrcaOutbound = false) {
+  const state = makeState({ config: { ...makeState().config, allowedUserIds, syncOrcaOutbound } })
+  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'setup')
+  return view
+}
+
+// A Callout's title is a prop, not part of the text the finders match.
+function openWarning(view: TestPanel) {
+  return view.findAll({ type: 'Callout' }).find((c) => c.props.title === 'Open to everyone') ?? null
+}
+
+test('an empty allowlist shows the open to everyone warning naming the bot', async () => {
+  const view = await mountWithAllowed('')
+  assert.ok(openWarning(view))
+  assert.ok(view.find({ text: /Anyone who finds @demo_orca_bot on Telegram/ }))
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('a list with only a negative group ID hides the open warning', async () => {
+  const view = await mountWithAllowed('-1001234567890')
+  assert.equal(openWarning(view), null)
+  await view.unmount()
+})
+
+test('an allowlist with no valid ID still counts as open', async () => {
+  const view = await mountWithAllowed('abc, ,')
+  assert.ok(openWarning(view))
+  await view.unmount()
+})
+
+test('sync on with an open allowlist says sync is paused, restricted list does not', async () => {
+  const paused = /Sync is paused while the bot is open to everyone/
+  const open = await mountWithAllowed('', true)
+  assert.ok(open.find({ text: paused }))
+  await open.unmount()
+
+  const restricted = await mountWithAllowed('123456', true)
+  assert.equal(restricted.find({ text: paused }), null)
+  await restricted.unmount()
+
+  const syncOff = await mountWithAllowed('', false)
+  assert.equal(syncOff.find({ text: paused }), null)
+  await syncOff.unmount()
 })

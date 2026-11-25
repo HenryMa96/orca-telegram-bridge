@@ -23,6 +23,7 @@ import {
   type TelegramBotCommand,
   type TelegramClient,
   type TelegramInlineKeyboardMarkup,
+  type TelegramMessage,
   type TelegramUpdate
 } from './telegram-api'
 import * as main from './worker'
@@ -661,7 +662,7 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   const host = mockHost({
     capabilities: ['storage:own', 'secrets:own', 'settings:own', 'notifications:show'],
     secrets: { botToken: '123456:TEST_TOKEN' },
-    settings: { enabled: false, defaultBot: '', allowedUserIds: '', proxyUrl: '', replyTimeoutSec: 300 }
+    settings: { enabled: false, defaultBot: '', allowedUserIds: '42', proxyUrl: '', replyTimeoutSec: 300 }
   })
 
   const deps = makeMockDeps()
@@ -683,7 +684,7 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   // Empty defaultBot auto-selects first available Orca bot
   assert.equal(controller.getState().config.defaultBot, 'Assistant')
 
-  // 1. Unauthorized message is blocked and notifies sender of their numeric ID
+  // 1. With a restricted allowlist, an unlisted message is blocked and notifies sender of their numeric ID
   await controller.testConnection()
   assert.equal(deps.registeredCommands.length, 1)
   assert.ok(deps.registeredCommands[0].some((c) => c.command === 'new'))
@@ -1359,7 +1360,7 @@ test('outbound sync stops for a chat whose Telegram user was removed from the al
     },
     storage: {
       'tg.bindings': [
-        // A group chat id is never on the allowlist; the user who used it last is.
+        // This group chat id is not on the allowlist; the user who used it last is.
         { tgChatId: '-100500', ownerUserId: '555', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-group', updatedAt: 1000 },
         { tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-private', updatedAt: 1000 }
       ]
@@ -1769,7 +1770,7 @@ test('entries stored by 0.2.0 without a scope load into state and export', async
 
 const CJK = /[\u4e00-\u9fff]/
 
-// What a stranger reads after messaging the bot while the allowlist is empty.
+// What a stranger reads after messaging the bot while the allowlist holds only someone else.
 async function unauthorizedReply(
   replyLanguage?: string
 ): Promise<{ reply: string; language: string }> {
@@ -1779,7 +1780,7 @@ async function unauthorizedReply(
     settings: {
       enabled: false,
       defaultBot: 'Assistant',
-      allowedUserIds: '',
+      allowedUserIds: '42',
       proxyUrl: '',
       replyTimeoutSec: 300,
       ...(replyLanguage === undefined ? {} : { replyLanguage })
@@ -1799,24 +1800,24 @@ async function unauthorizedReply(
 test('by default the bridge answers a stranger in English with their Telegram ID', async () => {
   const { reply, language } = await unauthorizedReply()
   assert.equal(language, 'en')
-  assert.match(reply, /^Access denied\. Your Telegram ID is 777888\./)
+  assert.match(reply, /^Not authorized\. Your Telegram ID is 777888\. Ask the bot owner to add it\.$/)
   assert.ok(!CJK.test(reply), `the English reply holds Chinese text: ${reply}`)
 })
 
 test('with Portuguese chosen the bridge answers a stranger in Portuguese', async () => {
   const { reply } = await unauthorizedReply('pt-BR')
-  assert.match(reply, /^Acesso negado\. Seu ID do Telegram é 777888\./)
+  assert.match(reply, /^Sem autorização\. Seu ID do Telegram é 777888\./)
 })
 
-test('with Chinese chosen the bridge keeps its original Chinese text', async () => {
+test('with Chinese chosen the bridge answers a stranger in Chinese', async () => {
   const { reply } = await unauthorizedReply('zh-CN')
-  assert.equal(reply, '未授权访问。你的 Telegram ID 是 777888，请先在 Orca 的 Telegram 面板中将其加入白名单。')
+  assert.equal(reply, '未获授权。你的 Telegram ID 是 777888，请联系机器人所有者添加。')
 })
 
 test('an unknown stored reply language falls back to English', async () => {
   const { reply, language } = await unauthorizedReply('fr')
   assert.equal(language, 'en')
-  assert.match(reply, /^Access denied\./)
+  assert.match(reply, /^Not authorized\./)
 })
 
 test('saving a new reply language sends the Telegram command menu again in that language', async () => {
@@ -1907,6 +1908,225 @@ test('a reply that Orca shortened ends with the note in the chosen language', as
       reply
     )
     assert.ok(!CJK.test(reply), `the Portuguese reply holds Chinese text: ${reply}`)
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+// The bot that makeMockDeps' getMe reports.
+const BOT_USER = { id: 100000001, is_bot: true, first_name: 'DemoBot', username: 'demo_orca_bot' }
+const GROUP_ID = -100500
+
+function groupUpdate(
+  updateId: number,
+  userId: number,
+  text: string,
+  extra: Partial<TelegramMessage> = {}
+): TelegramUpdate {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: 100 + updateId,
+      from: { id: userId, is_bot: false, first_name: 'Member' },
+      chat: { id: GROUP_ID, type: 'supergroup', title: 'Team' },
+      date: 1000,
+      text,
+      ...extra
+    }
+  }
+}
+
+// Mounts the bridge with this allowlist. testConnection runs getMe, so the bot knows its @username
+// and user id the way it does once polling starts.
+async function withAccess(
+  allowedUserIds: string,
+  run: (controller: TelegramBridgeController, deps: ReturnType<typeof makeMockDeps>) => Promise<void>
+): Promise<void> {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds, proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    await controller.testConnection()
+    await run(controller, deps)
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+}
+
+// The user's own words are the last line of the body the Orca bot receives.
+function lastBodyLine(deps: ReturnType<typeof makeMockDeps>): string {
+  return deps.sentToBots.at(-1)?.body.split('\n').at(-1) ?? ''
+}
+
+test('with an empty allowlist a stranger reaches the Orca bot and gets no access-denied reply', async () => {
+  await withAccess('', async (controller, deps) => {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello there'))
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(lastBodyLine(deps), 'hello there')
+    assert.ok(!deps.sentMessages.some((m) => m.text === t('en').unauthorized('777888')))
+    assert.equal(controller.getState().lastBlockedUserId, null)
+  })
+})
+
+test('with a restricted allowlist a stranger is blocked and told only once, however often they write', async () => {
+  await withAccess('42', async (controller, deps) => {
+    for (let i = 1; i <= 3; i++) {
+      await controller.handleIncomingUpdate(textUpdate(i, 777888, `hello ${i}`))
+    }
+    assert.equal(deps.sentToBots.length, 0)
+    assert.deepEqual(
+      deps.sentMessages.map((m) => m.text),
+      [t('en').unauthorized('777888')]
+    )
+    assert.equal(controller.getState().lastBlockedUserId, '777888')
+  })
+})
+
+test('a listed group lets an unlisted member reach the Orca bot by mentioning it', async () => {
+  await withAccess(String(GROUP_ID), async (controller, deps) => {
+    await controller.handleIncomingUpdate(
+      groupUpdate(1, 555, 'hi @Demo_Orca_Bot, any news?', {
+        entities: [{ type: 'mention', offset: 3, length: 14 }]
+      })
+    )
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(lastBodyLine(deps), 'hi, any news?')
+    assert.equal(controller.getState().lastBlockedUserId, null)
+  })
+})
+
+test('a group message that neither mentions nor replies to the bot is ignored', async () => {
+  await withAccess('', async (controller, deps) => {
+    await controller.handleIncomingUpdate(groupUpdate(1, 555, 'just chatting with the team'))
+    await controller.handleIncomingUpdate(
+      groupUpdate(2, 555, 'agreed', {
+        reply_to_message: {
+          message_id: 50,
+          from: { id: 556, is_bot: false, first_name: 'Other' },
+          chat: { id: GROUP_ID, type: 'supergroup' },
+          date: 999,
+          text: 'shall we ship?'
+        }
+      })
+    )
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(deps.sentMessages.length, 0)
+    assert.equal(controller.getState().lastBlockedUserId, null)
+  })
+})
+
+test('a plain-text @mention reaches the Orca bot without the mention', async () => {
+  await withAccess('', async (controller, deps) => {
+    await controller.handleIncomingUpdate(groupUpdate(1, 555, '@demo_orca_bot what is up'))
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(lastBodyLine(deps), 'what is up')
+    assert.ok(!deps.sentToBots[0].body.includes('demo_orca_bot'))
+  })
+})
+
+test('a group reply to a message from the bot reaches the Orca bot', async () => {
+  await withAccess('', async (controller, deps) => {
+    await controller.handleIncomingUpdate(
+      groupUpdate(1, 555, 'and tomorrow?', {
+        reply_to_message: {
+          message_id: 901,
+          from: BOT_USER,
+          chat: { id: GROUP_ID, type: 'supergroup' },
+          date: 999,
+          text: 'Reply #1 from Assistant'
+        }
+      })
+    )
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(lastBodyLine(deps), 'and tomorrow?')
+  })
+})
+
+test('group commands for this bot run without a mention; commands for another bot are ignored', async () => {
+  await withAccess('', async (controller, deps) => {
+    await controller.handleIncomingUpdate(groupUpdate(1, 555, '/help@other_bot'))
+    assert.equal(deps.sentMessages.length, 0)
+    await controller.handleIncomingUpdate(groupUpdate(2, 555, '/help@demo_orca_bot'))
+    await controller.handleIncomingUpdate(groupUpdate(3, 555, '/start'))
+    assert.equal(deps.sentMessages.length, 2)
+    assert.ok(deps.sentMessages.every((m) => String(m.chatId) === String(GROUP_ID)))
+    assert.equal(deps.sentToBots.length, 0)
+  })
+})
+
+test('a restricted allowlist holding only a group id still blocks a stranger in a private chat', async () => {
+  await withAccess(String(GROUP_ID), async (controller, deps) => {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
+    assert.equal(deps.sentToBots.length, 0)
+    assert.equal(controller.getState().lastBlockedUserId, '777888')
+    assert.equal(deps.sentMessages[0]?.text, t('en').unauthorized('777888'))
+  })
+})
+
+test('outbound sync forwards nothing while the allowlist is empty', async () => {
+  const session: OrcaSessionRead = {
+    orcaSessionId: 'orca-bound',
+    state: 'done',
+    entries: [{ kind: 'message', role: 'assistant', text: 'Old history' }]
+  }
+  let activityAt = 1000
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: true
+    },
+    storage: {
+      'tg.bindings': [
+        { tgChatId: '777888', ownerUserId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-bound', updatedAt: 1000 }
+      ]
+    }
+  })
+  const deps = makeMockDeps({
+    orcaCli: {
+      async listBotChats() {
+        return [
+          {
+            id: 'orca-bound',
+            title: 'Bound',
+            lastActivityAt: activityAt,
+            lastAsked: null,
+            lastSaid: null,
+            home: false,
+            self: false,
+            closed: false
+          }
+        ]
+      },
+      async readSession() {
+        return { ...session, entries: [...session.entries] }
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await controller.syncOrcaBoundChatsOnce()
+    activityAt = 2000
+    session.entries.push({ kind: 'message', role: 'user', text: 'Private Orca-side question' })
+    session.entries.push({ kind: 'message', role: 'assistant', text: 'Private Orca-side answer' })
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(deps.sentMessages.length, 0)
   } finally {
     await controller.dispose()
     await worker.deactivate()
