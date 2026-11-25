@@ -216,6 +216,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async runAutomation(id) {
       triggeredAutomations.push(id)
     },
+    async listAutomationRuns() {
+      return []
+    },
     async openPanel(pluginKey, panelId) {
       openedPanels.push({ pluginKey, panelId })
     },
@@ -769,7 +772,7 @@ test('syncOrcaBoundChatsOnce forwards Orca-side user messages and bot replies wi
   await capturedWorker.deactivate()
 })
 
-test('sync skips Orca automation prompts and NO_REPLY answers but forwards the reminder itself', async () => {
+test('sync skips Orca automation prompts, scheduled runs and NO_REPLY answers but forwards the answers', async () => {
   const boundChatId = 'orca-bound-auto'
   let chatActivityAt = 1000
   const session: OrcaSessionRead = {
@@ -822,6 +825,20 @@ test('sync skips Orca automation prompts and NO_REPLY answers but forwards the r
       },
       async readSession() {
         return { ...session, entries: [...session.entries] }
+      },
+      // Orca runs an automation in a reused chat by sending its prompt with no marker.
+      async listAutomations() {
+        return [
+          { id: 'auto-daily', name: 'Daily balance', enabled: true, prompt: 'Check the balance and post it.' },
+          // Ran in another chat: the same words typed here are the owner's.
+          { id: 'auto-other', name: 'Elsewhere', enabled: true, prompt: 'Typed in Orca' }
+        ]
+      },
+      async listAutomationRuns() {
+        return [
+          { automationId: 'auto-daily', chatSessionId: boundChatId, startedAt: Date.now() },
+          { automationId: 'auto-other', chatSessionId: 'another-chat', startedAt: Date.now() }
+        ]
       }
     }
   })
@@ -859,14 +876,23 @@ test('sync skips Orca automation prompts and NO_REPLY answers but forwards the r
     await controller.syncOrcaBoundChatsOnce()
     assert.equal(sent.length, 1)
 
-    // What the owner types in Orca still reaches Telegram.
+    // A scheduled run of an automation in this reused chat: only the bot's answer goes.
+    chatActivityAt = 3500
+    session.entries.push({ kind: 'message', role: 'user', text: 'Check the balance and post it.\r\n' })
+    session.entries.push({ kind: 'message', role: 'assistant', text: 'Balance: 10.' })
+    await controller.syncOrcaBoundChatsOnce()
+    assert.equal(sent.length, 2)
+    assert.match(sent[1], /Balance: 10\./)
+
+    // What the owner types in Orca still reaches Telegram, even when an automation elsewhere has
+    // the same words.
     chatActivityAt = 4000
     session.entries.push({ kind: 'message', role: 'user', text: 'Typed in Orca' })
     session.entries.push({ kind: 'message', role: 'assistant', text: 'Done.' })
     await controller.syncOrcaBoundChatsOnce()
-    assert.equal(sent.length, 3)
-    assert.match(sent[1], /Typed in Orca/)
-    assert.match(sent[2], /Done\./)
+    assert.equal(sent.length, 4)
+    assert.match(sent[2], /Typed in Orca/)
+    assert.match(sent[3], /Done\./)
   } finally {
     await controller.dispose()
     await worker.deactivate()

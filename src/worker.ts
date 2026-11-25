@@ -94,6 +94,15 @@ const SLOW_CLI_CALL_MS = 2000
 const LOG_FLUSH_MS = 1000
 const BLOCK_LOG_INTERVAL_MS = 60_000
 const TRANSCRIBE_TIMEOUT_MS = 60_000
+// Orca's page size for `automations runs`, and how recent a run must be to explain a chat message.
+const AUTOMATION_RUNS_LIMIT = 100
+const AUTOMATION_RUN_WINDOW_MS = 24 * 60 * 60 * 1000
+
+// A chat entry may differ from the stored prompt in line endings and outer whitespace.
+function normalizePrompt(text: string): string {
+  return text.replace(/\r\n/g, '\n').trim()
+}
+
 // Starts the text sent to the Orca bot in place of a voice message or audio file.
 const VOICE_PREFIX = '[Voice message, transcribed]'
 
@@ -544,6 +553,8 @@ function traceOrcaCli(cli: OrcaCliRunner, tracer: Tracer): OrcaCliRunner {
     listAutomations: () =>
       trace('orca automations list', () => cli.listAutomations(), (list) => `${list.length} automation(s)`),
     runAutomation: (id) => trace(`orca automations run ${id}`, () => cli.runAutomation(id)),
+    listAutomationRuns: (limit) =>
+      trace(`orca automations runs --limit ${limit}`, () => cli.listAutomationRuns(limit), (runs) => `${runs.length} run(s)`),
     sendToBot: (params) =>
       trace(
         `orca orchestration send --to bot:${params.botName} --chat ${params.chatId}`,
@@ -2531,6 +2542,33 @@ export class BridgeRuntime {
     }
   }
 
+  /**
+   * The prompts of automations that ran in this Orca chat within a day. A scheduled run in a reused
+   * chat reaches it as the automation's prompt with no marker (upstream
+   * automation-chat-session-reuse.ts), so a typed-looking message counts as a run only when its text
+   * is that prompt and that automation ran in this very chat. Empty when Orca cannot be read.
+   */
+  private async scheduledRunPrompts(orcaChatId: string): Promise<Set<string>> {
+    try {
+      const [runs, automations] = await Promise.all([
+        this.deps.orcaCli.listAutomationRuns(AUTOMATION_RUNS_LIMIT),
+        this.deps.orcaCli.listAutomations()
+      ])
+      const since = Date.now() - AUTOMATION_RUN_WINDOW_MS
+      const ranHere = new Set(
+        runs
+          .filter((run) => run.chatSessionId === orcaChatId && run.startedAt !== null && run.startedAt >= since)
+          .map((run) => run.automationId)
+      )
+      return new Set(
+        automations.flatMap((a) => (ranHere.has(a.id) && a.prompt?.trim() ? [normalizePrompt(a.prompt)] : []))
+      )
+    } catch (err) {
+      await this.appendLog('warn', 'sync', 'Could not read Orca automation runs', describeError(err))
+      return new Set()
+    }
+  }
+
   private async syncSingleBoundChat(
     token: string,
     binding: ChatBinding,
@@ -2619,13 +2657,20 @@ export class BridgeRuntime {
 
     let forwardedUserCount = 0
     let forwardedAssistantCount = 0
+    // Read once per tick, and only when a message may be a scheduled run.
+    let scheduledPrompts: Set<string> | undefined
 
     // Group consecutive assistant messages so multi-step tool turns arrive as one clean reply.
     for (let i = 0; i < readyItems.length; i++) {
       const item = readyItems[i]
       if (item.role === 'user') {
-        // Orca's own automation runs (reminders, deadlines, events) are not something the owner typed.
-        if (!isTelegramOriginatedUserMessage(item.text) && !isOrcaAutomationRunMessage(item.text)) {
+        // Orca's own automation runs (reminders, deadlines, events, scheduled runs) are not
+        // something the owner typed.
+        const typedInOrca =
+          !isTelegramOriginatedUserMessage(item.text) &&
+          !isOrcaAutomationRunMessage(item.text) &&
+          !(scheduledPrompts ??= await this.scheduledRunPrompts(orcaChatId)).has(normalizePrompt(item.text))
+        if (typedInOrca) {
           const userPayload = `${this.i18n.orcaUserMessageHeader(binding.botName)}\n\n${item.text}`
           const chunks = splitTelegramMessage(userPayload, 3500)
           for (const chunk of chunks) {

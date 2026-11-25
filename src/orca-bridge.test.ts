@@ -72,6 +72,9 @@ function makeRunner(options: {
       return []
     },
     async runAutomation() {},
+    async listAutomationRuns() {
+      return []
+    },
     async sendToBot({ body }) {
       sentBodies.push(body)
     },

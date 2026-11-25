@@ -39,6 +39,16 @@ export type OrcaAutomationSummary = {
   nextRunAt?: number | null
   lastRunAt?: number | null
   lastRunStatus?: string | null
+  /** What Orca sends the bot on each run; a run in a reused chat sends it as is, with no marker. */
+  prompt?: string
+}
+
+// One row of `orca automations runs --json`; only what telling an automation run apart needs.
+export type OrcaAutomationRun = {
+  automationId: string
+  /** The Orca chat the run used; a run in a reused chat names that chat. */
+  chatSessionId: string | null
+  startedAt: number | null
 }
 
 export interface OrcaCliRunner {
@@ -48,6 +58,8 @@ export interface OrcaCliRunner {
   renameChat(sessionId: string, name: string): Promise<void>
   listAutomations(): Promise<OrcaAutomationSummary[]>
   runAutomation(id: string): Promise<void>
+  /** The newest automation runs first, at most `limit` (Orca pages at 100). */
+  listAutomationRuns(limit: number): Promise<OrcaAutomationRun[]>
   openPanel(pluginKey: string, panelId: string): Promise<void>
   listPlugins(): Promise<OrcaPluginSummary[]>
   sendToBot(params: {
@@ -459,6 +471,7 @@ export function createOrcaCliRunner(): OrcaCliRunner {
           rrule?: string | null
           nextRunAt?: number | null
           lastRunAt?: number | null
+          prompt?: string
         }[]
         items?: {
           automationId: string
@@ -476,11 +489,33 @@ export function createOrcaCliRunner(): OrcaCliRunner {
         rrule: a.rrule ?? null,
         nextRunAt: a.nextRunAt ?? null,
         lastRunAt: a.lastRunAt ?? null,
-        lastRunStatus: statusById.get(a.id) ?? null
+        lastRunStatus: statusById.get(a.id) ?? null,
+        ...(typeof a.prompt === 'string' ? { prompt: a.prompt } : {})
       }))
     },
     async runAutomation(id) {
       await runOrcaJson<unknown>(['automations', 'run', id, '--json'])
+    },
+    async listAutomationRuns(limit) {
+      const result = await runOrcaJson<{
+        runs?: {
+          automationId?: string
+          chatSessionId?: string | null
+          startedAt?: number | null
+          dispatchedAt?: number | null
+        }[]
+      }>(['automations', 'runs', '--limit', String(limit), '--json'])
+      return (result.runs || []).flatMap((run) =>
+        typeof run.automationId === 'string'
+          ? [
+              {
+                automationId: run.automationId,
+                chatSessionId: run.chatSessionId ?? null,
+                startedAt: run.startedAt ?? run.dispatchedAt ?? null
+              }
+            ]
+          : []
+      )
     },
     async openPanel(pluginKey, panelId) {
       await runOrcaJson<unknown>(['plugin', 'open', pluginKey, '--panel', panelId, '--json'])
