@@ -355,11 +355,13 @@ Then send the Telegram message or voice message again. The Logs tab shows the re
 
 **Symptom.** Every Telegram request of one bridge (`getMe`, `getUpdates`) times out in the Logs tab, while other bridges keep working.
 
-**Find out where it fails.** On the same computer, ask Telegram directly, first with a made-up token, then with the bridge's token (type it in your own terminal; never paste it in a chat or bug report):
+**Find out where it fails.** On the same computer, ask Telegram directly, first with a made-up token, then with the bridge's token. In a terminal (macOS, Linux, or Git Bash on Windows), `read -rs` takes the token without showing it or saving it in the shell history; paste it and press Enter:
 
 ```sh
 curl -sS -m 40 -w "\nhttp=%{http_code} total=%{time_total}s\n" https://api.telegram.org/bot123456:fake/getMe
-curl -sS -m 40 -w "\nhttp=%{http_code} total=%{time_total}s\n" https://api.telegram.org/bot<YOUR_TOKEN>/getMe
+read -rs TOKEN
+curl -sS -m 40 -w "\nhttp=%{http_code} total=%{time_total}s\n" "https://api.telegram.org/bot$TOKEN/getMe"
+unset TOKEN
 ```
 
 - **Both answer fast** (`401` for the fake one, `200` for yours): the path works now; restart the bridge with its **Active** switch and check the Logs tab.
