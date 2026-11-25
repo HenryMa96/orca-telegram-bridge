@@ -8,7 +8,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
 - **Open or restricted access**: open to everyone while the ID list is empty; add Telegram user or group IDs to restrict it, with one-click **Allow** in the sidebar panel
-- **Telegram groups**: in a group the bot answers commands, mentions (`@yourbot`) and replies to its own messages
+- **Telegram groups**: in a group the bot answers commands addressed to it, replies to its own messages and, with Telegram privacy mode off, `@yourbot` mentions
 - **Encrypted Bot Token storage** via `orca.secrets` (OS keyring)
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
@@ -153,12 +153,15 @@ Removing an ID stops the bot from answering that person or group, and stops sync
 ### Use the bot in a group
 
 1. Add the bot to the group in Telegram (group menu → **Add members**). If Telegram refuses, enable **Allow Groups?** for the bot in `@BotFather` (`/setjoingroups`).
-2. In the group, talk to the bot in one of these ways:
-   - a command, such as `/help` or `/help@yourbot`;
-   - a message that mentions it: `@yourbot what changed today?` (the mention is removed before the text goes to the Orca bot);
-   - a reply to one of the bot's messages.
-   Other group messages are ignored. This matches Telegram's default privacy mode for bots, so you do not need to change it in `@BotFather`.
-3. To restrict access to this group, add the group's ID to **Allowed Telegram IDs**. The group's ID appears in the **Chats** tab (`TG -100… -> …`) after the bot answers there once.
+2. Choose how much the bot sees. Telegram starts every bot in **privacy mode** ([Telegram: privacy mode](https://core.telegram.org/bots/features#privacy-mode)):
+   - **Privacy mode on (default):** the bot receives only commands addressed to it (`/help@yourbot`) and replies to its own messages. Plain `/help` reaches it only if it was the last bot to post in the group. `@yourbot` mentions do **not** reach it.
+   - **Privacy mode off, or the bot is a group admin:** the bot receives every group message, and `@yourbot` mentions work. In `@BotFather`, run `/setprivacy`, choose the bot, then **Disable**. Then remove the bot from the group and add it again; Telegram applies the change only then.
+3. In the group, talk to the bot in one of these ways:
+   - a command addressed to it, such as `/help@yourbot`;
+   - a reply to one of the bot's messages;
+   - with privacy mode off: a message that mentions it, `@yourbot what changed today?` (the mention is removed before the text goes to the Orca bot).
+   The plugin ignores every other group message, even when privacy mode is off, so the bot does not answer normal conversation.
+4. To restrict access to this group, add the group's ID to **Allowed Telegram IDs**. The group's ID appears in the **Chats** tab (`TG -100… -> …`) after the bot answers there once. In restricted mode, a blocked group message also logs it in the **Logs** tab: `Blocked unauthorized Telegram user <ID> (…) in group -100…`.
 
 In a group, everyone sees the bot's replies, and the whole group shares one Orca chat: `/new`, `/use`, `/bind` and `/home` change it for everyone in that group.
 
