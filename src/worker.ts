@@ -145,6 +145,12 @@ function truncateText(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
 }
 
+// Orca refuses a storage value holding `undefined` (invalid_params "Invalid input"); optional
+// fields such as a binding's botId are often unset, so drop them as JSON would.
+function toStorageJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
@@ -2105,7 +2111,7 @@ export class TelegramBridgeController {
 
   private async saveSyncCursors(): Promise<void> {
     try {
-      await this.orca.storage.set(STORAGE_SYNC_CURSORS, this.syncCursors)
+      await this.orca.storage.set(STORAGE_SYNC_CURSORS, toStorageJson(this.syncCursors))
     } catch (err) {
       // Non-fatal in mock/read-only runs.
       await this.appendLog('debug', 'sync', 'Saving sync cursors failed', describeError(err))
@@ -2387,7 +2393,7 @@ export class TelegramBridgeController {
     } else {
       this.bindings.push(binding)
     }
-    await this.orca.storage.set(STORAGE_BINDINGS, this.bindings)
+    await this.orca.storage.set(STORAGE_BINDINGS, toStorageJson(this.bindings))
   }
 
   // Debug entries are stored only while debugLogging is on and never post state themselves.

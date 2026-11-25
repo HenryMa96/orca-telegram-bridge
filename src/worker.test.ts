@@ -280,6 +280,34 @@ function textUpdate(updateId: number, userId: number, text: string): TelegramUpd
   }
 }
 
+// Orca's host refuses (invalid_params) a storage/settings value it cannot take as JSON. A user saw
+// 'value: Invalid input' on their first authorized message; every host write here must be accepted.
+for (const scenario of ['no Orca bots found', 'Orca bots found'] as const) {
+  test(`an authorized first message makes no host call Orca refuses (${scenario})`, async () => {
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      secrets: { botToken: '123456:TEST_TOKEN' },
+      settings: { enabled: false, defaultBot: '', allowedUserIds: '175844659', proxyUrl: '', replyTimeoutSec: 300 }
+    })
+    const deps = makeMockDeps(scenario === 'no Orca bots found' ? { orcaCli: { listBots: async () => [] } } : {})
+    const { controller, worker } = await mountController(host, {
+      telegram: deps.telegram,
+      orcaCli: deps.orcaCli,
+      logFlushMs: 0
+    })
+    try {
+      await within(controller.handleIncomingUpdate(textUpdate(681159817, 175844659, 'oi')), 'first message')
+      assert.deepEqual(host.refusals, [])
+      const lastReply = deps.sentMessages.at(-1)?.text ?? ''
+      assert.equal(lastReply.startsWith(t('en').processingFailed('')), false)
+      if (scenario === 'no Orca bots found') assert.equal(lastReply, t('en').noBotsAvailable)
+    } finally {
+      await within(controller.dispose(), 'dispose')
+      await worker.deactivate()
+    }
+  })
+}
+
 test('extractTablesFromMarkdown extracts GFM tables outside code fences', () => {
   const md = [
     '说明：',
