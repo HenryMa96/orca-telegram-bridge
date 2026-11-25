@@ -3,7 +3,7 @@
 import http from 'node:http'
 import https from 'node:https'
 import type { VoiceProvider } from './protocol'
-import { createProxyAgent, resolveProxyUrl } from './telegram-api'
+import { createProxyAgent, resolveProxyUrl, trustedCaCertificates } from './telegram-api'
 
 export const DEFAULT_VOICE_MODELS: Record<VoiceProvider, string> = {
   openrouter: 'openai/whisper-large-v3',
@@ -124,7 +124,7 @@ export function transcribeAudio(params: TranscribeParams): Promise<string> {
       return
     }
     // Plain http only for a test server's baseUrl.
-    const request: typeof http.request = secure ? https.request : http.request
+    const request: typeof https.request = secure ? https.request : http.request
     const req = request(
       {
         hostname: url.hostname,
@@ -132,6 +132,7 @@ export function transcribeAudio(params: TranscribeParams): Promise<string> {
         path: `${url.pathname}${url.search}`,
         method: 'POST',
         agent,
+        ca: secure ? trustedCaCertificates() : undefined,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': contentType,
