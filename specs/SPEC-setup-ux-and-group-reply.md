@@ -1,7 +1,7 @@
 # SPEC: Setup panel redesign + group reply policy
 
 **Date:** 2026-11-25
-**Status:** approved (UX review in chat; user: "the bridge name makes no sense, the bot name is the reference"; "in groups, even while reading every message, it must be optional whether it answers only when mentioned or when it thinks it can help")
+**Status:** implemented in 0.8.0
 
 ## Goal
 1. A calm, low-effort setup panel: one identity (the Telegram bot's `@username`), sections, rare options behind a disclosure, an explicit "who can talk" choice.
@@ -29,12 +29,12 @@
 - Sentence case for every label and button.
 
 ## Acceptance Criteria
-1. [ ] A bridge saved without `name` keeps its name; `groupReply` round-trips and defaults to `mentioned`.
-2. [ ] Unaddressed group message, `mentioned`: handoff has the silent line; nothing is sent to the group even if the bot answers text; no typing action.
-3. [ ] Unaddressed group message, `helpful`: handoff has the helpful line; a text answer is sent; `NO_REPLY` sends nothing.
-4. [ ] Addressed group messages and private chats behave as before.
-5. [ ] Panel: no Name field; card title is `@username`; "Anyone on Telegram" saves an empty allowlist; "Only these people" with no ID is refused with a clear message; reply policy is shown only with All messages; Advanced is closed by default.
-6. [ ] `orca plugin test`, `orca plugin check` pass; tsc shows no new error.
+1. [x] A bridge saved without `name` keeps its name; `groupReply` round-trips and defaults to `mentioned`.
+2. [x] Unaddressed group message, `mentioned`: handoff has the silent line; nothing is sent to the group even if the bot answers text; no typing action.
+3. [x] Unaddressed group message, `helpful`: handoff has the helpful line; a text answer is sent; `NO_REPLY` sends nothing.
+4. [x] Addressed group messages and private chats behave as before.
+5. [x] Panel: no Name field; card title is `@username`; "Anyone on Telegram" saves an empty allowlist; "Only these people" with no ID is refused with a clear message; reply policy is shown only with All messages; Advanced is closed by default.
+6. [x] `orca plugin test` (183) and `orca plugin check` pass; tsc shows no new error (12 older type-only errors remain).
 
 ## Out of Scope
 - Buffering unaddressed messages as context for a later mention.
