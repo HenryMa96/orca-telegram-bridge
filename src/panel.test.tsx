@@ -4,8 +4,7 @@ import {
   mount,
   test,
   type MockHostOptions,
-  type TestPanel,
-  type TreeSnapshot
+  type TestPanel
 } from 'orca/testing'
 import * as panel from './panel'
 import type {
@@ -1297,47 +1296,28 @@ test('rows: added rows get Member, each role select is saved, removed rows are g
   await view.unmount()
 })
 
-// The name shown under this ID row; '' when none. The entry is the innermost Stack holding the ID
-// field (Text has no testId).
-function nameOf(view: TestPanel, row: number): string {
-  const words = (node: TreeSnapshot | string): string =>
-    typeof node === 'string' ? node : (node.children ?? []).map(words).join('')
-  const holds = (node: TreeSnapshot | string): boolean =>
-    typeof node !== 'string' &&
-    ((node.type === 'Input' && node.props?.label === `Telegram ID ${row}`) || (node.children ?? []).some(holds))
-  const entryOf = (node: TreeSnapshot | string): TreeSnapshot | null => {
-    if (typeof node === 'string' || !holds(node)) return null
-    for (const child of node.children ?? []) {
-      const inner = entryOf(child)
-      if (inner) return inner
-    }
-    return node.type === 'Stack' ? node : null
-  }
-  const tree = view.tree()
-  const entry = tree === null ? null : entryOf(tree)
-  const text = (entry?.children ?? []).find((c): c is TreeSnapshot => typeof c !== 'string' && c.type === 'Text')
-  return text ? words(text) : ''
-}
-
-test('each ID row shows the name the bridge knows for its trimmed ID, follows edits, and nothing when unknown', async () => {
+test('a saved ID shows "ID @name" read-only and saves the bare ID; a new row stays editable', async () => {
+  const saved: SaveConfigInput[] = []
   const state = makeState({
     bridges: [makeBridge('b1', { knownNames: { '123456': '@ana_dev', '-1001234567890': 'Ops Team' } })]
   })
-  const view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => state } }) })
+  const view = await mount(panel, { host: savedInputs(state, saved) })
   await openEditor(view, 'b1')
-  assert.equal(nameOf(view, 1), '@ana_dev')
+  // one "@": the name already carries it
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '123456 @ana_dev')
+  // typing into a saved ID changes nothing (the kit may refuse a field without onChange)
+  await view.type({ label: 'Telegram ID 1' }, '777', { replace: true }).catch(() => undefined)
+  assert.equal(view.valueOf({ label: 'Telegram ID 1' }), '123456 @ana_dev')
 
+  // a row added in the editor takes typing, without a name, even for an ID the bridge knows
   await view.press({ text: 'Add person or group' })
-  assert.equal(nameOf(view, 2), '')
-  await view.type({ label: 'Telegram ID 2' }, ' -1001234567890 ')
-  assert.equal(nameOf(view, 2), 'Ops Team')
-  assert.equal(nameOf(view, 1), '@ana_dev')
+  await view.type({ label: 'Telegram ID 2' }, '-1001234567890')
+  assert.equal(view.valueOf({ label: 'Telegram ID 2' }), '-1001234567890')
 
-  // an ID the bridge has no name for shows nothing
-  await view.type({ label: 'Telegram ID 1' }, '777', { replace: true })
-  assert.equal(nameOf(view, 1), '')
+  await view.press({ text: 'Save' })
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].allowedUserIds, '123456, -1001234567890')
   assert.deepEqual(view.errors, [])
-  assert.deepEqual(view.warnings, [])
   await view.unmount()
 })
 

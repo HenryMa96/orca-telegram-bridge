@@ -108,7 +108,7 @@ const tokenDraft = atom('')
 const accessModeDraft = atom<AccessMode>('restricted')
 // One row per Telegram user or group ID with its role. `key` keeps each row's field in place
 // while rows above it are removed.
-type AssignmentRow = { key: string; id: string; roleId: string }
+type AssignmentRow = { key: string; id: string; roleId: string; saved: boolean }
 const assignmentRowsDraft = atom<AssignmentRow[]>([])
 let rowSeq = 0
 // Shown under the rows when Save is refused: no valid ID, or a row that is not an ID.
@@ -290,9 +290,11 @@ function telegramIds(raw: string): string[] {
   return [...new Set(raw.split(/[\s,;]+/).filter(isTelegramId))]
 }
 
-function newRow(id: string, roleId: string): AssignmentRow {
+// `saved`: the ID is on the saved list, so its field is read-only (to change an ID, remove the row
+// and add another). Rows added in the editor stay editable until Save.
+function newRow(id: string, roleId: string, saved = false): AssignmentRow {
   rowSeq += 1
-  return { key: `row-${rowSeq}`, id, roleId }
+  return { key: `row-${rowSeq}`, id, roleId, saved }
 }
 
 // Restricted: the listed IDs, each with its role (Member when it has none, as the worker reads
@@ -302,7 +304,7 @@ function rowsFromConfig(config: BridgeConfig): AssignmentRow[] {
   const ids = hasAllowedIds(config.allowedUserIds)
     ? telegramIds(config.allowedUserIds)
     : Object.keys(config.roleAssignments)
-  return ids.map((id) => newRow(id, config.roleAssignments[id] ?? MEMBER_ROLE_ID))
+  return ids.map((id) => newRow(id, config.roleAssignments[id] ?? MEMBER_ROLE_ID, true))
 }
 
 function updateRow(key: string, patch: Partial<AssignmentRow>): void {
@@ -623,7 +625,7 @@ async function allowBlockedUser(bridgeId: string, userId: string): Promise<void>
         if (bridge && !read(assignmentRowsDraft).some((row) => row.id.trim() === userId)) {
           set(
             assignmentRowsDraft,
-            [...read(assignmentRowsDraft), newRow(userId, bridge.config.roleAssignments[userId] ?? MEMBER_ROLE_ID)]
+            [...read(assignmentRowsDraft), newRow(userId, bridge.config.roleAssignments[userId] ?? MEMBER_ROLE_ID, true)]
           )
         }
         set(accessModeDraft, 'restricted')
@@ -973,10 +975,18 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNa
         const invalid = idsError !== null && (id === '' ? idsError === NEEDS_ID : !isTelegramId(id))
         const name = Object.hasOwn(knownNames, id) ? knownNames[id] : undefined
         return (
-          // The name goes under the ID, not in the row: Orca sizes the role Select by its label, so
-          // anything sharing the row changes width with the chosen role.
-          <Stack key={row.key} gap="none">
-            <Row key={`line:${row.key}`} gap="xs" align="center">
+          <Row key={row.key} gap="xs" align="center">
+            {row.saved ? (
+              // A saved ID cannot be edited: remove the row and add another instead. `value` without
+              // `onChange` is read-only. The name already carries its "@" when it is a username.
+              <Input
+                key={`id:${row.key}`}
+                label={`Telegram ID ${i + 1}`}
+                labelHidden
+                value={name ? `${row.id} ${name}` : row.id}
+                invalid={invalid}
+              />
+            ) : (
               <Input
                 key={`id:${row.key}`}
                 label={`Telegram ID ${i + 1}`}
@@ -989,35 +999,30 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNa
                   set(allowedIdsError, null)
                 }}
               />
-              <Select
-                key={`role:${row.key}`}
-                label={`Role for Telegram ID ${i + 1}`}
-                labelHidden
-                value={row.roleId}
-                options={roleOptions}
-                onChange={(v) => updateRow(row.key, { roleId: v })}
-              />
-              <IconButton
-                key={`remove:${row.key}`}
-                icon="close"
-                label={`Remove Telegram ID ${i + 1}`}
-                size="sm"
-                variant="ghost"
-                onPress={() => {
-                  edit(
-                    assignmentRowsDraft,
-                    read(assignmentRowsDraft).filter((r) => r.key !== row.key)
-                  )
-                  set(allowedIdsError, null)
-                }}
-              />
-            </Row>
-            {name && (
-              <Text key={`name:${row.key}`} muted size="xs">
-                {name}
-              </Text>
             )}
-          </Stack>
+            <Select
+              key={`role:${row.key}`}
+              label={`Role for Telegram ID ${i + 1}`}
+              labelHidden
+              value={row.roleId}
+              options={roleOptions}
+              onChange={(v) => updateRow(row.key, { roleId: v })}
+            />
+            <IconButton
+              key={`remove:${row.key}`}
+              icon="close"
+              label={`Remove Telegram ID ${i + 1}`}
+              size="sm"
+              variant="ghost"
+              onPress={() => {
+                edit(
+                  assignmentRowsDraft,
+                  read(assignmentRowsDraft).filter((r) => r.key !== row.key)
+                )
+                set(allowedIdsError, null)
+              }}
+            />
+          </Row>
         )
       })}
       {idsError && (
