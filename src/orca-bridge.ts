@@ -49,6 +49,7 @@ export interface OrcaCliRunner {
   listAutomations(): Promise<OrcaAutomationSummary[]>
   runAutomation(id: string): Promise<void>
   openPanel(pluginKey: string, panelId: string): Promise<void>
+  listPlugins(): Promise<OrcaPluginSummary[]>
   sendToBot(params: {
     botName: string
     chatId: string | 'new'
@@ -56,6 +57,48 @@ export interface OrcaCliRunner {
     body: string
     signal?: AbortSignal
   }): Promise<void>
+}
+
+// One entry of `orca plugin list --json`; only what finding this plugin's key needs.
+export type OrcaPluginSummary = {
+  pluginKey: string
+  isDev: boolean
+  status: string
+}
+
+// `orca plugin list --json` answers `{ plugins: [...] }`; entries without a string key are skipped.
+export function parsePluginList(result: unknown): OrcaPluginSummary[] {
+  const list = Array.isArray(result)
+    ? result
+    : typeof result === 'object' && result !== null && 'plugins' in result && Array.isArray(result.plugins)
+      ? result.plugins
+      : []
+  return list.flatMap((entry: unknown) => {
+    if (typeof entry !== 'object' || entry === null || !('pluginKey' in entry)) return []
+    const { pluginKey } = entry
+    if (typeof pluginKey !== 'string' || !pluginKey) return []
+    return [
+      {
+        pluginKey,
+        isDev: 'isDev' in entry && entry.isDev === true,
+        status: 'status' in entry && typeof entry.status === 'string' ? entry.status : ''
+      }
+    ]
+  })
+}
+
+// The key Orca lists this plugin under: an installed copy is `<publisher>.<id>`, a dev copy may
+// carry another prefix. With several copies the dev one wins (that is the one being worked on),
+// then a running one. Null when none matches.
+export function pickPluginKey(plugins: OrcaPluginSummary[], manifestId: string): string | null {
+  const matches = plugins.filter((p) => p.pluginKey.endsWith(`.${manifestId}`))
+  const running = (p: OrcaPluginSummary) => p.status === 'running'
+  const best =
+    matches.find((p) => p.isDev && running(p)) ??
+    matches.find((p) => p.isDev) ??
+    matches.find(running) ??
+    matches[0]
+  return best?.pluginKey ?? null
 }
 
 // Mirrors Orca's AGENT_READ_MAX_LIMIT: `agent read --limit` accepts at most 100 newest entries.
@@ -441,6 +484,9 @@ export function createOrcaCliRunner(): OrcaCliRunner {
     },
     async openPanel(pluginKey, panelId) {
       await runOrcaJson<unknown>(['plugin', 'open', pluginKey, '--panel', panelId, '--json'])
+    },
+    async listPlugins() {
+      return parsePluginList(await runOrcaJson<unknown>(['plugin', 'list', '--json']))
     },
     async sendToBot({ botName, chatId, subject, body, signal }) {
       await runOrcaJson<unknown>(

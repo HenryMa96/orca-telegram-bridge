@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import { assert, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
+import type { JsonValue } from 'orca'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { t } from './i18n'
 import {
@@ -14,7 +15,7 @@ import {
   type OrcaCliRunner,
   type OrcaSessionRead
 } from './orca-bridge'
-import type { BridgeLogEntry, BridgeState, ExportLogsResult } from './protocol'
+import type { BridgeLogEntry, BridgeState, ExportLogsResult, SaveConfigInput } from './protocol'
 import { extractTablesFromMarkdown } from './table-render'
 import {
   markdownToTelegramHtml,
@@ -27,10 +28,11 @@ import {
   type TelegramUpdate
 } from './telegram-api'
 import * as main from './worker'
-import { TelegramBridgeController, type BridgeDeps } from './worker'
+import type { BridgeDeps, BridgeManager, BridgeRuntime } from './worker'
 
 function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; orcaCli: Partial<OrcaCliRunner> }> = {}) {
   const sentMessages: {
+    token: string
     chatId: number | string
     text: string
     replyToMessageId?: number
@@ -73,8 +75,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async getUpdates() {
       return []
     },
-    async sendMessage(_token, params) {
+    async sendMessage(token, params) {
       sentMessages.push({
+        token,
         chatId: params.chatId,
         text: params.text,
         replyToMessageId: params.replyToMessageId,
@@ -167,6 +170,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async openPanel(pluginKey, panelId) {
       openedPanels.push({ pluginKey, panelId })
     },
+    async listPlugins() {
+      return []
+    },
     async sendToBot({ botName, chatId, subject, body }) {
       sentToBots.push({ botName, chatId, subject, body })
       readPollCount = 0
@@ -222,18 +228,36 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
 
 const CAPABILITIES = ['storage:own', 'secrets:own', 'settings:own', 'notifications:show']
 
+// Activates through the real entry point, so the panel handlers are wired. Most hosts here hold the
+// 0.4.0 layout (plugin settings and the secret `botToken`); activation moves it into "Bridge 1" as
+// a real update does, and `controller` is that bridge.
 async function mountController(host: MockHost, deps: BridgeDeps) {
-  let controller!: TelegramBridgeController
+  let manager!: BridgeManager
   const worker = await mountWorker(
     {
       default: async (orca: OrcaWorkerApi) => {
-        controller = new TelegramBridgeController(orca, deps)
-        await controller.init()
-      }
+        manager = await main.activateWithDeps(orca, deps)
+      },
+      deactivate: main.deactivate
     },
     { host }
   )
-  return { controller, worker }
+  return { manager, controller: manager.bridges[0], worker }
+}
+
+// The panel always sends every field of the bridge form; unchanged fields keep the bridge's values.
+function saveInput(bridge: BridgeRuntime, fields: Partial<SaveConfigInput>): SaveConfigInput {
+  const { config } = bridge.view()
+  return {
+    bridgeId: bridge.id,
+    name: config.name,
+    orcaBot: config.orcaBot,
+    allowedUserIds: config.allowedUserIds,
+    proxyUrl: config.proxyUrl,
+    replyTimeoutSec: config.replyTimeoutSec,
+    syncOrcaOutbound: config.syncOrcaOutbound,
+    ...fields
+  }
 }
 
 // A regression that deadlocks fails the test instead of hanging it (the same guard as the activation test).
@@ -343,24 +367,24 @@ test('panel handlers answer plain JSON after a message created a binding with no
     settings: { enabled: false, defaultBot: '', allowedUserIds: '175844659', proxyUrl: '', replyTimeoutSec: 300 }
   })
   const deps = makeMockDeps({ orcaCli: { listBots: async () => [] } })
-  let controller!: TelegramBridgeController
+  let manager!: BridgeManager
   const worker = await mountWorker(
     {
       default: async (orca: OrcaWorkerApi) => {
-        controller = await main.activateWithDeps(orca, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+        manager = await main.activateWithDeps(orca, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
       },
       deactivate: main.deactivate
     },
     { host }
   )
   try {
-    await within(controller.handleIncomingUpdate(textUpdate(681159817, 175844659, 'oi')), 'first message')
+    await within(manager.bridges[0].handleIncomingUpdate(textUpdate(681159817, 175844659, 'oi')), 'first message')
     const enabled = await worker.request('bridge.setDebugLogging', { enabled: true })
     assert.equal(nonJsonPath(enabled), null)
-    assert.equal((enabled as BridgeState).config.debugLogging, true)
+    assert.equal((enabled as BridgeState).global.debugLogging, true)
     const state = await worker.request('bridge.getState')
     assert.equal(nonJsonPath(state), null)
-    assert.equal((state as BridgeState).bindings.length, 1)
+    assert.equal((state as BridgeState).bridges[0].bindings.length, 1)
   } finally {
     await worker.deactivate()
   }
@@ -436,23 +460,29 @@ test('worker activates cleanly without token and saves config', async () => {
     settings: { enabled: false, defaultBot: '', allowedUserIds: '', proxyUrl: '', replyTimeoutSec: 300 }
   })
   const worker = await mountWorker(main, { host })
-  const initial = (await worker.request('bridge.getState')) as { status: string; config: { hasToken: boolean } }
-  assert.equal(initial.status, 'needs_token')
-  assert.equal(initial.config.hasToken, false)
+  const initial = (await worker.request('bridge.getState')) as BridgeState
+  assert.equal(initial.bridges.length, 1)
+  assert.equal(initial.bridges[0].name, 'Bridge 1')
+  assert.equal(initial.bridges[0].status, 'needs_token')
+  assert.equal(initial.bridges[0].config.hasToken, false)
 
   const saved = (await worker.request('bridge.saveConfig', {
+    bridgeId: initial.bridges[0].id,
+    name: 'CI bot',
     botToken: '123456:TEST_TOKEN',
     enabled: false,
-    defaultBot: 'Assistant',
+    orcaBot: 'Assistant',
     allowedUserIds: '42',
     proxyUrl: '',
     replyTimeoutSec: 120,
     syncOrcaOutbound: true
-  })) as { status: string; config: { hasToken: boolean; allowedUserIds: string; syncOrcaOutbound: boolean } }
-  assert.equal(saved.status, 'stopped')
-  assert.equal(saved.config.hasToken, true)
-  assert.equal(saved.config.allowedUserIds, '42')
-  assert.equal(saved.config.syncOrcaOutbound, true)
+  })) as BridgeState
+  const bridge = saved.bridges[0]
+  assert.equal(bridge.status, 'stopped')
+  assert.equal(bridge.name, 'CI bot')
+  assert.equal(bridge.config.hasToken, true)
+  assert.equal(bridge.config.allowedUserIds, '42')
+  assert.equal(bridge.config.syncOrcaOutbound, true)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
@@ -601,20 +631,11 @@ test('syncOrcaBoundChatsOnce forwards Orca-side user messages and bot replies wi
     }
   })
 
-  let controller!: TelegramBridgeController
-  const capturedWorker = await mountWorker(
-    {
-      default: async (orca: OrcaWorkerApi) => {
-        controller = new TelegramBridgeController(orca, {
-          telegram: deps.telegram,
-          orcaCli: deps.orcaCli,
-          pollIntervalMs: 10
-        })
-        await controller.init()
-      }
-    },
-    { host }
-  )
+  const { manager, controller, worker: capturedWorker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 10
+  })
 
   // 1. First sync pass establishes baseline without dumping old history
   await controller.syncOrcaBoundChatsOnce()
@@ -645,14 +666,7 @@ test('syncOrcaBoundChatsOnce forwards Orca-side user messages and bot replies wi
   assert.equal(sentMessages.length, 2)
 
   // 5. Turning syncOrcaOutbound off stops forwarding new Orca messages
-  await controller.saveConfig({
-    enabled: false,
-    defaultBot: 'Assistant',
-    allowedUserIds: '777888',
-    proxyUrl: '',
-    replyTimeoutSec: 300,
-    syncOrcaOutbound: false
-  })
+  await manager.saveConfig(saveInput(controller, { enabled: false, syncOrcaOutbound: false }))
   chatActivityAt = 3000
   session.entries.push({ kind: 'message', role: 'user', text: 'Should stay local' })
   session.entries.push({ kind: 'message', role: 'assistant', text: 'Local reply' })
@@ -671,23 +685,14 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   })
 
   const deps = makeMockDeps()
-  let controller!: TelegramBridgeController
-  const capturedWorker = await mountWorker(
-    {
-      default: async (orca: OrcaWorkerApi) => {
-        controller = new TelegramBridgeController(orca, {
-          telegram: deps.telegram,
-          orcaCli: deps.orcaCli,
-          pollIntervalMs: 10
-        })
-        await controller.init()
-      }
-    },
-    { host }
-  )
+  const { controller, worker: capturedWorker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 10
+  })
 
-  // Empty defaultBot auto-selects first available Orca bot
-  assert.equal(controller.getState().config.defaultBot, 'Assistant')
+  // An empty defaultBot moves over as an empty Orca bot: the first bot found answers.
+  assert.equal(controller.view().config.orcaBot, '')
 
   // 1. With a restricted allowlist, an unlisted message is blocked and notifies sender of their numeric ID
   await controller.testConnection()
@@ -705,7 +710,7 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
     }
   })
   assert.equal(deps.sentToBots.length, 0)
-  assert.equal(controller.getState().lastBlockedUserId, '777888')
+  assert.equal(controller.view().lastBlockedUserId, '777888')
   assert.match(deps.sentMessages[0].text, /777888/)
 
   // 2. Allow the user ID and send a real message -> creates new Orca chat & replies
@@ -739,7 +744,7 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
   assert.equal(deps.sentToBots[1].chatId, 'tg-chat-2')
   assert.equal(deps.sentMessages[2].text, 'Reply #2 from Assistant')
 
-  // 4. /use switches bot and resets chat binding while keeping botId
+  // 4. /use does not switch: this Telegram bot is pinned to its Orca bot, and the chat stays bound
   await controller.handleIncomingUpdate({
     update_id: 4,
     message: {
@@ -751,10 +756,10 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
     }
   })
   assert.equal(deps.sentToBots.length, 2)
-  assert.match(deps.sentMessages[3].text, /Daily standup notes/)
-  assert.equal(controller.getState().bindings[0].botId, 'bot-2')
-  assert.equal(controller.getState().bindings[0].botName, 'Daily standup notes')
-  assert.equal(controller.getState().bindings[0].orcaChatId, null)
+  assert.equal(deps.sentMessages[3].text, t('en').botPinned('Assistant'))
+  assert.equal(controller.view().bindings[0].botId, 'bot-1')
+  assert.equal(controller.view().bindings[0].botName, 'Assistant')
+  assert.equal(controller.view().bindings[0].orcaChatId, 'tg-chat-2')
 
   // 5. /new preserves botId while clearing orcaChatId
   await controller.handleIncomingUpdate({
@@ -767,8 +772,8 @@ test('controller blocks unauthorized users, auto-picks bot, runs slash commands,
       text: '/new'
     }
   })
-  assert.equal(controller.getState().bindings[0].botId, 'bot-2')
-  assert.equal(controller.getState().bindings[0].orcaChatId, null)
+  assert.equal(controller.view().bindings[0].botId, 'bot-1')
+  assert.equal(controller.view().bindings[0].orcaChatId, null)
 
   assert.deepEqual(capturedWorker.refusals, [])
   await controller.dispose()
@@ -807,21 +812,12 @@ test('controller downloads Telegram photo and image document and passes local pa
     }
   })
 
-  let controller!: TelegramBridgeController
-  const capturedWorker = await mountWorker(
-    {
-      default: async (orca: OrcaWorkerApi) => {
-        controller = new TelegramBridgeController(orca, {
-          telegram: deps.telegram,
-          orcaCli: deps.orcaCli,
-          downloadDir: tempDownloadDir,
-          pollIntervalMs: 10
-        })
-        await controller.init()
-      }
-    },
-    { host }
-  )
+  const { controller, worker: capturedWorker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    downloadDir: tempDownloadDir,
+    pollIntervalMs: 10
+  })
 
   try {
     // 1. Compressed photo without caption picks largest resolution
@@ -896,22 +892,13 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
   })
 
   const deps = makeMockDeps()
-  let controller!: TelegramBridgeController
-  const capturedWorker = await mountWorker(
-    {
-      default: async (orca: OrcaWorkerApi) => {
-        controller = new TelegramBridgeController(orca, {
-          telegram: deps.telegram,
-          orcaCli: deps.orcaCli,
-          pollIntervalMs: 10
-        })
-        await controller.init()
-      }
-    },
-    { host }
-  )
+  const { controller, worker: capturedWorker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 10
+  })
 
-  // 1. /bots returns inline keyboard buttons and callback switches bot
+  // 1. /bots lists the Orca bots, marks the linked one and offers no switch buttons
   await controller.handleIncomingUpdate({
     update_id: 20,
     message: {
@@ -922,8 +909,9 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
       text: '/bots'
     }
   })
-  assert.ok(deps.sentMessages[0].replyMarkup?.inline_keyboard.length)
-  assert.equal(deps.sentMessages[0].replyMarkup?.inline_keyboard[0][1].callback_data, 'u:bot-2')
+  assert.equal(deps.sentMessages[0].replyMarkup, undefined)
+  assert.match(deps.sentMessages[0].text, /• Assistant \(linked\)/)
+  assert.match(deps.sentMessages[0].text, /• Daily standup notes — /)
 
   // Unauthorized callback is rejected
   await controller.handleIncomingUpdate({
@@ -940,9 +928,9 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
     }
   })
   assert.equal(deps.answeredCallbacks[0].showAlert, true)
-  assert.equal(controller.getState().bindings[0].botName, 'Assistant')
+  assert.equal(controller.view().bindings[0].botName, 'Assistant')
 
-  // Authorized callback switches bot
+  // An authorized press on a switch button from an old /bots message is answered, not obeyed
   await controller.handleIncomingUpdate({
     update_id: 22,
     callback_query: {
@@ -956,8 +944,11 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
       data: 'u:bot-2'
     }
   })
-  assert.equal(controller.getState().bindings[0].botName, 'Daily standup notes')
-  assert.equal(controller.getState().bindings[0].botId, 'bot-2')
+  const switchAnswer = deps.answeredCallbacks.find((a) => a.callbackQueryId === 'cb-auth')
+  assert.equal(switchAnswer?.text, t('en').botPinned('Assistant'))
+  assert.equal(switchAnswer?.showAlert, true)
+  assert.equal(controller.view().bindings[0].botName, 'Assistant')
+  assert.equal(controller.view().bindings[0].botId, 'bot-1')
 
   // 2. /home binds to Home Chat and /rename renames it
   await controller.handleIncomingUpdate({
@@ -970,7 +961,7 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
       text: '/home'
     }
   })
-  assert.equal(controller.getState().bindings[0].orcaChatId, 'home-chat-1')
+  assert.equal(controller.view().bindings[0].orcaChatId, 'home-chat-1')
 
   await controller.handleIncomingUpdate({
     update_id: 24,
@@ -983,7 +974,7 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
     }
   })
   assert.deepEqual(deps.renamedChats, [{ sessionId: 'home-chat-1', name: 'Work Sync' }])
-  assert.equal(controller.getState().bindings[0].title, 'Work Sync')
+  assert.equal(controller.view().bindings[0].title, 'Work Sync')
 
   // 3. /sync toggles syncOrcaOutbound via text and inline callback
   await controller.handleIncomingUpdate({
@@ -996,7 +987,7 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
       text: '/sync on'
     }
   })
-  assert.equal(controller.getState().config.syncOrcaOutbound, true)
+  assert.equal(controller.view().config.syncOrcaOutbound, true)
 
   await controller.handleIncomingUpdate({
     update_id: 26,
@@ -1011,7 +1002,7 @@ test('controller supports interactive inline buttons, /sync, /home, /rename, and
       data: 's:off'
     }
   })
-  assert.equal(controller.getState().config.syncOrcaOutbound, false)
+  assert.equal(controller.view().config.syncOrcaOutbound, false)
 
   // 4. /automations lists tasks with run buttons, and /run + button trigger them
   await controller.handleIncomingUpdate({
@@ -1126,7 +1117,7 @@ test('pausing after Telegram rejects the token (401) does not hang while outboun
       }
     }
   })
-  const { controller, worker } = await mountController(host, {
+  const { manager, controller, worker } = await mountController(host, {
     telegram: deps.telegram,
     orcaCli: deps.orcaCli,
     outboundPollIntervalMs: 1,
@@ -1134,12 +1125,12 @@ test('pausing after Telegram rejects the token (401) does not hang while outboun
   })
   try {
     // The poll loop must have ended on its own before the pause, or stopPolling would abort it itself.
-    await until(() => !controller.getState().polling, 'poll loop to exit after 401')
-    assert.equal(controller.getState().status, 'error')
+    await until(() => !controller.view().polling, 'poll loop to exit after 401')
+    assert.equal(controller.view().status, 'error')
 
-    const paused = await within(controller.togglePolling(), 'togglePolling after a 401')
-    assert.equal(paused.status, 'stopped')
-    assert.equal(paused.config.enabled, false)
+    await within(manager.togglePolling(), 'togglePolling after a 401')
+    assert.equal(controller.view().status, 'stopped')
+    assert.equal(controller.view().config.enabled, false)
   } finally {
     await within(controller.dispose(), 'dispose after a 401')
     await worker.deactivate()
@@ -1167,7 +1158,7 @@ test('status turns connected without waiting out a full long poll', async () => 
   })
   const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
-    await until(() => controller.getState().status === 'connected', 'status connected after the first poll')
+    await until(() => controller.view().status === 'connected', 'status connected after the first poll')
   } finally {
     await within(controller.dispose(), 'dispose')
     await worker.deactivate()
@@ -1197,21 +1188,13 @@ test('switching to a new bot token polls the new bot from offset 0 and reads its
       })
     }
   })
-  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await within(polledOld.promise, 'first poll with the old token')
     assert.equal(polls[0].offset, 50)
 
     await within(
-      controller.saveConfig({
-        botToken: '222:NEW_BOT',
-        enabled: true,
-        defaultBot: 'Assistant',
-        allowedUserIds: '777888',
-        proxyUrl: '',
-        replyTimeoutSec: 300,
-        syncOrcaOutbound: false
-      }),
+      manager.saveConfig(saveInput(controller, { botToken: '222:NEW_BOT', enabled: true })),
       'saveConfig with a new token'
     )
     await within(polledNew.promise, 'first poll with the new token')
@@ -1219,7 +1202,7 @@ test('switching to a new bot token polls the new bot from offset 0 and reads its
     // The old bot's offset would make Telegram confirm, and so drop, the new bot's pending updates.
     const newPolls = polls.filter((p) => p.token === '222:NEW_BOT')
     assert.ok(newPolls.every((p) => p.offset === undefined))
-    assert.equal(controller.getState().botUsername, 'new_bot')
+    assert.equal(controller.view().botUsername, 'new_bot')
     assert.equal(deps.registeredCommands.length, 2)
   } finally {
     await controller.dispose()
@@ -1252,25 +1235,20 @@ test('saving settings that do not touch the connection keeps an in-flight reply 
     return sent
   }
 
-  const { controller, worker } = await mountController(host, {
+  const { manager, controller, worker } = await mountController(host, {
     telegram: deps.telegram,
     orcaCli: deps.orcaCli,
     pollIntervalMs: 1
   })
   try {
     const signal = await within(entered.promise, 'the reply to reach the Orca bot')
-    const saved = await within(
-      controller.saveConfig({
-        enabled: true,
-        defaultBot: 'Assistant',
-        allowedUserIds: '777888, 42',
-        proxyUrl: '',
-        replyTimeoutSec: 600,
-        syncOrcaOutbound: true
-      }),
+    await within(
+      manager.saveConfig(
+        saveInput(controller, { enabled: true, allowedUserIds: '777888, 42', replyTimeoutSec: 600, syncOrcaOutbound: true })
+      ),
       'saveConfig while a reply is running'
     )
-    assert.equal(saved.config.replyTimeoutSec, 600)
+    assert.equal(controller.view().config.replyTimeoutSec, 600)
     assert.equal(signal?.aborted, false)
 
     release.resolve()
@@ -1310,8 +1288,8 @@ test('an Orca CLI failure in /home or a Home button answers the user and keeps p
   try {
     await within(replied.promise, 'an error reply to /home')
     assert.match(deps.sentMessages[0].text, /Processing failed: orca bot chats failed/)
-    assert.equal(controller.getState().status, 'connected')
-    assert.equal(controller.getState().lastError, null)
+    assert.equal(controller.view().status, 'connected')
+    assert.equal(controller.view().lastError, null)
 
     await controller.handleIncomingUpdate({
       update_id: 2,
@@ -1325,7 +1303,7 @@ test('an Orca CLI failure in /home or a Home button answers the user and keeps p
     const answer = deps.answeredCallbacks[deps.answeredCallbacks.length - 1]
     assert.equal(answer?.callbackQueryId, 'cb-home')
     assert.equal(answer?.showAlert, true)
-    assert.equal(controller.getState().status, 'connected')
+    assert.equal(controller.view().status, 'connected')
   } finally {
     await controller.dispose()
     await worker.deactivate()
@@ -1391,7 +1369,7 @@ test('outbound sync stops for a chat whose Telegram user was removed from the al
       }
     }
   })
-  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await controller.syncOrcaBoundChatsOnce()
     assert.equal(deps.sentMessages.length, 0)
@@ -1402,14 +1380,7 @@ test('outbound sync stops for a chat whose Telegram user was removed from the al
     assert.ok(deps.sentMessages.some((m) => String(m.chatId) === '-100500'))
     assert.ok(deps.sentMessages.some((m) => String(m.chatId) === '777888'))
 
-    await controller.saveConfig({
-      enabled: false,
-      defaultBot: 'Assistant',
-      allowedUserIds: '777888',
-      proxyUrl: '',
-      replyTimeoutSec: 300,
-      syncOrcaOutbound: true
-    })
+    await manager.saveConfig(saveInput(controller, { enabled: false, allowedUserIds: '777888', syncOrcaOutbound: true }))
     deps.sentMessages.length = 0
     addTurn('orca-group', 'group turn 2')
     addTurn('orca-private', 'private turn 2')
@@ -1462,49 +1433,94 @@ test('an SVG image document is refused instead of being handed to the bot as .jp
   }
 })
 
-test('settings reloads fired by saveConfig own writes do not roll the saved config back', async () => {
+test('a saved bridge survives a restart and leaves the plugin settings alone', async () => {
   const host = mockHost({
     capabilities: CAPABILITIES,
     secrets: { botToken: '123456:TEST_TOKEN' },
     settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
   })
+  const settingsBefore = JSON.stringify(host.data().settings)
   const deps = makeMockDeps({ telegram: { getUpdates: scriptedGetUpdates([]) } })
-  const worker = await mountWorker(
-    {
-      default: (orca: OrcaWorkerApi) => main.activateWithDeps(orca, deps).then(() => undefined),
-      deactivate: main.deactivate
-    },
-    { host }
-  )
+  const first = await mountController(host, deps)
+  const bridgeId = first.controller.id
   try {
-    await worker.request('bridge.saveConfig', {
-      enabled: false,
-      defaultBot: 'Assistant',
-      allowedUserIds: '777888',
-      proxyUrl: 'http://127.0.0.1:8080',
-      replyTimeoutSec: 120,
-      syncOrcaOutbound: true
-    })
-    // Let the onDidChange reloads from the six settings writes run, then read through the panel path.
-    for (let i = 0; i < 20; i++) await nextTurn()
-    const state = (await worker.request('bridge.getState')) as {
-      status: string
-      polling: boolean
-      config: { enabled: boolean; proxyUrl: string; replyTimeoutSec: number; syncOrcaOutbound: boolean }
-    }
-    assert.equal(state.config.enabled, false)
-    assert.equal(state.config.proxyUrl, 'http://127.0.0.1:8080')
-    assert.equal(state.config.replyTimeoutSec, 120)
-    assert.equal(state.config.syncOrcaOutbound, true)
-    assert.equal(state.status, 'stopped')
-    assert.equal(state.polling, false)
+    await first.worker.request(
+      'bridge.saveConfig',
+      saveInput(first.controller, {
+        name: 'Work bot',
+        enabled: false,
+        proxyUrl: 'http://127.0.0.1:8080',
+        replyTimeoutSec: 120,
+        syncOrcaOutbound: true
+      })
+    )
   } finally {
-    await worker.deactivate()
+    await first.worker.deactivate()
+  }
+  assert.equal(JSON.stringify(host.data().settings), settingsBefore)
+
+  const second = await mountController(host, deps)
+  try {
+    const state = (await second.worker.request('bridge.getState')) as BridgeState
+    assert.equal(state.bridges.length, 1)
+    const bridge = state.bridges[0]
+    assert.equal(bridge.id, bridgeId)
+    assert.equal(bridge.name, 'Work bot')
+    assert.equal(bridge.config.hasToken, true)
+    assert.equal(bridge.config.enabled, false)
+    assert.equal(bridge.config.proxyUrl, 'http://127.0.0.1:8080')
+    assert.equal(bridge.config.replyTimeoutSec, 120)
+    assert.equal(bridge.config.syncOrcaOutbound, true)
+    assert.equal(bridge.status, 'stopped')
+    assert.equal(bridge.polling, false)
+  } finally {
+    await second.worker.deactivate()
   }
 })
 
 // A real-looking token: the redaction tests must not pass just because a fake token looks unusual.
 const REAL_TOKEN = '7251846039:AAH3kVx9QzLm2pR8sT4uW6yZ0bC1dE5fG7h'
+
+// A host in the 0.5.0 layout: each seed is one bridge with its config in `bridges`, its token in
+// `botToken.<id>` and its state under `tg.<id>.*`. Plugin settings hold only debugLogging.
+type BridgeSeed = {
+  id: string
+  token?: string
+  config?: Record<string, JsonValue>
+  state?: Partial<Record<'offset' | 'bindings' | 'syncCursors' | 'lastBlocked', JsonValue>>
+}
+
+function bridgesHost(
+  seeds: BridgeSeed[],
+  options: { debugLogging?: boolean; storage?: Record<string, JsonValue> } = {}
+) {
+  const storage: Record<string, JsonValue> = { ...options.storage }
+  const secrets: Record<string, string> = {}
+  storage.bridges = seeds.map((seed, i) => ({
+    id: seed.id,
+    name: `Bridge ${i + 1}`,
+    enabled: false,
+    orcaBot: 'Assistant',
+    allowedUserIds: '777888',
+    proxyUrl: '',
+    replyTimeoutSec: 300,
+    syncOrcaOutbound: false,
+    replyLanguage: 'en',
+    ...seed.config
+  }))
+  for (const seed of seeds) {
+    if (seed.token) secrets[`botToken.${seed.id}`] = seed.token
+    for (const [name, value] of Object.entries(seed.state ?? {})) {
+      if (value !== undefined) storage[`tg.${seed.id}.${name}`] = value
+    }
+  }
+  return mockHost({
+    capabilities: CAPABILITIES,
+    storage,
+    secrets,
+    settings: { debugLogging: options.debugLogging ?? false }
+  })
+}
 
 function loggingHost(
   options: {
@@ -1512,41 +1528,21 @@ function loggingHost(
     storedLogs?: { id: string; at: number; level: string; message: string }[]
   } = {}
 ) {
-  return mockHost({
-    capabilities: CAPABILITIES,
-    secrets: { botToken: REAL_TOKEN },
-    settings: {
-      enabled: false,
-      defaultBot: 'Assistant',
-      allowedUserIds: '777888',
-      proxyUrl: '',
-      replyTimeoutSec: 300,
-      syncOrcaOutbound: false,
-      debugLogging: options.debugLogging ?? false
-    },
+  return bridgesHost([{ id: 'b-logtest1', token: REAL_TOKEN }], {
+    debugLogging: options.debugLogging,
     ...(options.storedLogs ? { storage: { 'tg.logs': options.storedLogs } } : {})
   })
 }
 
-// Activates through the real entry point so the panel handlers are wired; logs are written at once.
+// Logs are written at once.
 async function mountBridge(host: MockHost, deps: ReturnType<typeof makeMockDeps>, extra: Partial<BridgeDeps> = {}) {
-  let controller!: TelegramBridgeController
-  const worker = await mountWorker(
-    {
-      default: async (orca: OrcaWorkerApi) => {
-        controller = await main.activateWithDeps(orca, {
-          telegram: deps.telegram,
-          orcaCli: deps.orcaCli,
-          pollIntervalMs: 0,
-          logFlushMs: 0,
-          ...extra
-        })
-      },
-      deactivate: main.deactivate
-    },
-    { host }
-  )
-  return { controller, worker }
+  return mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 0,
+    logFlushMs: 0,
+    ...extra
+  })
 }
 
 function storedLogs(host: MockHost): BridgeLogEntry[] {
@@ -1572,13 +1568,14 @@ function failingSendCli() {
 test('a failing orca CLI call shows its args, exit code and stderr in the panel log', async () => {
   const host = loggingHost()
   const deps = failingSendCli()
-  const { controller, worker } = await mountBridge(host, deps)
+  const { manager, controller, worker } = await mountBridge(host, deps)
   try {
     await controller.handleIncomingUpdate(textUpdate(1, 777888, 'Summarize my notes'))
-    const entry = controller.getState().logs.find((e) => e.level === 'error')
+    const entry = manager.getState().logs.find((e) => e.level === 'error')
     assert.ok(entry, 'an error entry is logged')
     assert.equal(entry.scope, 'dispatch')
     assert.match(entry.message, /Failed handling message for Assistant: orchestration send failed/)
+    assert.equal(entry.bridgeId, controller.id)
     assert.match(entry.details ?? '', /command: orca orchestration send --to bot:Assistant --chat new/)
     assert.match(entry.details ?? '', /exit code: 2/)
     assert.match(entry.details ?? '', /bot "Assistant" is not running/)
@@ -1603,12 +1600,12 @@ test('the bot token never reaches log messages, details, storage, orca.log or th
       }
     }
   })
-  const { controller, worker } = await mountBridge(host, deps)
+  const { manager, controller, worker } = await mountBridge(host, deps)
   try {
     await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
-    const exported = await controller.exportLogs()
+    const exported = await manager.exportLogs()
     const surfaces = {
-      state: JSON.stringify(controller.getState().logs),
+      state: JSON.stringify(manager.getState().logs),
       storage: JSON.stringify(storedLogs(host)),
       orcaLog: worker.logs.join('\n'),
       export: exported.text
@@ -1631,21 +1628,21 @@ test('the bot token never reaches log messages, details, storage, orca.log or th
 test('debug entries are stored only while debug logging is on, and a dispatch then logs its timings', async () => {
   const host = loggingHost()
   const deps = makeMockDeps()
-  const { controller, worker } = await mountBridge(host, deps)
+  const { manager, controller, worker } = await mountBridge(host, deps)
   try {
     await controller.handleIncomingUpdate(textUpdate(1, 777888, 'first'))
     assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
-    assert.ok(controller.getState().logs.every((e) => e.level !== 'debug'))
+    assert.ok(manager.getState().logs.every((e) => e.level !== 'debug'))
     assert.ok(storedLogs(host).every((e) => e.level !== 'debug'))
 
     const state = (await worker.request('bridge.setDebugLogging', { enabled: true })) as BridgeState
-    assert.equal(state.config.debugLogging, true)
+    assert.equal(state.global.debugLogging, true)
     assert.equal(host.data().settings.debugLogging, true)
     assert.equal(state.logs[0].message, 'Debug logging enabled')
 
     await controller.handleIncomingUpdate(textUpdate(2, 777888, 'second'))
     assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #2 from Assistant')
-    const debug = controller.getState().logs.filter((e) => e.level === 'debug').map((e) => e.message)
+    const debug = manager.getState().logs.filter((e) => e.level === 'debug').map((e) => e.message)
     assert.ok(
       debug.some((m) => /^Dispatch start: bot Assistant, tg chat 777888, bound Orca chat tg-chat-2, body 6 chars/.test(m)),
       `no dispatch start entry in ${JSON.stringify(debug)}`
@@ -1655,7 +1652,7 @@ test('debug entries are stored only while debug logging is on, and a dispatch th
       `no dispatch finish entry in ${JSON.stringify(debug)}`
     )
     // The user's text itself is never logged, only its length.
-    assert.ok(!JSON.stringify(controller.getState().logs).includes('second'))
+    assert.ok(!JSON.stringify(manager.getState().logs).includes('second'))
   } finally {
     await worker.deactivate()
   }
@@ -1671,7 +1668,7 @@ test('a failing typing indicator on an image message is logged as debug and the 
       }
     }
   })
-  const { controller, worker } = await mountBridge(host, deps, { downloadDir })
+  const { manager, controller, worker } = await mountBridge(host, deps, { downloadDir })
   try {
     await controller.handleIncomingUpdate({
       update_id: 1,
@@ -1685,7 +1682,7 @@ test('a failing typing indicator on an image message is logged as debug and the 
     })
     assert.equal(deps.sentToBots.length, 1)
     assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
-    const entry = controller.getState().logs.find((e) => e.message === 'Typing indicator failed for chat 777888')
+    const entry = manager.getState().logs.find((e) => e.message === 'Typing indicator failed for chat 777888')
     assert.ok(entry, 'the swallowed typing failure is recorded')
     assert.equal(entry.level, 'debug')
     assert.match(entry.details ?? '', /TelegramApiError: Bad Request: chat not found/)
@@ -1711,11 +1708,13 @@ test('exported logs carry the diagnostics header and every entry with its detail
     assert.match(text, /^Platform: \S+ \S+$/m)
     assert.match(text, /^Node: v\d+/m)
     assert.match(text, /^Orca CLI: \S+/m)
-    assert.match(text, /^Status: stopped$/m)
-    assert.match(text, /^Config: .*"hasToken":true/m)
-    assert.match(text, /^Bindings: 1$/m)
+    assert.match(text, /^Bridges: 1$/m)
+    assert.match(text, /^Bridge: Bridge 1 \(b-logtest1\)$/m)
+    assert.match(text, /^ {2}Status: stopped$/m)
+    assert.match(text, /^ {2}Config: .*"hasToken":true/m)
+    assert.match(text, /^ {2}Bindings: 1$/m)
     assert.match(text, /^Log entries: \d+$/m)
-    assert.match(text, /Z ERROR \[dispatch\] Failed handling message for Assistant: orchestration send failed\n/)
+    assert.match(text, /Z ERROR \[dispatch\] \[Bridge 1\] Failed handling message for Assistant: orchestration send failed\n/)
     assert.match(text, /\n {2}command: orca orchestration send --to bot:Assistant/)
     assert.match(text, /\n {2}exit code: 2\n/)
     assert.ok(!text.includes(REAL_TOKEN))
@@ -1734,16 +1733,17 @@ test('the panel state carries the newest 40 entries while storage keeps at most 
     message: `old entry ${i}`
   }))
   const host = loggingHost({ storedLogs: old })
-  const { controller, worker } = await mountBridge(host, makeMockDeps())
+  const { manager, controller, worker } = await mountBridge(host, makeMockDeps())
   try {
-    const state = await controller.allowUserId('5')
+    await controller.allowUserId('5')
+    const state = manager.getState()
     assert.equal(state.logs.length, 40)
     assert.equal(state.logTotal, 200)
     assert.equal(state.logs[0].message, 'Added Telegram user 5 to allowlist.')
     assert.equal(storedLogs(host).length, 200)
     const lastPost = worker.posts.filter((p) => p.event === 'bridge.stateChanged').at(-1)?.payload as BridgeState
     assert.ok(lastPost.logs.length <= 40)
-    assert.equal((await controller.exportLogs()).text.match(/ \[(?:-|config)\] /g)?.length, 200)
+    assert.equal((await manager.exportLogs()).text.match(/ \[(?:-|config)\] /g)?.length, 200)
   } finally {
     await worker.deactivate()
   }
@@ -1755,9 +1755,9 @@ test('entries stored by 0.2.0 without a scope load into state and export', async
     { id: 'a', at: Date.UTC(2026, 0, 1), level: 'info', message: 'old entry one' }
   ]
   const host = loggingHost({ storedLogs: old })
-  const { controller, worker } = await mountBridge(host, makeMockDeps())
+  const { manager, worker } = await mountBridge(host, makeMockDeps())
   try {
-    const state = controller.getState()
+    const state = manager.getState()
     assert.deepEqual(
       state.logs.map((e) => [e.id, e.level, e.scope, e.message]),
       [
@@ -1766,7 +1766,7 @@ test('entries stored by 0.2.0 without a scope load into state and export', async
       ]
     )
     assert.equal(state.logTotal, 2)
-    const text = (await controller.exportLogs()).text
+    const text = (await manager.exportLogs()).text
     assert.match(text, /2026-01-01T00:00:00\.000Z INFO \[-\] old entry one\n2026-01-02T00:00:00\.000Z ERROR \[-\] old failure\n/)
   } finally {
     await worker.deactivate()
@@ -1795,7 +1795,7 @@ async function unauthorizedReply(
   const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
-    return { reply: deps.sentMessages[0]?.text ?? '', language: controller.getState().config.replyLanguage }
+    return { reply: deps.sentMessages[0]?.text ?? '', language: controller.view().config.replyLanguage }
   } finally {
     await controller.dispose()
     await worker.deactivate()
@@ -1843,22 +1843,14 @@ test('saving a new reply language sends the Telegram command menu again in that 
       }
     }
   })
-  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  const { manager, controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await until(() => polls.length === 1, 'the first poll')
     assert.equal(deps.registeredCommands.length, 1)
     assert.equal(deps.registeredCommands[0].find((c) => c.command === 'help')?.description, 'Show available commands')
 
     await within(
-      controller.saveConfig({
-        enabled: true,
-        defaultBot: 'Assistant',
-        allowedUserIds: '777888',
-        proxyUrl: '',
-        replyTimeoutSec: 300,
-        syncOrcaOutbound: false,
-        replyLanguage: 'pt-BR'
-      }),
+      manager.saveConfig(saveInput(controller, { enabled: true, replyLanguage: 'pt-BR' })),
       'saveConfig with a new language'
     )
     polls[0].resolve([])
@@ -1870,7 +1862,7 @@ test('saving a new reply language sends the Telegram command menu again in that 
       english.map((c) => c.command)
     )
     assert.equal(portuguese.find((c) => c.command === 'help')?.description, 'Mostrar os comandos disponíveis')
-    assert.equal(controller.getState().config.replyLanguage, 'pt-BR')
+    assert.equal(controller.view().config.replyLanguage, 'pt-BR')
   } finally {
     await controller.dispose()
     await worker.deactivate()
@@ -1946,7 +1938,7 @@ function groupUpdate(
 // and user id the way it does once polling starts.
 async function withAccess(
   allowedUserIds: string,
-  run: (controller: TelegramBridgeController, deps: ReturnType<typeof makeMockDeps>) => Promise<void>
+  run: (controller: BridgeRuntime, deps: ReturnType<typeof makeMockDeps>, manager: BridgeManager) => Promise<void>
 ): Promise<void> {
   const host = mockHost({
     capabilities: CAPABILITIES,
@@ -1954,14 +1946,14 @@ async function withAccess(
     settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds, proxyUrl: '', replyTimeoutSec: 300 }
   })
   const deps = makeMockDeps()
-  const { controller, worker } = await mountController(host, {
+  const { manager, controller, worker } = await mountController(host, {
     telegram: deps.telegram,
     orcaCli: deps.orcaCli,
     pollIntervalMs: 1
   })
   try {
     await controller.testConnection()
-    await run(controller, deps)
+    await run(controller, deps, manager)
     assert.deepEqual(worker.refusals, [])
   } finally {
     await controller.dispose()
@@ -1980,7 +1972,7 @@ test('with an empty allowlist a stranger reaches the Orca bot and gets no access
     assert.equal(deps.sentToBots.length, 1)
     assert.equal(lastBodyLine(deps), 'hello there')
     assert.ok(!deps.sentMessages.some((m) => m.text === t('en').unauthorized('777888')))
-    assert.equal(controller.getState().lastBlockedUserId, null)
+    assert.equal(controller.view().lastBlockedUserId, null)
   })
 })
 
@@ -1994,7 +1986,7 @@ test('with a restricted allowlist a stranger is blocked and told only once, howe
       deps.sentMessages.map((m) => m.text),
       [t('en').unauthorized('777888')]
     )
-    assert.equal(controller.getState().lastBlockedUserId, '777888')
+    assert.equal(controller.view().lastBlockedUserId, '777888')
   })
 })
 
@@ -2007,7 +1999,7 @@ test('a listed group lets an unlisted member reach the Orca bot by mentioning it
     )
     assert.equal(deps.sentToBots.length, 1)
     assert.equal(lastBodyLine(deps), 'hi, any news?')
-    assert.equal(controller.getState().lastBlockedUserId, null)
+    assert.equal(controller.view().lastBlockedUserId, null)
   })
 })
 
@@ -2027,7 +2019,7 @@ test('a group message that neither mentions nor replies to the bot is ignored', 
     )
     assert.equal(deps.sentToBots.length, 0)
     assert.equal(deps.sentMessages.length, 0)
-    assert.equal(controller.getState().lastBlockedUserId, null)
+    assert.equal(controller.view().lastBlockedUserId, null)
   })
 })
 
@@ -2074,7 +2066,7 @@ test('a restricted allowlist holding only a group id still blocks a stranger in 
   await withAccess(String(GROUP_ID), async (controller, deps) => {
     await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
     assert.equal(deps.sentToBots.length, 0)
-    assert.equal(controller.getState().lastBlockedUserId, '777888')
+    assert.equal(controller.view().lastBlockedUserId, '777888')
     assert.equal(deps.sentMessages[0]?.text, t('en').unauthorized('777888'))
   })
 })
@@ -2140,7 +2132,12 @@ test('outbound sync forwards nothing while the allowlist is empty', async () => 
 
 async function withPolling(
   enabled: boolean,
-  run: (controller: TelegramBridgeController, host: MockHost, deps: ReturnType<typeof makeMockDeps>) => Promise<void>,
+  run: (
+    controller: BridgeRuntime,
+    host: MockHost,
+    deps: ReturnType<typeof makeMockDeps>,
+    manager: BridgeManager
+  ) => Promise<void>,
   orcaCli: Partial<OrcaCliRunner> = {}
 ): Promise<void> {
   const host = mockHost({
@@ -2149,13 +2146,13 @@ async function withPolling(
     settings: { enabled, defaultBot: 'Assistant', allowedUserIds: '42', proxyUrl: '', replyTimeoutSec: 300 }
   })
   const deps = makeMockDeps({ orcaCli })
-  const { controller, worker } = await mountController(host, {
+  const { manager, controller, worker } = await mountController(host, {
     telegram: deps.telegram,
     orcaCli: deps.orcaCli,
     pollIntervalMs: 1
   })
   try {
-    await run(controller, host, deps)
+    await run(controller, host, deps, manager)
     assert.deepEqual(worker.refusals, [])
   } finally {
     await within(controller.dispose(), 'dispose')
@@ -2164,8 +2161,8 @@ async function withPolling(
 }
 
 test('the open-panel command opens this plugin panel by its manifest key', async () => {
-  await withPolling(false, async (controller, _host, deps) => {
-    assert.equal(await controller.openPanel(), 'Telegram panel opened')
+  await withPolling(false, async (_controller, _host, deps, manager) => {
+    assert.equal(await manager.openPanel(), 'Telegram panel opened')
     assert.deepEqual(deps.openedPanels, [{ pluginKey: 'drecchia.telegram-bridge', panelId: 'telegram-bridge' }])
   })
 })
@@ -2173,11 +2170,11 @@ test('the open-panel command opens this plugin panel by its manifest key', async
 test('a failed open-panel command is logged as a warning and answered, not thrown', async () => {
   await withPolling(
     false,
-    async (controller) => {
-      const answer = await controller.openPanel()
+    async (_controller, _host, _deps, manager) => {
+      const answer = await manager.openPanel()
       assert.match(answer, /no_workspace/)
       assert.match(answer, /Open a workspace in Orca first/)
-      const entry = controller.getState().logs.find((e) => e.level === 'warn' && e.scope === 'orca-cli')
+      const entry = manager.getState().logs.find((e) => e.level === 'warn' && e.scope === 'orca-cli')
       assert.ok(entry, 'warn log entry')
       assert.match(entry.message, /Failed to open the Telegram panel/)
     },
@@ -2189,57 +2186,492 @@ test('a failed open-panel command is logged as a warning and answered, not throw
   )
 })
 
+function storedBridges(host: MockHost): { id: string; name: string; enabled: boolean }[] {
+  return host.data().storage.bridges as { id: string; name: string; enabled: boolean }[]
+}
+
 test('setEnabled stops and starts polling at once and repeating a value changes nothing', async () => {
   await withPolling(true, async (controller, host) => {
-    await until(() => controller.getState().polling, 'polling to start')
+    await until(() => controller.view().polling, 'polling to start')
 
-    const off = await within(controller.setEnabled(false), 'setEnabled(false)')
-    assert.equal(off.polling, false)
-    assert.equal(off.status, 'stopped')
-    assert.equal(host.data().settings.enabled, false)
+    await within(controller.setEnabled(false), 'setEnabled(false)')
+    assert.equal(controller.view().polling, false)
+    assert.equal(controller.view().status, 'stopped')
+    assert.equal(storedBridges(host)[0].enabled, false)
 
-    const again = await within(controller.setEnabled(false), 'setEnabled(false) again')
-    assert.equal(again.config.enabled, false)
-    assert.equal(again.polling, false)
+    await within(controller.setEnabled(false), 'setEnabled(false) again')
+    assert.equal(controller.view().config.enabled, false)
+    assert.equal(controller.view().polling, false)
 
-    const on = await within(controller.setEnabled(true), 'setEnabled(true)')
-    assert.equal(on.config.enabled, true)
-    assert.equal(on.polling, true)
-    assert.equal(host.data().settings.enabled, true)
+    await within(controller.setEnabled(true), 'setEnabled(true)')
+    assert.equal(controller.view().config.enabled, true)
+    assert.equal(controller.view().polling, true)
+    assert.equal(storedBridges(host)[0].enabled, true)
 
-    const stillOn = await within(controller.setEnabled(true), 'setEnabled(true) again')
-    assert.equal(stillOn.config.enabled, true)
-    assert.equal(stillOn.polling, true)
+    await within(controller.setEnabled(true), 'setEnabled(true) again')
+    assert.equal(controller.view().config.enabled, true)
+    assert.equal(controller.view().polling, true)
   })
 })
 
 test('saving settings without the enabled field keeps polling running', async () => {
-  await withPolling(true, async (controller, host) => {
-    await until(() => controller.getState().polling, 'polling to start')
-    const saved = await within(
-      controller.saveConfig({
-        defaultBot: 'Assistant',
-        allowedUserIds: '42, 43',
-        proxyUrl: '',
-        replyTimeoutSec: 300,
-        syncOrcaOutbound: false
-      }),
-      'saveConfig'
-    )
-    assert.equal(saved.config.enabled, true)
-    assert.equal(saved.polling, true)
-    assert.equal(host.data().settings.enabled, true)
+  await withPolling(true, async (controller, host, _deps, manager) => {
+    await until(() => controller.view().polling, 'polling to start')
+    await within(manager.saveConfig(saveInput(controller, { allowedUserIds: '42, 43' })), 'saveConfig')
+    assert.equal(controller.view().config.enabled, true)
+    assert.equal(controller.view().polling, true)
+    assert.equal(storedBridges(host)[0].enabled, true)
   })
 })
 
 test('a stranger blocked in two groups is logged once per group', async () => {
-  await withAccess('42', async (controller) => {
+  await withAccess('42', async (controller, _deps, manager) => {
     const otherGroup: Partial<TelegramMessage> = { chat: { id: -100600, type: 'supergroup', title: 'Other' } }
     await controller.handleIncomingUpdate(groupUpdate(1, 777, '@demo_orca_bot hi'))
     await controller.handleIncomingUpdate(groupUpdate(2, 777, '@demo_orca_bot hi', otherGroup))
     await controller.handleIncomingUpdate(groupUpdate(3, 777, '@demo_orca_bot again'))
-    const warns = controller.getState().logs.filter((e) => e.level === 'warn').map((e) => e.message)
+    const warns = manager.getState().logs.filter((e) => e.level === 'warn').map((e) => e.message)
     assert.equal(warns.filter((m) => m.includes('in group -100500')).length, 1)
     assert.equal(warns.filter((m) => m.includes('in group -100600')).length, 1)
   })
+})
+
+test('a 0.4.0 setup becomes "Bridge 1" with its token, settings, chats and offset, and the old keys go', async () => {
+  const legacyBinding = {
+    tgChatId: '777888',
+    ownerUserId: '777888',
+    botId: 'bot-2',
+    botName: 'Daily standup notes',
+    orcaChatId: 'orca-old',
+    updatedAt: 1000
+  }
+  const legacyCursors = { 'orca-old': { tailHashes: ['h1'], lastActivityAt: 1000, pendingWorking: false } }
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:LEGACY' },
+    settings: {
+      enabled: true,
+      defaultBot: 'Daily standup notes',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 240,
+      syncOrcaOutbound: true,
+      replyLanguage: 'pt-BR'
+    },
+    storage: {
+      'tg.updateOffset': 77,
+      'tg.bindings': [legacyBinding],
+      'tg.syncCursors': legacyCursors,
+      'tg.lastBlockedUserId': '999'
+    }
+  })
+  const polls: { token: string; offset: number | undefined }[] = []
+  const deps = makeMockDeps({
+    telegram: { getUpdates: scriptedGetUpdates([], (token, offset) => polls.push({ token, offset })) }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    // Polling resumes where 0.4.0 stopped: an offset of 0 would replay or drop pending updates.
+    await until(() => polls.length > 0, 'the first poll of Bridge 1')
+    assert.deepEqual(polls[0], { token: '123456:LEGACY', offset: 77 })
+
+    const view = controller.view()
+    assert.match(view.id, /^b-[a-z0-9]{8}$/)
+    assert.deepEqual(view.config, {
+      id: view.id,
+      name: 'Bridge 1',
+      hasToken: true,
+      enabled: true,
+      orcaBot: 'Daily standup notes',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 240,
+      syncOrcaOutbound: true,
+      replyLanguage: 'pt-BR'
+    })
+    assert.equal(view.lastBlockedUserId, '999')
+    assert.deepEqual(view.bindings, [legacyBinding])
+
+    const { storage, secrets } = host.data()
+    assert.equal(secrets.botToken, undefined)
+    assert.equal(secrets[`botToken.${view.id}`], '123456:LEGACY')
+    assert.deepEqual(storage[`tg.${view.id}.syncCursors`], legacyCursors)
+    for (const key of ['tg.updateOffset', 'tg.bindings', 'tg.syncCursors', 'tg.lastBlockedUserId', 'migration.bridgeId']) {
+      assert.equal(storage[key], undefined, `${key} is left behind`)
+    }
+    assert.deepEqual(storedBridges(host).map((b) => b.id), [view.id])
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a 0.4.0 bot that was paused stays paused as Bridge 1', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:LEGACY' },
+    settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  let polled = false
+  const deps = makeMockDeps({ telegram: { getUpdates: scriptedGetUpdates([], () => (polled = true)) } })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    assert.equal(controller.view().config.enabled, false)
+    assert.equal(controller.view().config.hasToken, true)
+    assert.equal(controller.view().status, 'stopped')
+    assert.equal(controller.view().polling, false)
+    assert.equal(polled, false)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a migration cut short after copying resumes with the same bridge and keeps the token', async () => {
+  const binding = { tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-1', updatedAt: 1000 }
+  // The worker stopped after step 1: the copies exist, `bridges` and the old keys' deletion do not.
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:LEGACY', 'botToken.b-resume01': '123456:LEGACY' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 },
+    storage: {
+      'migration.bridgeId': 'b-resume01',
+      'tg.updateOffset': 5,
+      'tg.bindings': [binding],
+      'tg.b-resume01.offset': 5,
+      'tg.b-resume01.bindings': [binding]
+    }
+  })
+  const deps = makeMockDeps({ telegram: { getUpdates: scriptedGetUpdates([]) } })
+  // A second start must find the finished migration, not run it again.
+  for (const start of [1, 2]) {
+    const { worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+    try {
+      const state = (await worker.request('bridge.getState')) as BridgeState
+      assert.deepEqual(
+        state.bridges.map((b) => [b.id, b.name, b.config.hasToken, b.bindings.length]),
+        [['b-resume01', 'Bridge 1', true, 1]],
+        `start ${start}`
+      )
+    } finally {
+      await worker.deactivate()
+    }
+  }
+  const { storage, secrets } = host.data()
+  assert.equal(secrets['botToken.b-resume01'], '123456:LEGACY')
+  assert.equal(secrets.botToken, undefined)
+  assert.equal(storage['migration.bridgeId'], undefined)
+  assert.equal(storage['tg.bindings'], undefined)
+  assert.equal(storage['tg.updateOffset'], undefined)
+  assert.deepEqual(storedBridges(host).map((b) => b.id), ['b-resume01'])
+})
+
+// Telegram as several bots see it: each token has its own @username and its own updates. A token
+// not listed, or one with `rejectWith`, is refused. `openPolls` counts long polls still waiting.
+function multiBotTelegram(
+  bots: Record<string, { username: string; batches?: TelegramUpdate[][]; rejectWith?: Error }>
+) {
+  // The first poll answers at once (with `batches[0]`, or nothing), so the bridge turns connected.
+  const scripts = new Map(
+    Object.entries(bots).map(([token, bot]) => [token, scriptedGetUpdates(bot.batches ?? [[]])])
+  )
+  const openPolls: Record<string, number> = {}
+  const telegram: Partial<TelegramClient> = {
+    async getMe(token) {
+      const bot = bots[token]
+      if (!bot) throw new TelegramApiError('Unauthorized', 401)
+      if (bot.rejectWith) throw bot.rejectWith
+      return { id: Number(token.split(':')[0]), is_bot: true, first_name: bot.username, username: bot.username }
+    },
+    async getUpdates(token, params, options) {
+      const script = scripts.get(token)
+      if (!script) throw new TelegramApiError('Unauthorized', 401)
+      openPolls[token] = (openPolls[token] ?? 0) + 1
+      try {
+        return await script(token, params, options)
+      } finally {
+        openPolls[token]--
+      }
+    }
+  }
+  return { telegram, openPolls }
+}
+
+test('two bridges run at once and each Telegram bot reaches only its own Orca bot', async () => {
+  const host = bridgesHost([
+    { id: 'b-ci000001', token: '111:CI', config: { enabled: true, orcaBot: 'Assistant' } },
+    { id: 'b-dev00001', token: '222:DEV', config: { enabled: true, orcaBot: 'Daily standup notes' } }
+  ])
+  // The same person writes to both Telegram bots.
+  const tg = multiBotTelegram({
+    '111:CI': { username: 'ci_bot', batches: [[textUpdate(1, 777888, 'build status?')]] },
+    '222:DEV': { username: 'dev_bot', batches: [[textUpdate(1, 777888, 'standup?')]] }
+  })
+  const deps = makeMockDeps({ telegram: tg.telegram })
+  const bothReplied = Promise.withResolvers<void>()
+  const baseSendMessage = deps.telegram.sendMessage
+  deps.telegram.sendMessage = async (token, params, options) => {
+    const sent = await baseSendMessage(token, params, options)
+    if (deps.sentMessages.length === 2) bothReplied.resolve()
+    return sent
+  }
+  const { manager, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    await within(bothReplied.promise, 'a reply from each Telegram bot')
+    assert.deepEqual(
+      Object.fromEntries(deps.sentToBots.map((s) => [s.body.split('\n').at(-1) ?? '', s.botName])),
+      { 'build status?': 'Assistant', 'standup?': 'Daily standup notes' }
+    )
+    assert.deepEqual(Object.fromEntries(deps.sentMessages.map((m) => [m.token, m.text])), {
+      '111:CI': 'Reply #1 from Assistant',
+      '222:DEV': 'Reply #1 from Daily standup notes'
+    })
+    assert.equal(manager.bridge('b-ci000001').view().bindings[0].botName, 'Assistant')
+    assert.equal(manager.bridge('b-dev00001').view().bindings[0].botName, 'Daily standup notes')
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('changing the Orca bot of a bridge sends its chats to the new bot in a fresh Orca chat', async () => {
+  const host = bridgesHost([
+    {
+      id: 'b-pin00001',
+      token: '111:A',
+      state: {
+        bindings: [
+          { tgChatId: '777888', ownerUserId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-a', updatedAt: 1000 }
+        ]
+      }
+    }
+  ])
+  const deps = makeMockDeps()
+  const { manager, controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    await manager.saveConfig(saveInput(controller, { orcaBot: 'Daily standup notes' }))
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
+    assert.deepEqual(
+      deps.sentToBots.map((s) => [s.botName, s.chatId]),
+      [['Daily standup notes', 'new']]
+    )
+    assert.equal(controller.view().bindings[0].botName, 'Daily standup notes')
+    assert.equal(controller.view().bindings[0].botId, 'bot-2')
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a bot token that another bridge uses is refused and not stored', async () => {
+  const host = bridgesHost([{ id: 'b-first001', token: '111:SAME' }, { id: 'b-second01' }])
+  const deps = makeMockDeps()
+  const { manager, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await assert.rejects(
+      worker.request('bridge.saveConfig', saveInput(manager.bridge('b-second01'), { botToken: ' 111:SAME ' })),
+      /already used by the bridge "Bridge 1"/
+    )
+    assert.equal(host.data().secrets['botToken.b-second01'], undefined)
+    assert.equal(manager.bridge('b-second01').view().config.hasToken, false)
+    assert.equal(manager.bridge('b-first001').view().config.hasToken, true)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('adding a bridge creates one switched off, without a token, named by its place', async () => {
+  const host = bridgesHost([{ id: 'b-first001', token: '111:A' }])
+  const deps = makeMockDeps()
+  const { worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    const added = (await worker.request('bridge.add', {})) as { bridgeId: string; state: BridgeState }
+    assert.match(added.bridgeId, /^b-[a-z0-9]{8}$/)
+    const bridge = added.state.bridges.find((b) => b.id === added.bridgeId)
+    assert.equal(bridge?.name, 'Bridge 2')
+    assert.equal(bridge?.status, 'needs_token')
+    assert.equal(bridge?.config.enabled, false)
+    assert.equal(bridge?.config.hasToken, false)
+
+    const named = (await worker.request('bridge.add', { name: 'Dev bot' })) as { bridgeId: string; state: BridgeState }
+    assert.deepEqual(
+      named.state.bridges.map((b) => b.name),
+      ['Bridge 1', 'Bridge 2', 'Dev bot']
+    )
+    assert.deepEqual(storedBridges(host).map((b) => b.name), ['Bridge 1', 'Bridge 2', 'Dev bot'])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('removing a bridge stops its polling and deletes its token and state; the other keeps polling', async () => {
+  const host = bridgesHost([
+    { id: 'b-keep0001', token: '111:KEEP', config: { enabled: true } },
+    {
+      id: 'b-drop0001',
+      token: '222:DROP',
+      config: { enabled: true },
+      state: {
+        offset: 9,
+        lastBlocked: '5',
+        bindings: [{ tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: 'orca-1', updatedAt: 1000 }]
+      }
+    }
+  ])
+  const tg = multiBotTelegram({ '111:KEEP': { username: 'keep_bot' }, '222:DROP': { username: 'drop_bot' } })
+  const deps = makeMockDeps({ telegram: tg.telegram })
+  const { manager, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await until(() => tg.openPolls['111:KEEP'] === 1 && tg.openPolls['222:DROP'] === 1, 'both bridges long-polling')
+    const state = (await within(worker.request('bridge.remove', { bridgeId: 'b-drop0001' }), 'remove')) as BridgeState
+    assert.deepEqual(state.bridges.map((b) => b.id), ['b-keep0001'])
+    assert.equal(tg.openPolls['222:DROP'], 0)
+    assert.equal(tg.openPolls['111:KEEP'], 1)
+    assert.equal(manager.bridge('b-keep0001').view().polling, true)
+
+    const { storage, secrets } = host.data()
+    assert.equal(secrets['botToken.b-drop0001'], undefined)
+    assert.equal(secrets['botToken.b-keep0001'], '111:KEEP')
+    for (const name of ['offset', 'bindings', 'syncCursors', 'lastBlocked']) {
+      assert.equal(storage[`tg.b-drop0001.${name}`], undefined, `tg.b-drop0001.${name} is left behind`)
+    }
+    assert.deepEqual(storedBridges(host).map((b) => b.id), ['b-keep0001'])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+function lastStatusBar(host: MockHost): { text?: string; tone?: string; tooltip?: string } | undefined {
+  return host.callsOf('statusBar.update').at(-1) as { text?: string; tone?: string; tooltip?: string } | undefined
+}
+
+test('a bridge whose token Telegram rejects (401) stops alone; the other stays connected', async () => {
+  const host = bridgesHost([
+    { id: 'b-bad00001', token: '111:REVOKED', config: { enabled: true } },
+    { id: 'b-good0001', token: '222:GOOD', config: { enabled: true } }
+  ])
+  const tg = multiBotTelegram({
+    '111:REVOKED': { username: 'old_bot', rejectWith: new TelegramApiError('Unauthorized', 401) },
+    '222:GOOD': { username: 'good_bot' }
+  })
+  const deps = makeMockDeps({ telegram: tg.telegram })
+  const { manager, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    retryBackoffMs: 1
+  })
+  const bad = manager.bridge('b-bad00001')
+  const good = manager.bridge('b-good0001')
+  try {
+    await until(
+      () => bad.view().status === 'error' && !bad.view().polling && tg.openPolls['222:GOOD'] === 1,
+      'the revoked bridge to stop while the other long-polls'
+    )
+    assert.equal(good.view().status, 'connected')
+    assert.equal(good.view().polling, true)
+    assert.equal(good.view().lastError, null)
+    await until(() => lastStatusBar(host)?.text === 'TG: 1/2', 'the status bar to count one of two connected')
+    assert.equal(lastStatusBar(host)?.tone, 'danger')
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('the status bar shows Setup without a token, Off with every bridge off, else connected / active', async () => {
+  const cases: { seeds: BridgeSeed[]; text: string; tone: string }[] = [
+    { seeds: [{ id: 'b-nokey001' }], text: 'TG: Setup', tone: 'warning' },
+    { seeds: [{ id: 'b-off00001', token: '111:A' }, { id: 'b-off00002', token: '222:B' }], text: 'TG: Off', tone: 'neutral' },
+    {
+      seeds: [
+        { id: 'b-on000001', token: '111:A', config: { enabled: true } },
+        { id: 'b-on000002', token: '222:B', config: { enabled: true } }
+      ],
+      text: 'TG: 2/2',
+      tone: 'success'
+    }
+  ]
+  for (const { seeds, text, tone } of cases) {
+    const host = bridgesHost(seeds)
+    const tg = multiBotTelegram({ '111:A': { username: 'a_bot' }, '222:B': { username: 'b_bot' } })
+    const deps = makeMockDeps({ telegram: tg.telegram })
+    const { worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+    try {
+      await until(() => lastStatusBar(host)?.text === text, `status bar ${text}`)
+      assert.equal(lastStatusBar(host)?.tone, tone, text)
+      if (text === 'TG: 2/2') {
+        assert.match(lastStatusBar(host)?.tooltip ?? '', /^Bridge 1 \(@a_bot\): connected$/m)
+        assert.match(lastStatusBar(host)?.tooltip ?? '', /^Bridge 2 \(@b_bot\): connected$/m)
+        assert.match(lastStatusBar(host)?.tooltip ?? '', /\(click to open the panel\)$/)
+      }
+    } finally {
+      await worker.deactivate()
+    }
+  }
+})
+
+test('the palette toggle pauses every running bridge, then starts every bridge that has a token', async () => {
+  const host = bridgesHost([
+    { id: 'b-run00001', token: '111:A', config: { enabled: true } },
+    { id: 'b-idle0001', token: '222:B' },
+    { id: 'b-notok001' }
+  ])
+  const tg = multiBotTelegram({ '111:A': { username: 'a_bot' }, '222:B': { username: 'b_bot' } })
+  const deps = makeMockDeps({ telegram: tg.telegram })
+  const { manager, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  const switches = () => manager.bridges.map((b) => [b.view().config.enabled, b.view().polling])
+  try {
+    await until(() => manager.bridge('b-run00001').view().polling, 'the running bridge to poll')
+    assert.match(String(await worker.command('telegram-bridge.togglePolling')), /paused 1 bridge/)
+    assert.deepEqual(switches(), [[false, false], [false, false], [false, false]])
+
+    assert.match(String(await worker.command('telegram-bridge.togglePolling')), /started 2 bridge/)
+    assert.deepEqual(switches(), [[true, true], [true, true], [false, false]])
+    assert.deepEqual(storedBridges(host).map((b) => b.enabled), [true, true, false])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('the open-panel command uses the dev copy key when Orca lists two copies, else the manifest key', async () => {
+  let listCalls = 0
+  await withPolling(
+    false,
+    async (_controller, _host, deps, manager) => {
+      await manager.openPanel()
+      await manager.openPanel()
+      assert.deepEqual(
+        deps.openedPanels.map((p) => p.pluginKey),
+        ['local.telegram-bridge', 'local.telegram-bridge']
+      )
+      assert.equal(listCalls, 1)
+    },
+    {
+      async listPlugins() {
+        listCalls++
+        return [
+          { pluginKey: 'drecchia.telegram-bridge', isDev: false, status: 'running' },
+          { pluginKey: 'local.telegram-bridge', isDev: true, status: 'running' },
+          { pluginKey: 'local.other-plugin', isDev: true, status: 'running' }
+        ]
+      }
+    }
+  )
+  await withPolling(
+    false,
+    async (_controller, _host, deps, manager) => {
+      assert.equal(await manager.openPanel(), 'Telegram panel opened')
+      assert.deepEqual(deps.openedPanels, [{ pluginKey: 'drecchia.telegram-bridge', panelId: 'telegram-bridge' }])
+    },
+    {
+      async listPlugins() {
+        throw new Error('orca plugin list failed: exit 1')
+      }
+    }
+  )
 })

@@ -1,17 +1,17 @@
-// Texts the bridge sends to Telegram, in the language chosen by the `replyLanguage` setting.
+// Texts the bridge sends to Telegram, in the language each bridge's `replyLanguage` chose.
 // Log entries and the panel stay English; only what the Telegram user reads is translated.
 
 export type ReplyLanguage = 'en' | 'pt-BR' | 'zh-CN'
 
 export const REPLY_LANGUAGES: ReplyLanguage[] = ['en', 'pt-BR', 'zh-CN']
 
-// Telegram slash command menu, in menu order.
+// Telegram slash command menu, in menu order. `/use` is not listed: each Telegram bot is pinned
+// to one Orca bot, and `/use` only answers that.
 export const TELEGRAM_COMMAND_NAMES = [
   'help',
   'new',
   'home',
   'bots',
-  'use',
   'chats',
   'bind',
   'rename',
@@ -52,12 +52,10 @@ export type Messages = {
   help: (info: HelpInfo) => string
   status: (info: StatusInfo) => string
   currentSuffix: string
+  linkedSuffix: string
   noBotsFound: string
-  useUsage: string
-  botNotFound: (name: string, available: string[]) => string
-  switchedBot: (botName: string) => string
-  switchedBotToast: (botName: string) => string
-  botNotFoundRetry: string
+  // The answer to `/use` and to an old bot-switch button.
+  botPinned: (botName: string) => string
   contextReset: (botName: string) => string
   contextResetToast: string
   homeChatNotFoundFor: (botName: string) => string
@@ -101,8 +99,7 @@ const en: Messages = {
     help: 'Show available commands',
     new: 'Start a fresh Orca chat session',
     home: 'Bind to current bot Home Chat',
-    bots: 'List & switch Orca bots',
-    use: 'Switch target Orca bot (/use <name>)',
+    bots: 'List the Orca bots',
     chats: 'List & switch recent Orca chats',
     bind: 'Bind to an Orca chat (/bind <id>)',
     rename: 'Rename bound Orca chat (/rename <title>)',
@@ -129,8 +126,7 @@ const en: Messages = {
       `Two-way sync (Orca -> TG): ${enOnOff(syncOn)}`,
       '',
       'Commands:',
-      '/bots - List Orca bots and tap one to switch',
-      '/use <name> - Switch the target bot',
+      '/bots - List the Orca bots (this Telegram bot talks to one of them)',
       '/chats - List chats and tap one to bind it',
       "/home - Bind the current bot's Home Chat",
       '/new - Clear the context and start a new chat',
@@ -150,13 +146,10 @@ const en: Messages = {
       `Polling: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (current)',
+  linkedSuffix: ' (linked)',
   noBotsFound: 'No Orca bots found.',
-  useUsage: 'Usage: /use <bot name>',
-  botNotFound: (name, available) =>
-    `No bot named "${name}". Available bots: ${available.join(', ') || 'none'}`,
-  switchedBot: (botName) => `Switched to bot: ${botName} (your next message starts a new chat)`,
-  switchedBotToast: (botName) => `Switched to ${botName}`,
-  botNotFoundRetry: 'Bot not found. Run /bots again.',
+  botPinned: (botName) =>
+    `This Telegram bot is linked to ${botName || 'the first Orca bot'}. Ask the owner to change it in Orca.`,
   contextReset: (botName) => `Context cleared. Your next message starts a new chat in ${botName}.`,
   contextResetToast: 'Context cleared',
   homeChatNotFoundFor: (botName) => `No Home Chat found for ${botName}.`,
@@ -202,8 +195,7 @@ const ptBR: Messages = {
     help: 'Mostrar os comandos disponíveis',
     new: 'Iniciar uma nova conversa no Orca',
     home: 'Vincular o Home Chat do bot atual',
-    bots: 'Listar e trocar bots do Orca',
-    use: 'Trocar o bot do Orca (/use <nome>)',
+    bots: 'Listar os bots do Orca',
     chats: 'Listar e trocar conversas recentes do Orca',
     bind: 'Vincular a uma conversa do Orca (/bind <id>)',
     rename: 'Renomear a conversa vinculada (/rename <título>)',
@@ -230,8 +222,7 @@ const ptBR: Messages = {
       `Sincronização bidirecional (Orca -> TG): ${ptOnOff(syncOn)}`,
       '',
       'Comandos:',
-      '/bots - Listar os bots do Orca e tocar em um para trocar',
-      '/use <nome> - Trocar o bot de destino',
+      '/bots - Listar os bots do Orca (este bot do Telegram fala com um deles)',
       '/chats - Listar as conversas e tocar em uma para vincular',
       '/home - Vincular o Home Chat do bot atual',
       '/new - Limpar o contexto e iniciar uma nova conversa',
@@ -251,13 +242,10 @@ const ptBR: Messages = {
       `Polling: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (atual)',
+  linkedSuffix: ' (vinculado)',
   noBotsFound: 'Nenhum bot do Orca encontrado.',
-  useUsage: 'Uso: /use <nome do bot>',
-  botNotFound: (name, available) =>
-    `Nenhum bot chamado "${name}". Bots disponíveis: ${available.join(', ') || 'nenhum'}`,
-  switchedBot: (botName) => `Bot trocado para: ${botName} (sua próxima mensagem inicia uma nova conversa)`,
-  switchedBotToast: (botName) => `Trocado para ${botName}`,
-  botNotFoundRetry: 'Bot não encontrado. Execute /bots de novo.',
+  botPinned: (botName) =>
+    `Este bot do Telegram está vinculado ${botName ? `a ${botName}` : 'ao primeiro bot do Orca'}. Peça ao dono para trocar no Orca.`,
   contextReset: (botName) => `Contexto limpo. Sua próxima mensagem inicia uma nova conversa em ${botName}.`,
   contextResetToast: 'Contexto limpo',
   homeChatNotFoundFor: (botName) => `Nenhum Home Chat disponível para ${botName}.`,
@@ -302,8 +290,7 @@ const zhCN: Messages = {
     help: '显示可用指令',
     new: '开启新的 Orca 会话',
     home: '绑定当前 Bot 的 Home Chat',
-    bots: '列出并切换 Orca Bot',
-    use: '切换目标 Orca Bot (/use <名称>)',
+    bots: '列出 Orca Bot',
     chats: '列出并切换最近的 Orca 会话',
     bind: '绑定到 Orca 会话 (/bind <id>)',
     rename: '重命名绑定的 Orca 会话 (/rename <标题>)',
@@ -330,8 +317,7 @@ const zhCN: Messages = {
       `双向同步 (Orca -> TG)：${zhOnOff(syncOn)}`,
       '',
       '可用指令：',
-      '/bots - 列出并点击切换 Orca Bot',
-      '/use <名称> - 切换目标 Bot',
+      '/bots - 列出 Orca Bot（本 Telegram 机器人只与其中一个对话）',
       '/chats - 查看并点击绑定历史会话',
       '/home - 绑定当前 Bot 的 Home Chat',
       '/new - 清空当前上下文，开启新对话',
@@ -351,12 +337,10 @@ const zhCN: Messages = {
       `轮询状态: ${pollStatus}`
     ].join('\n'),
   currentSuffix: ' (当前)',
+  linkedSuffix: ' (已绑定)',
   noBotsFound: '未检测到 Orca Bot。',
-  useUsage: '用法：/use <Bot名称>',
-  botNotFound: (name, available) => `未找到名为 "${name}" 的 Bot。可用 Bot：${available.join('、') || '无'}`,
-  switchedBot: (botName) => `已切换到 Bot：${botName}（下一条消息将新建会话）`,
-  switchedBotToast: (botName) => `已切换到 ${botName}`,
-  botNotFoundRetry: '未找到该 Bot，请重新运行 /bots。',
+  botPinned: (botName) =>
+    `这个 Telegram 机器人已绑定到 ${botName || '第一个 Orca Bot'}。如需更换，请联系所有者在 Orca 中修改。`,
   contextReset: (botName) => `已重置上下文，下一条消息将在 ${botName} 中创建新会话。`,
   contextResetToast: '已重置上下文',
   homeChatNotFoundFor: (botName) => `未找到 ${botName} 的可用 Home Chat。`,

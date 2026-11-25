@@ -57,14 +57,14 @@
       {
         "key": "enabled",
         "title": "Enable Telegram Polling",
-        "description": "Keep polling Telegram for incoming messages while Orca is running.",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Keep polling Telegram for incoming messages while Orca is running.",
         "type": "boolean",
         "default": true
       },
       {
         "key": "defaultBot",
         "title": "Default Orca Bot",
-        "description": "Default Orca bot name to route Telegram messages to (leave blank for auto: use the first available bot).",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Default Orca bot name to route Telegram messages to (leave blank for auto: use the first available bot).",
         "type": "string",
         "default": "",
         "placeholder": "e.g. Assistant"
@@ -72,7 +72,7 @@
       {
         "key": "allowedUserIds",
         "title": "Allowed Telegram IDs",
-        "description": "Leave empty to let everyone use the bot. Add Telegram user IDs or group IDs (negative, e.g. -1001234567890), separated by commas, to allow only them.",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Leave empty to let everyone use the bot. Add Telegram user IDs or group IDs (negative, e.g. -1001234567890), separated by commas, to allow only them.",
         "type": "string",
         "default": "",
         "placeholder": "123456789"
@@ -80,7 +80,7 @@
       {
         "key": "proxyUrl",
         "title": "HTTP Proxy URL",
-        "description": "Optional HTTP proxy for api.telegram.org (e.g. http://127.0.0.1:7890).",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Optional HTTP proxy for api.telegram.org (e.g. http://127.0.0.1:7890).",
         "type": "string",
         "default": "",
         "placeholder": "http://127.0.0.1:7890"
@@ -88,7 +88,7 @@
       {
         "key": "replyTimeoutSec",
         "title": "Reply Timeout (seconds)",
-        "description": "Maximum seconds to wait for an Orca bot reply.",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Maximum seconds to wait for an Orca bot reply.",
         "type": "integer",
         "default": 300,
         "minimum": 30,
@@ -97,14 +97,14 @@
       {
         "key": "syncOrcaOutbound",
         "title": "Sync Orca Messages to Telegram",
-        "description": "Forward messages sent in Orca and bot replies from bound chats back to Telegram.",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Forward messages sent in Orca and bot replies from bound chats back to Telegram.",
         "type": "boolean",
         "default": false
       },
       {
         "key": "replyLanguage",
         "title": "Telegram Reply Language",
-        "description": "Language of the bridge's own Telegram replies and command menu: en (English), pt-BR (Português do Brasil) or zh-CN (中文). Bot replies are not translated.",
+        "description": "Legacy (read once to create Bridge 1; edit bridges in the Telegram panel). Language of the bridge's own Telegram replies and command menu: en (English), pt-BR (Português do Brasil) or zh-CN (中文). Bot replies are not translated.",
         "type": "string",
         "default": "en",
         "enum": ["en", "pt-BR", "zh-CN"],

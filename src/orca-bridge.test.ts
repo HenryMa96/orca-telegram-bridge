@@ -9,6 +9,8 @@ import {
   listBotsLocalFirst,
   listLocalBots,
   OrcaCliError,
+  parsePluginList,
+  pickPluginKey,
   runOrcaJson,
   type OrcaChatSummary,
   type OrcaCliRunner,
@@ -71,7 +73,10 @@ function makeRunner(options: {
     async sendToBot({ body }) {
       sentBodies.push(body)
     },
-    async openPanel() {}
+    async openPanel() {},
+    async listPlugins() {
+      return []
+    }
   }
   return { runner, sentBodies, readLimits, postSendReads: () => postSendReads }
 }
@@ -389,4 +394,32 @@ test('listing bots falls back to the CLI when no local bot is readable', async (
     const bots = await listBotsLocalFirst(root, async () => [CLI_BOT])
     assert.deepEqual(bots, [CLI_BOT])
   })
+})
+
+test('the plugin list is read from its plugins array and keeps only what the key choice needs', () => {
+  const result = {
+    plugins: [
+      { pluginKey: 'drecchia.telegram-bridge', isDev: false, status: 'running', name: 'Telegram Bridge', version: '0.5.0' },
+      { pluginKey: 'local.telegram-bridge', isDev: true, status: 'disabled' },
+      { name: 'no key' },
+      'junk'
+    ]
+  }
+  assert.deepEqual(parsePluginList(result), [
+    { pluginKey: 'drecchia.telegram-bridge', isDev: false, status: 'running' },
+    { pluginKey: 'local.telegram-bridge', isDev: true, status: 'disabled' }
+  ])
+  assert.deepEqual(parsePluginList({ ok: true }), [])
+})
+
+test('the plugin key prefers the dev copy, then a running one, and ignores other plugins', () => {
+  const installed = { pluginKey: 'drecchia.telegram-bridge', isDev: false, status: 'running' }
+  const devStopped = { pluginKey: 'local.telegram-bridge', isDev: true, status: 'disabled' }
+  const devRunning = { pluginKey: 'work.telegram-bridge', isDev: true, status: 'running' }
+  const other = { pluginKey: 'drecchia.telegram-bridge-extras', isDev: true, status: 'running' }
+  assert.equal(pickPluginKey([installed], 'telegram-bridge'), 'drecchia.telegram-bridge')
+  assert.equal(pickPluginKey([installed, devStopped], 'telegram-bridge'), 'local.telegram-bridge')
+  assert.equal(pickPluginKey([devStopped, installed, devRunning], 'telegram-bridge'), 'work.telegram-bridge')
+  assert.equal(pickPluginKey([other], 'telegram-bridge'), null)
+  assert.equal(pickPluginKey([], 'telegram-bridge'), null)
 })

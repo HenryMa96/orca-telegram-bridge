@@ -29,6 +29,8 @@ export type BridgeLogEntry = {
   level: 'debug' | 'info' | 'warn' | 'error'
   // Optional: entries stored by 0.2.0 have none.
   scope?: LogScope
+  // The bridge the entry belongs to; absent for plugin-wide entries and entries from before 0.5.0.
+  bridgeId?: string
   message: string
   // Multi-line, redacted, at most 3000 chars.
   details?: string
@@ -41,19 +43,24 @@ export type BotSummary = {
   agent: string
 }
 
+// One bridge: one Telegram bot token and the one Orca bot it talks to. Everything here is per bridge.
 export type BridgeConfig = {
+  id: string
+  name: string
   hasToken: boolean
   enabled: boolean
-  defaultBot: string
+  // The Orca bot this Telegram bot is pinned to ('' = the first Orca bot found).
+  orcaBot: string
   allowedUserIds: string
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
-  debugLogging: boolean
   replyLanguage: ReplyLanguage
 }
 
-export type BridgeState = {
+export type BridgeView = {
+  id: string
+  name: string
   status: BridgeConnectionStatus
   polling: boolean
   botUsername: string | null
@@ -62,24 +69,36 @@ export type BridgeState = {
   lastBlockedUserId: string | null
   lastPollAt: number | null
   config: BridgeConfig
-  bots: BotSummary[]
   bindings: ChatBinding[]
-  // The newest 40 stored entries, newest first; logTotal counts every stored entry.
+}
+
+export type GlobalConfig = {
+  debugLogging: boolean
+}
+
+export type BridgeState = {
+  // In creation order.
+  bridges: BridgeView[]
+  // The Orca bots on this computer; shared by every bridge.
+  bots: BotSummary[]
+  global: GlobalConfig
+  // The newest 40 stored entries of every bridge, newest first; logTotal counts every stored entry.
   logs: BridgeLogEntry[]
   logTotal: number
 }
 
 export type SaveConfigInput = {
+  bridgeId: string
+  name: string
   botToken?: string
   clearToken?: boolean
-  // Absent keeps the current state; the panel switches polling with `bridge.setEnabled`.
+  // Absent keeps the current state; the panel switches a bridge with `bridge.setEnabled`.
   enabled?: boolean
-  defaultBot: string
+  orcaBot: string
   allowedUserIds: string
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
-  // Optional for callers from 0.2.1; absent keeps the current language.
   replyLanguage?: ReplyLanguage
 }
 
@@ -99,12 +118,14 @@ export type ExportLogsResult = {
 declare module 'orca' {
   interface PluginRequests {
     'bridge.getState': { output: BridgeState }
+    // A new bridge starts without a token and switched off.
+    'bridge.add': { input: { name?: string }; output: { bridgeId: string; state: BridgeState } }
+    'bridge.remove': { input: { bridgeId: string }; output: BridgeState }
     'bridge.saveConfig': { input: SaveConfigInput; output: BridgeState }
-    'bridge.testConnection': { output: TestConnectionResult }
-    'bridge.togglePolling': { output: BridgeState }
-    'bridge.setEnabled': { input: { enabled: boolean }; output: BridgeState }
-    'bridge.allowUserId': { input: { userId: string }; output: BridgeState }
-    'bridge.resetBinding': { input: { tgChatId: string }; output: BridgeState }
+    'bridge.testConnection': { input: { bridgeId: string }; output: TestConnectionResult }
+    'bridge.setEnabled': { input: { bridgeId: string; enabled: boolean }; output: BridgeState }
+    'bridge.allowUserId': { input: { bridgeId: string; userId: string }; output: BridgeState }
+    'bridge.resetBinding': { input: { bridgeId: string; tgChatId: string }; output: BridgeState }
     'bridge.clearLogs': { output: BridgeState }
     'bridge.setDebugLogging': { input: { enabled: boolean }; output: BridgeState }
     'bridge.exportLogs': { output: ExportLogsResult }
