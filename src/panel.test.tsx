@@ -1296,7 +1296,7 @@ test('rows: added rows get Member, each role select is saved, removed rows are g
   await view.unmount()
 })
 
-// The name shown in the disabled field next to this ID row; '' when none.
+// The name shown in the read-only field next to this ID row; '' when none.
 function nameOf(view: TestPanel, row: number): string {
   return String(view.find({ label: `Telegram name ${row}` })?.props.value ?? '')
 }
@@ -1308,7 +1308,6 @@ test('each ID row shows the name the bridge knows for its trimmed ID, follows ed
   const view = await mount(panel, { host: panelHost({ requests: { 'bridge.getState': () => state } }) })
   await openEditor(view, 'b1')
   assert.equal(nameOf(view, 1), '@ana_dev')
-  assert.equal(view.find({ label: 'Telegram name 1' })?.props.disabled, true)
 
   await view.press({ text: 'Add person or group' })
   assert.equal(nameOf(view, 2), '')

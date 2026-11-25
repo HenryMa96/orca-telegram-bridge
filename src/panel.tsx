@@ -986,15 +986,15 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNa
                 set(allowedIdsError, null)
               }}
             />
-            {/* A disabled field rather than loose text: every row gets the same width, so the role
-                selects line up whatever the name's length. */}
+            {/* A field rather than loose text: every row gets the same width, so the role selects
+                line up whatever the name's length. `value` without `onChange` is read-only; not
+                disabled, which would grey the name out. */}
             <Input
               key={`name:${row.key}`}
               label={`Telegram name ${i + 1}`}
               labelHidden
               value={name ?? ''}
               placeholder="No name yet"
-              disabled
             />
             <Select
               key={`role:${row.key}`}
