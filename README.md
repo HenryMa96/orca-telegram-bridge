@@ -351,15 +351,20 @@ Other antivirus products call the same setting HTTPS scanning, SSL/TLS filtering
 
 Then send the Telegram message or voice message again. The Logs tab shows the result.
 
-### One bot times out, other bots work
+### Telegram requests time out for one bridge
 
-**What it means.** Every Telegram request of one bridge (`getMe`, `getUpdates`) times out, while other bots, the network and `Test connection` with a wrong token answer quickly. Asking Telegram directly with that bot's token answers `502 Bad Gateway` after about 16 seconds. This is a fault in Telegram's servers for that one bot, not in Orca, the plugin, a proxy or an antivirus. It has been reported for other bots in [tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api/issues).
+**Symptom.** Every Telegram request of one bridge (`getMe`, `getUpdates`) times out in the Logs tab, while other bridges keep working.
 
-**What to do.**
+**Find out where it fails.** On the same computer, ask Telegram directly, first with a made-up token, then with the bridge's token (type it in your own terminal; never paste it in a chat or bug report):
 
-1. Wait: Telegram fixes it on its side, sometimes in hours, sometimes in days. Reports say a new token for the same bot does not help.
-2. Or create a new bot with `@BotFather` (`/newbot`) and paste its token into the bridge's editor. A new bot gets a new ID, which should land on a healthy Telegram server; people must open the new bot, and groups must add it again.
-3. When the old bot comes back, Telegram delivers the messages sent while it was down, all at once.
+```sh
+curl -sS -m 40 -w "\nhttp=%{http_code} total=%{time_total}s\n" https://api.telegram.org/bot123456:fake/getMe
+curl -sS -m 40 -w "\nhttp=%{http_code} total=%{time_total}s\n" https://api.telegram.org/bot<YOUR_TOKEN>/getMe
+```
+
+- **Both answer fast** (`401` for the fake one, `200` for yours): the path works now; restart the bridge with its **Active** switch and check the Logs tab.
+- **The fake one answers fast, yours fails** (for example `502 Bad Gateway` after about 16 seconds): the network reaches Telegram, but Telegram's answer for that bot fails. Others have reported this for single bots in [tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api/issues), where it cleared on Telegram's side and a new token for the same bot did not help. You can wait, or create a new bot with `@BotFather` (`/newbot`) and paste its token into the bridge's editor; people must then open the new bot, and groups must add it again. When the old bot answers again, Telegram delivers the messages sent while it was down, all at once.
+- **Both fail or hang**: the problem is between this computer and Telegram (network, proxy, VPN or antivirus); see the entry above and the bridge's HTTP proxy setting.
 
 Never paste a bot token in a chat or a bug report; if you did, revoke it in `@BotFather` (`/mybots` → the bot → **API Token** → **Revoke current token**) and paste the new one in the editor.
 
