@@ -5,8 +5,17 @@ export type ReplyLanguage = 'en' | 'pt-BR' | 'es' | 'zh-CN'
 
 export const REPLY_LANGUAGES: ReplyLanguage[] = ['en', 'pt-BR', 'es', 'zh-CN']
 
-// What a bridge stores: a fixed language, or 'auto' = each person's Telegram language for the
-// bridge's own texts, and the language of their message for the Orca bot's answer.
+// How the Orca bot is told which language a chat speaks.
+export const LANGUAGE_NAMES: Record<ReplyLanguage, string> = {
+  en: 'English',
+  'pt-BR': 'Brazilian Portuguese',
+  es: 'Spanish',
+  'zh-CN': 'Simplified Chinese'
+}
+
+// What a bridge stores: a fixed language, or 'auto' = the sender's Telegram language for the
+// bridge's own texts (else the chat's last known one, else English), and the language of their
+// message for the Orca bot's answer.
 export type ReplyLanguageSetting = ReplyLanguage | 'auto'
 
 // Telegram slash command menu, in menu order. `/use` is not listed: each Telegram bot is pinned

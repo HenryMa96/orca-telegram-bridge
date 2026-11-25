@@ -2176,8 +2176,72 @@ test("with Auto the Orca bot is told to answer in the user's language; a fixed l
       await worker.deactivate()
     }
   }
-  assert.ok((await bodyFor('auto')).includes("Answer in the language of the user's message."))
+  // No language seen yet: English is the fallback the bot is given.
+  assert.ok(
+    (await bodyFor('auto')).includes(
+      "Answer in the language of the user's message; when it has no words (only an image or a file), answer in English."
+    )
+  )
   assert.equal((await bodyFor('pt-BR')).includes('Answer in the language'), false)
+})
+
+test("Auto keeps each chat's language: English until one is seen, then that one, even after a restart", async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds: '777888, 555', proxyUrl: '', replyTimeoutSec: 300, replyLanguage: 'auto' }
+  })
+  // A message saying "please fail" makes the bot fail, so the bridge answers with its own text.
+  const failingDeps = () => {
+    const deps = makeMockDeps()
+    const sendToBot = deps.orcaCli.sendToBot
+    deps.orcaCli.sendToBot = async (params) => {
+      if (params.body.includes('please fail')) throw new Error('bot unavailable')
+      return sendToBot(params)
+    }
+    return deps
+  }
+  const update = (id: number, userId: number, text: string, languageCode?: string) => {
+    const u = textUpdate(id, userId, text)
+    if (languageCode) u.message!.from!.language_code = languageCode
+    return u
+  }
+  const lastTo = (deps: ReturnType<typeof makeMockDeps>, chatId: string) =>
+    deps.sentMessages.filter((m) => String(m.chatId) === chatId).at(-1)?.text ?? ''
+  const run = async (deps: ReturnType<typeof makeMockDeps>, steps: (send: (u: TelegramUpdate) => Promise<void>) => Promise<void>) => {
+    const { controller, worker } = await within(
+      mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 }),
+      'mount'
+    )
+    try {
+      await steps((u) => within(controller.handleIncomingUpdate(u), `update ${u.update_id}`))
+    } finally {
+      await within(controller.dispose(), 'dispose')
+      await worker.deactivate()
+    }
+  }
+
+  const first = failingDeps()
+  await run(first, async (send) => {
+    // Nothing known yet, and no Telegram language: English.
+    await send(update(1, 777888, 'please fail'))
+    assert.match(lastTo(first, '777888'), /^Processing failed: /)
+    // A Spanish Telegram app: the chat's language from now on, and the bot is told.
+    await send(update(2, 777888, 'hola', 'es'))
+    assert.ok(first.sentToBots.at(-1)?.body.includes('answer in Spanish.'))
+    // A later message without a Telegram language keeps Spanish.
+    await send(update(3, 777888, 'please fail'))
+    assert.match(lastTo(first, '777888'), /^Error al procesar: /)
+  })
+
+  const afterRestart = failingDeps()
+  await run(afterRestart, async (send) => {
+    await send(update(4, 777888, 'please fail'))
+    assert.match(lastTo(afterRestart, '777888'), /^Error al procesar: /)
+    // Another chat starts in English.
+    await send(update(5, 555, 'please fail'))
+    assert.match(lastTo(afterRestart, '555'), /^Processing failed: /)
+  })
 })
 
 test('an unknown stored reply language falls back to English', async () => {

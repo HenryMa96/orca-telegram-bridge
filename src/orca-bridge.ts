@@ -736,8 +736,9 @@ export async function dispatchToOrcaBotAndWait(
     imagePaths?: string[]
     // Set only for a group message not addressed to the bot: the group's reply policy.
     unaddressedGroupReply?: GroupReply
-    // The bridge's reply language is 'auto': the Orca bot answers in the language the user wrote in.
-    answerInMessageLanguage?: boolean
+    // Set when the bridge's reply language is 'auto': the chat's known language (else English), for
+    // a message with no words to follow.
+    answerLanguage?: string
     timeoutMs: number
     pollIntervalMs?: number
     signal?: AbortSignal
@@ -782,8 +783,10 @@ export async function dispatchToOrcaBotAndWait(
           'To send an image or file to the Telegram user, put it on its own line as Markdown ![short caption](absolute local path or https URL); wrap a path with spaces in <>. Images: PNG, JPEG, GIF, WEBP (up to 10 MB). Documents: PDF, CSV, TSV, TXT, MD and Office/OpenDocument files (up to 50 MB).'
         ])
   ]
-  if (params.answerInMessageLanguage && groupReply !== 'mentioned') {
-    bodyParts.push("Answer in the language of the user's message.")
+  if (params.answerLanguage && groupReply !== 'mentioned') {
+    bodyParts.push(
+      `Answer in the language of the user's message; when it has no words (only an image or a file), answer in ${params.answerLanguage}.`
+    )
   }
   if (imagePaths.length > 0) {
     bodyParts.push(

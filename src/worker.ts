@@ -4,8 +4,10 @@ import os from 'node:os'
 import path from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
+  LANGUAGE_NAMES,
   languageFromTelegramCode,
   normalizeLanguageSetting,
+  REPLY_LANGUAGES,
   t,
   TELEGRAM_COMMAND_NAMES,
   type Messages,
@@ -82,10 +84,11 @@ import {
 // state lives under `tg.<id>.*`.
 const STORAGE_BRIDGES = 'bridges'
 const STORAGE_LOGS = 'tg.logs'
-const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked'] as const
+const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages'] as const
 // What 0.4.0 and earlier stored for their single bridge; moved into "Bridge 1" on the first start.
 const LEGACY_SECRET_BOT_TOKEN = 'botToken'
-const LEGACY_STORAGE: Record<(typeof BRIDGE_STORAGE_NAMES)[number], string> = {
+// chatLanguages came later, so 0.4.0 had nothing to move for it.
+const LEGACY_STORAGE: Partial<Record<(typeof BRIDGE_STORAGE_NAMES)[number], string>> = {
   offset: 'tg.updateOffset',
   bindings: 'tg.bindings',
   syncCursors: 'tg.syncCursors',
@@ -639,7 +642,7 @@ export class BridgeRuntime {
   private readonly chatQueues = new Map<string, Promise<void>>()
   private readonly activeTelegramTgChats = new Set<string>()
   private readonly activeTelegramOrcaChats = new Set<string>()
-  // With 'auto': the last Telegram language seen per chat, for what sync sends there unprompted.
+  // With 'auto': the last Telegram language of each allowed chat, kept in storage (chatLanguages).
   private readonly chatLanguages = new Map<string, ReplyLanguage>()
   private automationSnapshot: Promise<AutomationSnapshot | null> | null = null
   private readonly blockedLoggedAt = new Map<string, number>()
@@ -988,15 +991,17 @@ export class BridgeRuntime {
     await accepted?.done
   }
 
-  // Runs the update in its sender's Telegram language, which 'auto' uses for everything it says.
+  // Runs the update in a language 'auto' uses for everything it says: the sender's Telegram
+  // language, else the one this chat showed before, else English.
   private acceptIncomingUpdate(
     update: TelegramUpdate,
     signal?: AbortSignal
   ): Promise<{ done: Promise<void> } | null> {
     const from = update.message?.from ?? update.callback_query?.from
-    const language = languageFromTelegramCode(from?.language_code)
     const chatId = update.message?.chat.id ?? update.callback_query?.message?.chat.id
-    if (from?.language_code && chatId !== undefined) this.chatLanguages.set(String(chatId), language)
+    const language = from?.language_code
+      ? languageFromTelegramCode(from.language_code)
+      : ((chatId === undefined ? undefined : this.chatLanguages.get(String(chatId))) ?? 'en')
     return messageLanguage.run(language, () => this.acceptUpdateInLanguage(update, signal))
   }
 
@@ -1079,6 +1084,8 @@ export class BridgeRuntime {
 
     // A group line not addressed to the bot is handled quietly: no typing, no notices in the group.
     const unaddressed = group?.addressed === false
+    // Only an allowed chat's language is kept, so strangers never grow the stored map.
+    if (msg.from?.language_code) await this.rememberChatLanguage(tgChatId, languageFromTelegramCode(msg.from.language_code))
     const done = this.enqueueChatWork(tgChatId, async () => {
       try {
         if (unsupportedImage) {
@@ -1337,7 +1344,8 @@ export class BridgeRuntime {
         userText: text,
         imagePaths,
         unaddressedGroupReply: unaddressed ? this.config.groupReply : undefined,
-        answerInMessageLanguage: this.config.replyLanguage === 'auto',
+        answerLanguage:
+          this.config.replyLanguage === 'auto' ? LANGUAGE_NAMES[messageLanguage.getStore() ?? 'en'] : undefined,
         timeoutMs: this.config.replyTimeoutSec * 1000,
         pollIntervalMs: this.deps.pollIntervalMs,
         signal,
@@ -2968,12 +2976,28 @@ export class BridgeRuntime {
         ? (savedCursors as Record<string, SyncCursor>)
         : {}
 
+    const savedLanguages = await this.orca.storage.get(this.key('chatLanguages'))
+    this.chatLanguages.clear()
+    if (savedLanguages && typeof savedLanguages === 'object' && !Array.isArray(savedLanguages)) {
+      for (const [chatId, language] of Object.entries(savedLanguages)) {
+        if (REPLY_LANGUAGES.includes(language as ReplyLanguage)) this.chatLanguages.set(chatId, language as ReplyLanguage)
+      }
+    }
+
     // The pinned bot's id, from a chat that talked to it, so a rename in Orca before the first
     // bot list is still followed.
     if (this.config.orcaBot) {
       this.pinnedBotId =
         this.bindings.find((b) => b.botName === this.config.orcaBot && b.botId)?.botId ?? null
     }
+  }
+
+  // The language a chat last showed, kept so 'auto' still knows it after a restart, for a message
+  // without a Telegram language, and for what sync sends there unprompted.
+  private async rememberChatLanguage(tgChatId: string, language: ReplyLanguage): Promise<void> {
+    if (this.chatLanguages.get(tgChatId) === language) return
+    this.chatLanguages.set(tgChatId, language)
+    await this.orca.storage.set(this.key('chatLanguages'), toPlainJson(Object.fromEntries(this.chatLanguages)))
   }
 
   private async readToken(): Promise<string | null> {
@@ -3299,7 +3323,9 @@ export class BridgeManager {
     if (token) await this.orca.secrets.set(bridgeSecretKey(id), token)
     const copied = new Map<BridgeStorageName, string>()
     for (const name of BRIDGE_STORAGE_NAMES) {
-      const value = await this.orca.storage.get(LEGACY_STORAGE[name])
+      const legacyKey = LEGACY_STORAGE[name]
+      if (!legacyKey) continue
+      const value = await this.orca.storage.get(legacyKey)
       if (value === null) continue
       await this.orca.storage.set(bridgeStorageKey(id, name), value)
       copied.set(name, JSON.stringify(value))
@@ -3328,7 +3354,8 @@ export class BridgeManager {
   private async dropLegacy(): Promise<void> {
     await this.orca.secrets.delete(LEGACY_SECRET_BOT_TOKEN)
     for (const name of BRIDGE_STORAGE_NAMES) {
-      await this.orca.storage.delete(LEGACY_STORAGE[name])
+      const legacyKey = LEGACY_STORAGE[name]
+      if (legacyKey) await this.orca.storage.delete(legacyKey)
     }
     await this.orca.storage.delete(STORAGE_MIGRATION_ID)
   }
