@@ -5,8 +5,8 @@
 
 ## Goal
 Today the plugin runs exactly one Telegram bot token, so only one Telegram bot can front the Orca
-bots. Users want several pairs, e.g. `@ci_bot` ↔ Orca bot `BabyShark` and `@dev_bot` ↔ Orca bot
-`VerissimaDev`, each with its own access list, language and on/off state. The ideal (a Telegram
+bots. Users want several pairs, e.g. `@ci_bot` ↔ Orca bot `CIWatcher` and `@dev_bot` ↔ Orca bot
+`DevHelper`, each with its own access list, language and on/off state. The ideal (a Telegram
 connector inside Orca's Bot settings → Connectors) is not possible from a plugin: the plugin API
 cannot contribute bot connectors (`contributes.connections` is reserved, no schema), and the
 built-in connectors are slack, linear, github, google and webhook. That request lives upstream in

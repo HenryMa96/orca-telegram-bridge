@@ -324,7 +324,7 @@ for (const scenario of ['no Orca bots found', 'Orca bots found'] as const) {
     const host = mockHost({
       capabilities: CAPABILITIES,
       secrets: { botToken: '123456:TEST_TOKEN' },
-      settings: { enabled: false, defaultBot: '', allowedUserIds: '175844659', proxyUrl: '', replyTimeoutSec: 300 }
+      settings: { enabled: false, defaultBot: '', allowedUserIds: '555000111', proxyUrl: '', replyTimeoutSec: 300 }
     })
     const deps = makeMockDeps(scenario === 'no Orca bots found' ? { orcaCli: { listBots: async () => [] } } : {})
     const { controller, worker } = await mountController(host, {
@@ -333,7 +333,7 @@ for (const scenario of ['no Orca bots found', 'Orca bots found'] as const) {
       logFlushMs: 0
     })
     try {
-      await within(controller.handleIncomingUpdate(textUpdate(681159817, 175844659, 'oi')), 'first message')
+      await within(controller.handleIncomingUpdate(textUpdate(681159817, 555000111, 'oi')), 'first message')
       assert.deepEqual(host.refusals, [])
       const lastReply = deps.sentMessages.at(-1)?.text ?? ''
       assert.equal(lastReply.startsWith(t('en').processingFailed('')), false)
@@ -371,7 +371,7 @@ test('panel handlers answer plain JSON after a message created a binding with no
   const host = mockHost({
     capabilities: CAPABILITIES,
     secrets: { botToken: '123456:TEST_TOKEN' },
-    settings: { enabled: false, defaultBot: '', allowedUserIds: '175844659', proxyUrl: '', replyTimeoutSec: 300 }
+    settings: { enabled: false, defaultBot: '', allowedUserIds: '555000111', proxyUrl: '', replyTimeoutSec: 300 }
   })
   const deps = makeMockDeps({ orcaCli: { listBots: async () => [] } })
   let manager!: BridgeManager
@@ -385,7 +385,7 @@ test('panel handlers answer plain JSON after a message created a binding with no
     { host }
   )
   try {
-    await within(manager.bridges[0].handleIncomingUpdate(textUpdate(681159817, 175844659, 'oi')), 'first message')
+    await within(manager.bridges[0].handleIncomingUpdate(textUpdate(681159817, 555000111, 'oi')), 'first message')
     const enabled = await worker.request('bridge.setDebugLogging', { enabled: true })
     assert.equal(nonJsonPath(enabled), null)
     assert.equal((enabled as BridgeState).global.debugLogging, true)

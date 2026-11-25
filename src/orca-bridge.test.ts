@@ -331,13 +331,13 @@ async function writeBotFolder(root: string, folder: string, files: Record<string
 
 test('local bot folders list only valid bots, sorted, with SOUL.md specialty', async () => {
   await withBotsRoot(async (root) => {
-    // Folder order (babyshark, zed) and case-sensitive order (B < a) both differ from the wanted order.
+    // Folder order (ciwatcher, zed) and case-sensitive order (C < a) both differ from the wanted order.
     await writeBotFolder(root, 'zed', {
       'bot.json': JSON.stringify({ id: 'id-alpha', name: 'alpha', agent: 'codex' }),
       'SOUL.md': '# Alpha\n\n## Role\n\nWatches the  deploys\nand reports.\n\nSecond paragraph.\n'
     })
-    await writeBotFolder(root, 'babyshark', {
-      'bot.json': JSON.stringify({ id: 'id-shark', name: 'BabyShark', avatar: 'x' })
+    await writeBotFolder(root, 'ciwatcher', {
+      'bot.json': JSON.stringify({ id: 'id-ci', name: 'CIWatcher', avatar: 'x' })
     })
     await writeBotFolder(root, 'no-meta', { 'SOUL.md': 'Not a bot.' })
     await writeBotFolder(root, 'broken', { 'bot.json': '{ not json' })
@@ -347,7 +347,7 @@ test('local bot folders list only valid bots, sorted, with SOUL.md specialty', a
 
     assert.deepEqual(bots, [
       { id: 'id-alpha', name: 'alpha', specialty: 'Watches the deploys and reports.', agent: 'codex' },
-      { id: 'id-shark', name: 'BabyShark', specialty: '', agent: 'claude' }
+      { id: 'id-ci', name: 'CIWatcher', specialty: '', agent: 'claude' }
     ])
   })
 })
@@ -375,15 +375,15 @@ const CLI_BOT: BotSummary = { id: 'id-remote', name: 'Remote', specialty: 'From 
 
 test('listing bots uses local folders and never waits on the CLI when any exist', async () => {
   await withBotsRoot(async (root) => {
-    await writeBotFolder(root, 'babyshark', {
-      'bot.json': JSON.stringify({ id: 'id-shark', name: 'BabyShark', agent: 'claude' })
+    await writeBotFolder(root, 'ciwatcher', {
+      'bot.json': JSON.stringify({ id: 'id-ci', name: 'CIWatcher', agent: 'claude' })
     })
     let cliCalls = 0
     const bots = await listBotsLocalFirst(root, async () => {
       cliCalls++
       return [CLI_BOT]
     })
-    assert.deepEqual(bots.map((b) => b.name), ['BabyShark'])
+    assert.deepEqual(bots.map((b) => b.name), ['CIWatcher'])
     assert.equal(cliCalls, 0)
   })
 })

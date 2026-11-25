@@ -59,8 +59,8 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
     bridges: [makeBridge('b1')],
     bots: [
       { id: 'bot-1', name: 'Assistant', specialty: 'Workspace assistant', agent: 'claude' },
-      { id: 'bot-2', name: 'BabyShark', specialty: 'CI', agent: 'claude' },
-      { id: 'bot-3', name: 'VerissimaDev', specialty: '', agent: 'codex' }
+      { id: 'bot-2', name: 'CIWatcher', specialty: 'CI', agent: 'claude' },
+      { id: 'bot-3', name: 'DevHelper', specialty: '', agent: 'codex' }
     ],
     global: { debugLogging: false },
     logs: [
@@ -78,14 +78,14 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
   }
 }
 
-// @ci_bot is pinned to BabyShark and restricted; @dev_bot is pinned to the first Orca bot and open.
+// @ci_bot is pinned to CIWatcher and restricted; @dev_bot is pinned to the first Orca bot and open.
 function twoBridges(): BridgeView[] {
   return [
     makeBridge('ci', {
       name: 'CI',
       botUsername: 'ci_bot',
-      config: { orcaBot: 'BabyShark', allowedUserIds: '111' },
-      bindings: [binding('111', 'BabyShark', 'chat-ci')]
+      config: { orcaBot: 'CIWatcher', allowedUserIds: '111' },
+      bindings: [binding('111', 'CIWatcher', 'chat-ci')]
     }),
     makeBridge('dev', {
       name: 'Dev',
@@ -179,7 +179,7 @@ test('two bridges render one card each with name, @username and pinned Orca bot'
   )
   assert.deepEqual(
     cards.map((c) => c.props.description),
-    ['@ci_bot → BabyShark', '@dev_bot → first Orca bot']
+    ['@ci_bot → CIWatcher', '@dev_bot → first Orca bot']
   )
   assert.equal(view.findAll({ label: 'Bot active' }).length, 2)
   assert.deepEqual(view.errors, [])
@@ -265,13 +265,13 @@ test('Save sends the edited bridge id and never the on/off state', async () => {
   await openEditor(view, 'dev')
   assert.equal(view.valueOf({ label: 'Name' }), 'Dev')
   await view.type({ label: 'Name' }, 'Dev box', { replace: true })
-  await view.select({ label: ORCA_BOT_LABEL }, 'VerissimaDev')
+  await view.select({ label: ORCA_BOT_LABEL }, 'DevHelper')
   await view.press({ text: 'Save Settings' })
   assert.deepEqual(saved, [
     {
       bridgeId: 'dev',
       name: 'Dev box',
-      orcaBot: 'VerissimaDev',
+      orcaBot: 'DevHelper',
       allowedUserIds: '',
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
@@ -363,7 +363,7 @@ test('Chats tab groups bindings under each bridge and resets on the right bridge
     .map((h) => h.text)
   assert.deepEqual(headings, ['CI', 'Dev'])
   assert.ok(view.find({ label: 'TG 222 -> Assistant' }))
-  assert.ok(view.find({ label: 'TG 111 -> BabyShark' }))
+  assert.ok(view.find({ label: 'TG 111 -> CIWatcher' }))
 
   await view.press({ testId: 'reset:dev:222' })
   assert.deepEqual(resets, [{ bridgeId: 'dev', tgChatId: '222' }])
