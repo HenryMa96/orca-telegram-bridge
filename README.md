@@ -37,6 +37,8 @@ Already using `henryma96.telegram-bridge`? Read [Moving from henryma96.telegram-
 
 The plugin key is `drecchia.telegram-bridge`. Orca uses the repository owner (`drecchia`) as the publisher.
 
+**On Linux, Orca's CLI is `orca-ide`.** Plain `orca` there is usually the GNOME screen reader. Replace `orca` with `orca-ide` in every command in this README. On Windows and macOS the command is `orca`.
+
 ### From this GitHub repository (recommended)
 
 Orca installs the newest `vX.Y.Z` tag of this repository and pins it to that exact commit:

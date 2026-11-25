@@ -48,7 +48,7 @@ For each release:
 
 ## 3. Local Validation & Checks
 
-Run all four Orca CLI checks from the repository root and confirm every command succeeds (exit code `0`):
+Run all four Orca CLI checks from the repository root and confirm every command succeeds (exit code `0`). On Linux, use `orca-ide` instead of `orca` here and in every command below (plain `orca` is usually the GNOME screen reader).
 
 ```sh
 orca plugin validate . --json
