@@ -751,7 +751,8 @@ export class TelegramBridgeController {
     if (!isAllowed(allowed, fromId, tgChatId)) {
       const firstInWindow = await this.recordBlockedUser(
         fromId,
-        `Blocked unauthorized Telegram user ${fromId} (${formatSenderLabel(msg)}).`
+        // In a group, also name the group: its ID is what the owner adds to allow the whole group.
+        `Blocked unauthorized Telegram user ${fromId} (${formatSenderLabel(msg)})${tgChatId !== fromId ? ` in group ${tgChatId}` : ''}.`
       )
       // The same window as the log line, so a stranger cannot make the bot spam a chat.
       const token = firstInWindow ? await this.readToken() : null
