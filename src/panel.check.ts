@@ -8,7 +8,8 @@ export default defineCheck({
       allowedUserIds: '',
       proxyUrl: '',
       replyTimeoutSec: 300,
-      syncOrcaOutbound: false
+      syncOrcaOutbound: false,
+      debugLogging: false
     }
   },
   configuredPaused: {
@@ -21,7 +22,8 @@ export default defineCheck({
       allowedUserIds: '123456789',
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
-      syncOrcaOutbound: true
+      syncOrcaOutbound: true,
+      debugLogging: true
     },
     storage: {
       'tg.bindings': [
@@ -34,6 +36,14 @@ export default defineCheck({
         }
       ],
       'tg.logs': [
+        {
+          id: 'log-2',
+          at: 1795400060000,
+          level: 'error',
+          scope: 'orca-cli',
+          message: 'Failed handling Telegram message in chat 123456789: orca exited with code 1',
+          details: 'OrcaCliError: orca exited with code 1\ncommand: orca bot chats --bot Assistant --json\nkind: exit\nexit code: 1\nduration: 412 ms\nstderr: bot not found'
+        },
         {
           id: 'log-1',
           at: 1795400000000,

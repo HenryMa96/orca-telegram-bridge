@@ -19,11 +19,17 @@ export type ChatBinding = {
   updatedAt: number
 }
 
+export type LogScope = 'bridge' | 'telegram' | 'orca-cli' | 'dispatch' | 'sync' | 'config'
+
 export type BridgeLogEntry = {
   id: string
   at: number
-  level: 'info' | 'warn' | 'error'
+  level: 'debug' | 'info' | 'warn' | 'error'
+  // Optional: entries stored by 0.2.0 have none.
+  scope?: LogScope
   message: string
+  // Multi-line, redacted, at most 3000 chars.
+  details?: string
 }
 
 export type BotSummary = {
@@ -41,6 +47,7 @@ export type BridgeConfig = {
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
+  debugLogging: boolean
 }
 
 export type BridgeState = {
@@ -54,7 +61,9 @@ export type BridgeState = {
   config: BridgeConfig
   bots: BotSummary[]
   bindings: ChatBinding[]
+  // The newest 40 stored entries, newest first; logTotal counts every stored entry.
   logs: BridgeLogEntry[]
+  logTotal: number
 }
 
 export type SaveConfigInput = {
@@ -76,6 +85,11 @@ export type TestConnectionResult = {
   state: BridgeState
 }
 
+export type ExportLogsResult = {
+  fileName: string
+  text: string
+}
+
 declare module 'orca' {
   interface PluginRequests {
     'bridge.getState': { output: BridgeState }
@@ -85,6 +99,8 @@ declare module 'orca' {
     'bridge.allowUserId': { input: { userId: string }; output: BridgeState }
     'bridge.resetBinding': { input: { tgChatId: string }; output: BridgeState }
     'bridge.clearLogs': { output: BridgeState }
+    'bridge.setDebugLogging': { input: { enabled: boolean }; output: BridgeState }
+    'bridge.exportLogs': { output: ExportLogsResult }
   }
   interface PluginPanelEvents {
     'bridge.stateChanged': BridgeState

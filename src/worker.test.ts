@@ -8,10 +8,12 @@ import {
   computeTailHashes,
   extractMessageItems,
   findUnsyncedTail,
+  OrcaCliError,
   type OrcaChatSummary,
   type OrcaCliRunner,
   type OrcaSessionRead
 } from './orca-bridge'
+import type { BridgeLogEntry, BridgeState, ExportLogsResult } from './protocol'
 import { extractTablesFromMarkdown } from './table-render'
 import {
   markdownToTelegramHtml,
@@ -1409,6 +1411,276 @@ test('settings reloads fired by saveConfig own writes do not roll the saved conf
     assert.equal(state.config.syncOrcaOutbound, true)
     assert.equal(state.status, 'stopped')
     assert.equal(state.polling, false)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+// A real-looking token: the redaction tests must not pass just because a fake token looks unusual.
+const REAL_TOKEN = '7251846039:AAH3kVx9QzLm2pR8sT4uW6yZ0bC1dE5fG7h'
+
+function loggingHost(
+  options: {
+    debugLogging?: boolean
+    storedLogs?: { id: string; at: number; level: string; message: string }[]
+  } = {}
+) {
+  return mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: REAL_TOKEN },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      syncOrcaOutbound: false,
+      debugLogging: options.debugLogging ?? false
+    },
+    ...(options.storedLogs ? { storage: { 'tg.logs': options.storedLogs } } : {})
+  })
+}
+
+// Activates through the real entry point so the panel handlers are wired; logs are written at once.
+async function mountBridge(host: MockHost, deps: ReturnType<typeof makeMockDeps>, extra: Partial<BridgeDeps> = {}) {
+  let controller!: TelegramBridgeController
+  const worker = await mountWorker(
+    {
+      default: async (orca: OrcaWorkerApi) => {
+        controller = await main.activateWithDeps(orca, {
+          telegram: deps.telegram,
+          orcaCli: deps.orcaCli,
+          pollIntervalMs: 0,
+          logFlushMs: 0,
+          ...extra
+        })
+      },
+      deactivate: main.deactivate
+    },
+    { host }
+  )
+  return { controller, worker }
+}
+
+function storedLogs(host: MockHost): BridgeLogEntry[] {
+  return host.data().storage['tg.logs'] as BridgeLogEntry[]
+}
+
+function failingSendCli() {
+  return makeMockDeps({
+    orcaCli: {
+      async sendToBot() {
+        throw new OrcaCliError('orchestration send failed', {
+          kind: 'exit',
+          args: ['orchestration', 'send', '--to', 'bot:Assistant', '--chat', 'new', '--body-file', '-', '--json'],
+          exitCode: 2,
+          stderr: 'Error: bot "Assistant" is not running',
+          durationMs: 41
+        })
+      }
+    }
+  })
+}
+
+test('a failing orca CLI call shows its args, exit code and stderr in the panel log', async () => {
+  const host = loggingHost()
+  const deps = failingSendCli()
+  const { controller, worker } = await mountBridge(host, deps)
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'Summarize my notes'))
+    const entry = controller.getState().logs.find((e) => e.level === 'error')
+    assert.ok(entry, 'an error entry is logged')
+    assert.equal(entry.scope, 'dispatch')
+    assert.match(entry.message, /Failed handling message for Assistant: orchestration send failed/)
+    assert.match(entry.details ?? '', /command: orca orchestration send --to bot:Assistant --chat new/)
+    assert.match(entry.details ?? '', /exit code: 2/)
+    assert.match(entry.details ?? '', /bot "Assistant" is not running/)
+    assert.match(entry.details ?? '', /tgChatId=777888/)
+    assert.match(entry.details ?? '', /bot=Assistant/)
+    assert.match(entry.details ?? '', /elapsedMs=\d+/)
+    // The user is still told it failed.
+    assert.match(deps.sentMessages.at(-1)?.text ?? '', /处理失败/)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('the bot token never reaches log messages, details, storage, orca.log or the export', async () => {
+  const host = loggingHost({ debugLogging: true })
+  const deps = makeMockDeps({
+    orcaCli: {
+      async sendToBot() {
+        throw new Error(
+          `request https://api.telegram.org/bot123:ABC-def_9/getMe failed; token=${REAL_TOKEN}; url=https://api.telegram.org/bot${REAL_TOKEN}/sendMessage`
+        )
+      }
+    }
+  })
+  const { controller, worker } = await mountBridge(host, deps)
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
+    const exported = await controller.exportLogs()
+    const surfaces = {
+      state: JSON.stringify(controller.getState().logs),
+      storage: JSON.stringify(storedLogs(host)),
+      orcaLog: worker.logs.join('\n'),
+      export: exported.text
+    }
+    for (const [name, text] of Object.entries(surfaces)) {
+      assert.ok(!text.includes(REAL_TOKEN), `${name} holds the token`)
+      assert.ok(!text.includes(REAL_TOKEN.split(':')[1]), `${name} holds the token secret`)
+      assert.ok(!text.includes('bot123:ABC'), `${name} holds a bot<id>:<secret> URL`)
+    }
+    assert.match(surfaces.state, /bot<redacted>/)
+    assert.match(surfaces.export, /bot<redacted>/)
+    const reply = deps.sentMessages.at(-1)?.text ?? ''
+    assert.match(reply, /^处理失败：/)
+    assert.ok(!reply.includes(REAL_TOKEN) && !reply.includes('bot123:ABC'), 'the Telegram reply holds the token')
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('debug entries are stored only while debug logging is on, and a dispatch then logs its timings', async () => {
+  const host = loggingHost()
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountBridge(host, deps)
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'first'))
+    assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
+    assert.ok(controller.getState().logs.every((e) => e.level !== 'debug'))
+    assert.ok(storedLogs(host).every((e) => e.level !== 'debug'))
+
+    const state = (await worker.request('bridge.setDebugLogging', { enabled: true })) as BridgeState
+    assert.equal(state.config.debugLogging, true)
+    assert.equal(host.data().settings.debugLogging, true)
+    assert.equal(state.logs[0].message, 'Debug logging enabled')
+
+    await controller.handleIncomingUpdate(textUpdate(2, 777888, 'second'))
+    assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #2 from Assistant')
+    const debug = controller.getState().logs.filter((e) => e.level === 'debug').map((e) => e.message)
+    assert.ok(
+      debug.some((m) => /^Dispatch start: bot Assistant, tg chat 777888, bound Orca chat tg-chat-2, body 6 chars/.test(m)),
+      `no dispatch start entry in ${JSON.stringify(debug)}`
+    )
+    assert.ok(
+      debug.some((m) => /^Dispatch finished in \d+ ms: Orca chat tg-chat-2, [1-9]\d* poll\(s\), state done/.test(m)),
+      `no dispatch finish entry in ${JSON.stringify(debug)}`
+    )
+    // The user's text itself is never logged, only its length.
+    assert.ok(!JSON.stringify(controller.getState().logs).includes('second'))
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a failing typing indicator on an image message is logged as debug and the reply still goes out', async () => {
+  const downloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-tg-bridge-test-'))
+  const host = loggingHost({ debugLogging: true })
+  const deps = makeMockDeps({
+    telegram: {
+      async sendChatAction() {
+        throw new TelegramApiError('Bad Request: chat not found', 400, false, undefined, 'sendChatAction')
+      }
+    }
+  })
+  const { controller, worker } = await mountBridge(host, deps, { downloadDir })
+  try {
+    await controller.handleIncomingUpdate({
+      update_id: 1,
+      message: {
+        message_id: 21,
+        from: { id: 777888, is_bot: false, first_name: 'Demo' },
+        chat: { id: 777888, type: 'private' },
+        date: 2000,
+        photo: [{ file_id: 'photo-lg', file_unique_id: 'lg', width: 1280, height: 720, file_size: 48000 }]
+      }
+    })
+    assert.equal(deps.sentToBots.length, 1)
+    assert.equal(deps.sentMessages.at(-1)?.text, 'Reply #1 from Assistant')
+    const entry = controller.getState().logs.find((e) => e.message === 'Typing indicator failed for chat 777888')
+    assert.ok(entry, 'the swallowed typing failure is recorded')
+    assert.equal(entry.level, 'debug')
+    assert.match(entry.details ?? '', /TelegramApiError: Bad Request: chat not found/)
+    assert.match(entry.details ?? '', /method: sendChatAction/)
+    assert.match(entry.details ?? '', /HTTP status: 400/)
+  } finally {
+    await worker.deactivate()
+    await fs.rm(downloadDir, { recursive: true, force: true })
+  }
+})
+
+test('exported logs carry the diagnostics header and every entry with its details', async () => {
+  const host = loggingHost()
+  const deps = failingSendCli()
+  const { controller, worker } = await mountBridge(host, deps)
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'Summarize my notes'))
+    const exported = (await worker.request('bridge.exportLogs')) as ExportLogsResult
+    assert.match(exported.fileName, /^telegram-bridge-logs-\d{8}-\d{6}\.txt$/)
+    const text = exported.text
+    assert.match(text, /^Telegram Bridge diagnostics$/m)
+    assert.match(text, /^Plugin: .+ (?:\d+\.\d+\.\d+|unknown)$/m)
+    assert.match(text, /^Platform: \S+ \S+$/m)
+    assert.match(text, /^Node: v\d+/m)
+    assert.match(text, /^Orca CLI: \S+/m)
+    assert.match(text, /^Status: stopped$/m)
+    assert.match(text, /^Config: .*"hasToken":true/m)
+    assert.match(text, /^Bindings: 1$/m)
+    assert.match(text, /^Log entries: \d+$/m)
+    assert.match(text, /Z ERROR \[dispatch\] Failed handling message for Assistant: orchestration send failed\n/)
+    assert.match(text, /\n {2}command: orca orchestration send --to bot:Assistant/)
+    assert.match(text, /\n {2}exit code: 2\n/)
+    assert.ok(!text.includes(REAL_TOKEN))
+    // Oldest first: the error comes after the earlier info entry about the incoming message.
+    assert.ok(text.indexOf('[TG ') < text.indexOf('ERROR [dispatch]'))
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('the panel state carries the newest 40 entries while storage keeps at most 200', async () => {
+  const old = Array.from({ length: 250 }, (_, i) => ({
+    id: `old-${i}`,
+    at: 1_000_000 - i,
+    level: 'info',
+    message: `old entry ${i}`
+  }))
+  const host = loggingHost({ storedLogs: old })
+  const { controller, worker } = await mountBridge(host, makeMockDeps())
+  try {
+    const state = await controller.allowUserId('5')
+    assert.equal(state.logs.length, 40)
+    assert.equal(state.logTotal, 200)
+    assert.equal(state.logs[0].message, 'Added Telegram user 5 to allowlist.')
+    assert.equal(storedLogs(host).length, 200)
+    const lastPost = worker.posts.filter((p) => p.event === 'bridge.stateChanged').at(-1)?.payload as BridgeState
+    assert.ok(lastPost.logs.length <= 40)
+    assert.equal((await controller.exportLogs()).text.match(/ \[(?:-|config)\] /g)?.length, 200)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('entries stored by 0.2.0 without a scope load into state and export', async () => {
+  const old = [
+    { id: 'b', at: Date.UTC(2026, 0, 2), level: 'error', message: 'old failure' },
+    { id: 'a', at: Date.UTC(2026, 0, 1), level: 'info', message: 'old entry one' }
+  ]
+  const host = loggingHost({ storedLogs: old })
+  const { controller, worker } = await mountBridge(host, makeMockDeps())
+  try {
+    const state = controller.getState()
+    assert.deepEqual(
+      state.logs.map((e) => [e.id, e.level, e.scope, e.message]),
+      [
+        ['b', 'error', undefined, 'old failure'],
+        ['a', 'info', undefined, 'old entry one']
+      ]
+    )
+    assert.equal(state.logTotal, 2)
+    const text = (await controller.exportLogs()).text
+    assert.match(text, /2026-01-01T00:00:00\.000Z INFO \[-\] old entry one\n2026-01-02T00:00:00\.000Z ERROR \[-\] old failure\n/)
   } finally {
     await worker.deactivate()
   }

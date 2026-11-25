@@ -144,16 +144,66 @@ function killProcessTree(child: ChildProcess): void {
   child.kill()
 }
 
+export type OrcaCliErrorKind = 'timeout' | 'aborted' | 'exit' | 'json' | 'spawn' | 'cli'
+
+const STDERR_FIELD_CHARS = 1500
+// Values of these flags are Telegram/Orca text (a message preview, a chat title), never logged.
+const TEXT_VALUE_FLAGS = new Set(['--subject', '--name'])
+
+function maskTextArgs(args: string[]): string[] {
+  return args.map((arg, i) =>
+    i > 0 && TEXT_VALUE_FLAGS.has(args[i - 1]) ? `<${arg.length} chars>` : arg
+  )
+}
+
+// What a failed `orca` call did. Only ids, lengths, codes and timings: `args` has text values
+// masked, the stdin body of `--body-file -` is never kept and stdout (bot/session content) only by size.
+export class OrcaCliError extends Error {
+  readonly kind: OrcaCliErrorKind
+  readonly args: string[]
+  readonly exitCode: number | null
+  readonly stderr: string
+  readonly stdoutBytes: number
+  readonly durationMs: number
+
+  constructor(
+    message: string,
+    fields: {
+      kind: OrcaCliErrorKind
+      args: string[]
+      durationMs: number
+      exitCode?: number | null
+      stderr?: string
+      stdoutBytes?: number
+      cause?: unknown
+    }
+  ) {
+    super(message, fields.cause === undefined ? undefined : { cause: fields.cause })
+    this.name = 'OrcaCliError'
+    this.kind = fields.kind
+    this.args = maskTextArgs(fields.args)
+    this.exitCode = fields.exitCode ?? null
+    this.stderr = (fields.stderr ?? '').slice(0, STDERR_FIELD_CHARS)
+    this.stdoutBytes = fields.stdoutBytes ?? 0
+    this.durationMs = fields.durationMs
+  }
+}
+
 export async function runOrcaJson<T>(
   args: string[],
   options: { stdinText?: string; timeoutMs?: number; signal?: AbortSignal } = {}
 ): Promise<T> {
   const bin = getOrcaBinary()
   const timeoutMs = options.timeoutMs ?? 30_000
+  const startedAt = Date.now()
+  const cliError = (
+    message: string,
+    fields: { kind: OrcaCliErrorKind; exitCode?: number | null; stderr?: string; stdoutBytes?: number; cause?: unknown }
+  ) => new OrcaCliError(message, { ...fields, args, durationMs: Date.now() - startedAt })
 
   return new Promise<T>((resolve, reject) => {
     if (options.signal?.aborted) {
-      reject(new Error('Orca CLI command aborted'))
+      reject(cliError('Orca CLI command aborted', { kind: 'aborted' }))
       return
     }
 
@@ -178,25 +228,27 @@ export async function runOrcaJson<T>(
 
     const onAbort = () => {
       killProcessTree(child)
-      finish(new Error('Orca CLI command aborted'))
+      finish(cliError('Orca CLI command aborted', { kind: 'aborted' }))
     }
 
     options.signal?.addEventListener('abort', onAbort, { once: true })
 
     const timer = setTimeout(() => {
       killProcessTree(child)
-      finish(new Error(`Orca CLI timed out after ${timeoutMs}ms: orca ${args.join(' ')}`))
+      finish(cliError(`Orca CLI timed out after ${timeoutMs}ms: orca ${maskTextArgs(args).join(' ')}`, { kind: 'timeout' }))
     }, timeoutMs)
 
     child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
     child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
-    child.on('error', (err) => finish(err))
+    child.on('error', (err) => finish(cliError(err.message, { kind: 'spawn', cause: err })))
     // A CLI that exits before reading all of stdin raises EPIPE/EOF here; the exit code reports the failure.
     child.stdin.on('error', () => {})
 
     child.on('close', (code) => {
-      const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim()
+      const stdoutBuf = Buffer.concat(stdoutChunks)
+      const stdout = stdoutBuf.toString('utf8').trim()
       const stderr = Buffer.concat(stderrChunks).toString('utf8').trim()
+      const stdoutBytes = stdoutBuf.length
 
       if (stdout) {
         try {
@@ -210,7 +262,7 @@ export async function runOrcaJson<T>(
             return
           }
           if (parsed.error?.message) {
-            finish(new Error(parsed.error.message))
+            finish(cliError(parsed.error.message, { kind: 'cli', exitCode: code, stderr, stdoutBytes }))
             return
           }
         } catch {
@@ -218,10 +270,20 @@ export async function runOrcaJson<T>(
         }
       }
 
+      // Stdout can hold bot or session content, so error messages report only its size.
       if (code === 0) {
-        finish(new Error(`Unexpected non-JSON output from orca ${args[0]}: ${stdout.slice(0, 200)}`))
+        finish(
+          cliError(`Unexpected non-JSON output from orca ${args[0]} (${stdoutBytes} bytes)`, {
+            kind: 'json',
+            exitCode: code,
+            stderr,
+            stdoutBytes
+          })
+        )
       } else {
-        finish(new Error(stderr || stdout || `orca exited with code ${code}`))
+        finish(
+          cliError(stderr || `orca exited with code ${code}`, { kind: 'exit', exitCode: code, stderr, stdoutBytes })
+        )
       }
     })
 

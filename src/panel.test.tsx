@@ -18,7 +18,8 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
       allowedUserIds: '123456',
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
-      syncOrcaOutbound: false
+      syncOrcaOutbound: false,
+      debugLogging: false
     },
     bots: [
       { id: 'bot-1', name: 'Assistant', specialty: 'Workspace assistant', agent: 'claude' }
@@ -33,8 +34,15 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
       }
     ],
     logs: [
-      { id: '1', at: Date.now(), level: 'info', message: 'Connected to Telegram as @demo_orca_bot.' }
+      {
+        id: '1',
+        at: Date.now(),
+        level: 'info',
+        scope: 'telegram',
+        message: 'Connected to Telegram as @demo_orca_bot.'
+      }
     ],
+    logTotal: 1,
     ...overrides
   }
 }
@@ -166,5 +174,155 @@ test('long log messages are truncated below the label limit', async () => {
   assert.ok(item)
   assert.deepEqual(view.warnings, [])
   assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('log level filter hides entries outside the chosen level', async () => {
+  const at = Date.now()
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () =>
+        makeState({
+          logTotal: 4,
+          logs: [
+            { id: 'e', at, level: 'error', scope: 'orca-cli', message: 'Orca CLI call failed' },
+            { id: 'w', at, level: 'warn', scope: 'telegram', message: 'Telegram answered slowly' },
+            { id: 'i', at, level: 'info', scope: 'bridge', message: 'Polling started' },
+            { id: 'd', at, level: 'debug', scope: 'dispatch', message: 'Dispatch finished in 12 ms' }
+          ]
+        })
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  assert.ok(view.find({ label: 'Polling started' }))
+  assert.ok(view.find({ text: 'Showing 4 of 4 entries' }))
+
+  await view.select({ label: 'Log level filter' }, 'errors')
+  assert.ok(view.find({ label: 'Orca CLI call failed' }))
+  assert.equal(view.find({ label: 'Telegram answered slowly' }), null)
+  assert.equal(view.find({ label: 'Polling started' }), null)
+  assert.equal(view.find({ label: 'Dispatch finished in 12 ms' }), null)
+  assert.ok(view.find({ text: 'Showing 1 of 4 entries' }))
+
+  await view.select({ label: 'Log level filter' }, 'warnings')
+  assert.ok(view.find({ label: 'Orca CLI call failed' }))
+  assert.ok(view.find({ label: 'Telegram answered slowly' }))
+  assert.equal(view.find({ label: 'Polling started' }), null)
+
+  await view.select({ label: 'Log level filter' }, 'debug')
+  assert.ok(view.find({ label: 'Dispatch finished in 12 ms' }))
+  assert.equal(view.find({ label: 'Orca CLI call failed' }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('an entry with details shows them after expanding, between plain entries', async () => {
+  const at = Date.now()
+  const details = 'OrcaCliError: orca exited with code 2\nargs: bot send --json\nexitCode: 2\nstderr: unknown bot'
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () =>
+        makeState({
+          logTotal: 3,
+          logs: [
+            { id: 'a', at, level: 'info', scope: 'dispatch', message: 'Reply sent' },
+            { id: 'b', at, level: 'error', scope: 'orca-cli', message: 'Orca CLI call failed', details },
+            { id: 'c', at, level: 'info', scope: 'bridge', message: 'Polling started' }
+          ]
+        })
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  assert.ok(view.find({ label: 'Reply sent' }))
+  assert.ok(view.find({ label: 'Polling started' }))
+  assert.equal(view.find({ type: 'CodeView' }), null)
+
+  const entry = view.find({ type: 'Collapsible', label: 'Orca CLI call failed' })
+  assert.ok(entry)
+  assert.match(String(entry!.props.description), /^ERROR · orca-cli · /)
+  await view.toggle(entry!)
+  const code = view.find({ type: 'CodeView' })
+  assert.ok(code)
+  assert.equal(code!.props.code, details)
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  await view.unmount()
+})
+
+test('export logs saves the worker text as a file and reports only a real save', async () => {
+  const exported = { fileName: 'telegram-bridge-logs-2026-11-25.txt', text: 'Telegram Bridge 0.2.0\n\n[error] boom' }
+  let exportCalls = 0
+  const host = mockHost({
+    results: { 'files.saveAs': { status: 'cancelled' } },
+    requests: {
+      'bridge.getState': () => makeState(),
+      'bridge.exportLogs': () => {
+        exportCalls += 1
+        return exported
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+
+  await view.press({ text: 'Export logs' })
+  assert.equal(exportCalls, 1)
+  assert.deepEqual(
+    host.calls.filter((c) => c.method === 'files.saveAs').map((c) => c.params),
+    [{ suggestedName: exported.fileName, mimeType: 'text/plain', data: exported.text }]
+  )
+  assert.equal(view.find({ text: 'Logs exported.' }), null)
+
+  host.respond('files.saveAs', { status: 'saved' })
+  await view.press({ text: 'Export logs' })
+  assert.equal(exportCalls, 2)
+  assert.ok(view.find({ text: 'Logs exported.' }))
+  assert.deepEqual(view.refusals, [])
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('debug logging switch asks the worker to turn debug logging on', async () => {
+  let current = makeState()
+  let sent: { enabled: boolean } | null = null
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => current,
+      'bridge.setDebugLogging': (input: { enabled: boolean }) => {
+        sent = input
+        current = makeState({ config: { ...current.config, debugLogging: input.enabled } })
+        return current
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  assert.equal(view.valueOf({ label: 'Debug logging' }), false)
+
+  await view.toggle({ label: 'Debug logging' })
+  assert.deepEqual(sent, { enabled: true })
+  assert.equal(view.valueOf({ label: 'Debug logging' }), true)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('entries stored by 0.2.0 without scope render as bridge entries', async () => {
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () =>
+        makeState({
+          logs: [{ id: 'old', at: Date.now(), level: 'warn', message: 'Telegram polling paused.' }]
+        })
+    }
+  })
+  const view = await mount(panel, { host })
+  await view.select({ label: 'Telegram Bridge sections' }, 'logs')
+  const item = view.find({ label: 'Telegram polling paused.' })
+  assert.ok(item)
+  assert.equal(item!.props.description, 'WARN · bridge')
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
   await view.unmount()
 })

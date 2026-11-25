@@ -5,8 +5,12 @@ import {
   Callout,
   Card,
   Code,
+  CodeView,
+  Collapsible,
   EmptyState,
+  files,
   Heading,
+  host,
   Input,
   List,
   ListItem,
@@ -23,12 +27,21 @@ import {
   Tabs,
   Text,
   type Atom,
+  type IconName,
   type PanelContext
 } from 'orca'
-import type { BridgeConnectionStatus, BridgeState, SaveConfigInput } from './protocol'
+import type {
+  BridgeConnectionStatus,
+  BridgeLogEntry,
+  BridgeState,
+  SaveConfigInput
+} from './protocol'
+
+type LogFilter = 'all' | 'errors' | 'warnings' | 'debug'
 
 const bridgeState = atom<BridgeState | null>(null)
 const activeTab = atom<'setup' | 'bindings' | 'logs'>('setup', 'setup', { persist: 'plugin' })
+const logFilter = atom<LogFilter>('logFilter', 'all', { persist: 'plugin' })
 
 const tokenDraft = atom('')
 const enabledDraft = atom(true)
@@ -46,6 +59,14 @@ const formDirty = atom(false)
 // Select option values must be non-empty; '' (auto) is stored as this sentinel in the draft.
 const AUTO_BOT = '__auto__'
 const MAX_LABEL = 500
+
+const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
+  { value: 'all', label: 'All levels' },
+  { value: 'errors', label: 'Errors' },
+  { value: 'warnings', label: 'Warnings and errors' },
+  { value: 'debug', label: 'Debug only' }
+]
+const EXPORT_UNAVAILABLE = 'Export needs the Orca desktop app'
 
 function clip(text: string): string {
   return text.length > MAX_LABEL ? `${text.slice(0, MAX_LABEL)}…` : text
@@ -201,6 +222,83 @@ async function clearLogs(): Promise<void> {
   }
 }
 
+async function setDebugLogging(enabled: boolean): Promise<void> {
+  try {
+    const next = await plugin.request('bridge.setDebugLogging', { enabled })
+    set(bridgeState, next)
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
+  }
+}
+
+// files.saveAs is desktop-only and needs the Export press's gesture, so nothing else is awaited
+// between the worker's answer and the save dialog.
+async function exportLogs(): Promise<void> {
+  if (!host.has('files.saveAs')) {
+    set(feedback, { tone: 'danger', text: EXPORT_UNAVAILABLE })
+    return
+  }
+  try {
+    const { fileName, text } = await plugin.request('bridge.exportLogs')
+    const res = await files.saveAs({ suggestedName: fileName, mimeType: 'text/plain', data: text })
+    if (res.status === 'saved') set(feedback, { tone: 'success', text: 'Logs exported.' })
+  } catch (err) {
+    set(feedback, { tone: 'danger', text: errorText(err) })
+  }
+}
+
+function matchesFilter(entry: BridgeLogEntry, filter: LogFilter): boolean {
+  switch (filter) {
+    case 'errors':
+      return entry.level === 'error'
+    case 'warnings':
+      return entry.level === 'error' || entry.level === 'warn'
+    case 'debug':
+      return entry.level === 'debug'
+    case 'all':
+      return true
+  }
+}
+
+function levelIcon(level: BridgeLogEntry['level']): IconName {
+  switch (level) {
+    case 'error':
+      return 'error'
+    case 'warn':
+      return 'warning'
+    case 'debug':
+      return 'bug'
+    case 'info':
+      return 'info'
+  }
+}
+
+// Entries stored by 0.2.0 have no scope; they all came from the bridge itself.
+function logMeta(entry: BridgeLogEntry): string {
+  return `${entry.level.toUpperCase()} · ${entry.scope ?? 'bridge'}`
+}
+
+function formatTime(at: number): string {
+  const d = new Date(at)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+// A List takes only ListItems, so runs of plain entries share a List and each entry with
+// details becomes its own Collapsible, keeping newest-first order.
+type LogBlock = BridgeLogEntry[] | { entry: BridgeLogEntry; details: string }
+
+function logBlocks(entries: BridgeLogEntry[]): LogBlock[] {
+  const blocks: LogBlock[] = []
+  for (const entry of entries) {
+    const last = blocks[blocks.length - 1]
+    if (entry.details) blocks.push({ entry, details: entry.details })
+    else if (Array.isArray(last)) last.push(entry)
+    else blocks.push([entry])
+  }
+  return blocks
+}
+
 export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(
     plugin.on('bridge.stateChanged', (next) => {
@@ -216,6 +314,7 @@ export default function Panel() {
   const tab = read(activeTab)
   const isBusy = read(busy)
   const notice = read(feedback)
+  const filter = read(logFilter)
 
   if (!state) {
     if (notice) {
@@ -236,6 +335,8 @@ export default function Panel() {
   }
 
   const badge = statusMeta(state.status)
+  const shownLogs = state.logs.filter((entry) => matchesFilter(entry, filter))
+  const canExport = host.has('files.saveAs')
   const botOptions = [
     { value: AUTO_BOT, label: '(Auto-select first Orca bot)' },
     ...state.bots
@@ -416,15 +517,38 @@ export default function Panel() {
           )}
         </Tab>
 
-        <Tab value="logs" label={`Logs (${state.logs.length})`}>
+        <Tab value="logs" label={`Logs (${state.logTotal})`}>
           <Stack gap="xs">
-            {state.logs.length > 0 && (
-              <Row justify="end">
+            <Row gap="sm" align="end" justify="between" wrap>
+              <Switch
+                label="Debug logging"
+                checked={state.config.debugLogging}
+                onChange={(v) => void setDebugLogging(v)}
+              />
+              <Select
+                label="Log level filter"
+                value={filter}
+                options={LOG_FILTERS}
+                onChange={(v) => set(logFilter, v as LogFilter)}
+              />
+            </Row>
+            <Row gap="xs" justify="end">
+              {state.logs.length > 0 && (
                 <Button size="xs" variant="ghost" onPress={clearLogs}>
                   Clear Logs
                 </Button>
-              </Row>
-            )}
+              )}
+              <Button
+                size="xs"
+                variant="outline"
+                icon="download"
+                disabled={!canExport}
+                tooltip={canExport ? undefined : EXPORT_UNAVAILABLE}
+                onPress={exportLogs}
+              >
+                Export logs
+              </Button>
+            </Row>
             {state.logs.length === 0 ? (
               <EmptyState
                 icon="info"
@@ -432,17 +556,47 @@ export default function Panel() {
                 description="Incoming Telegram messages and bridge events appear here."
               />
             ) : (
-              <List label="Bridge activity logs">
-                {state.logs.slice(0, 25).map((entry) => (
-                  <ListItem
-                    key={entry.id}
-                    icon={entry.level === 'error' ? 'error' : entry.level === 'warn' ? 'warning' : 'info'}
-                    title={clip(entry.message)}
-                  >
-                    <RelativeTime at={entry.at} muted />
-                  </ListItem>
-                ))}
-              </List>
+              <Stack gap="xs">
+                <Text muted size="xs">
+                  {`Showing ${shownLogs.length} of ${state.logTotal} entries`}
+                </Text>
+                {shownLogs.length === 0 ? (
+                  <EmptyState
+                    icon="filter"
+                    title="No entries match this filter"
+                    description={
+                      filter === 'debug' && !state.config.debugLogging
+                        ? 'Turn on Debug logging to record debug entries.'
+                        : 'Pick another level to see more entries.'
+                    }
+                  />
+                ) : (
+                  logBlocks(shownLogs).map((block) =>
+                    Array.isArray(block) ? (
+                      <List key={`list-${block[0].id}`} label="Bridge activity logs">
+                        {block.map((entry) => (
+                          <ListItem
+                            key={entry.id}
+                            icon={levelIcon(entry.level)}
+                            title={clip(entry.message)}
+                            description={logMeta(entry)}
+                          >
+                            <RelativeTime at={entry.at} muted />
+                          </ListItem>
+                        ))}
+                      </List>
+                    ) : (
+                      <Collapsible
+                        key={`log-${block.entry.id}`}
+                        title={clip(block.entry.message)}
+                        description={`${logMeta(block.entry)} · ${formatTime(block.entry.at)}`}
+                      >
+                        <CodeView code={block.details} label="Log details" wrap maxHeight="sm" />
+                      </Collapsible>
+                    )
+                  )
+                )}
+              </Stack>
             )}
           </Stack>
         </Tab>

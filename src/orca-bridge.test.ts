@@ -3,6 +3,7 @@ import {
   dispatchToOrcaBotAndWait,
   getOrcaBinary,
   isTelegramOriginatedUserMessage,
+  OrcaCliError,
   runOrcaJson,
   type OrcaChatSummary,
   type OrcaCliRunner,
@@ -248,4 +249,49 @@ test('runOrcaJson survives a CLI that exits without reading its stdin', { timeou
   )
   // Give a late pipe error the chance to surface as an uncaught exception inside this test.
   await new Promise((resolve) => setImmediate(resolve))
+})
+
+async function cliErrorOf(run: Promise<unknown>): Promise<OrcaCliError> {
+  try {
+    await run
+  } catch (err) {
+    if (err instanceof OrcaCliError) return err
+    throw err
+  }
+  throw new Error('runOrcaJson resolved; expected an OrcaCliError')
+}
+
+test('a CLI that exits non-zero rejects with its args, exit code and stderr', { timeout: 10_000 }, async () => {
+  const args = ['-e', "process.stderr.write('bot not found: Ghost'); process.exit(3)"]
+  const err = await withOrcaCli(process.execPath, () => cliErrorOf(runOrcaJson(args)))
+  assert.equal(err.kind, 'exit')
+  assert.equal(err.exitCode, 3)
+  assert.equal(err.stderr, 'bot not found: Ghost')
+  assert.equal(err.message, 'bot not found: Ghost')
+  assert.deepEqual(err.args, args)
+  assert.ok(err.durationMs >= 0)
+})
+
+test('non-JSON CLI output is reported by size, never by content', { timeout: 10_000 }, async () => {
+  const err = await withOrcaCli(process.execPath, () =>
+    cliErrorOf(runOrcaJson(['-e', "process.stdout.write('session secret text')"]))
+  )
+  assert.equal(err.kind, 'json')
+  assert.equal(err.exitCode, 0)
+  assert.equal(err.stdoutBytes, Buffer.byteLength('session secret text'))
+  assert.match(err.message, /non-JSON/)
+  assert.ok(!err.message.includes('session secret text'))
+})
+
+test('an already-aborted signal rejects with kind aborted and masks text arguments', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  const err = await cliErrorOf(
+    runOrcaJson(['orchestration', 'send', '--subject', 'Telegram: my private words', '--json'], {
+      signal: controller.signal
+    })
+  )
+  assert.equal(err.kind, 'aborted')
+  assert.equal(err.exitCode, null)
+  assert.deepEqual(err.args, ['orchestration', 'send', '--subject', '<26 chars>', '--json'])
 })

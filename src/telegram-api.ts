@@ -85,14 +85,25 @@ export class TelegramApiError extends Error {
   readonly retryable: boolean
   /** Seconds Telegram asks us to wait (`parameters.retry_after` on 429). */
   readonly retryAfterSec?: number
+  /** The Bot API method that failed (`downloadFile` for file downloads). */
+  method?: string
 
-  constructor(message: string, statusCode = 0, retryable = false, retryAfterSec?: number) {
+  constructor(message: string, statusCode = 0, retryable = false, retryAfterSec?: number, method?: string) {
     super(message)
     this.name = 'TelegramApiError'
     this.statusCode = statusCode
     this.retryable = retryable
     this.retryAfterSec = retryAfterSec
+    this.method = method
   }
+}
+
+// Errors raised deep in the transport (proxy, socket, timeout) do not know the method; tag them here.
+function withMethod<T>(method: string, request: Promise<T>): Promise<T> {
+  return request.catch((err: unknown) => {
+    if (err instanceof TelegramApiError && err.method === undefined) err.method = method
+    throw err
+  })
 }
 
 export type TelegramBotCommand = {
@@ -266,13 +277,16 @@ async function callTelegramApi<T>(
   options: TelegramRequestOptions = {}
 ): Promise<T> {
   const bodyText = payload ? JSON.stringify(payload) : undefined
-  return sendTelegramHttp<T>(
-    token,
+  return withMethod(
     method,
-    payload ? 'POST' : 'GET',
-    bodyText ? Buffer.from(bodyText, 'utf8') : undefined,
-    bodyText ? { 'Content-Type': 'application/json' } : undefined,
-    options
+    sendTelegramHttp<T>(
+      token,
+      method,
+      payload ? 'POST' : 'GET',
+      bodyText ? Buffer.from(bodyText, 'utf8') : undefined,
+      bodyText ? { 'Content-Type': 'application/json' } : undefined,
+      options
+    )
   )
 }
 
@@ -303,13 +317,16 @@ async function sendTelegramMultipart<T>(
   chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'))
   const body = Buffer.concat(chunks)
 
-  return sendTelegramHttp<T>(
-    token,
+  return withMethod(
     method,
-    'POST',
-    body,
-    { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-    options
+    sendTelegramHttp<T>(
+      token,
+      method,
+      'POST',
+      body,
+      { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      options
+    )
   )
 }
 
@@ -663,7 +680,7 @@ export function createTelegramClient(): TelegramClient {
       )
     },
     downloadFile(token, filePath, options) {
-      return downloadTelegramFileBytes(token, filePath, options)
+      return withMethod('downloadFile', downloadTelegramFileBytes(token, filePath, options))
     }
   }
 }
