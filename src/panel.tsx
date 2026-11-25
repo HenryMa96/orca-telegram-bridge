@@ -986,11 +986,16 @@ function assignmentRows(accessMode: AccessMode, idsError: string | null, knownNa
                 set(allowedIdsError, null)
               }}
             />
-            {name && (
-              <Text key={`name:${row.key}`} muted size="xs">
-                {name}
-              </Text>
-            )}
+            {/* A disabled field rather than loose text: every row gets the same width, so the role
+                selects line up whatever the name's length. */}
+            <Input
+              key={`name:${row.key}`}
+              label={`Telegram name ${i + 1}`}
+              labelHidden
+              value={name ?? ''}
+              placeholder="No name yet"
+              disabled
+            />
             <Select
               key={`role:${row.key}`}
               label={`Role for Telegram ID ${i + 1}`}
