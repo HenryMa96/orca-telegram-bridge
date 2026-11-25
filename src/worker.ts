@@ -2993,11 +2993,16 @@ export class BridgeRuntime {
   }
 
   // The language a chat last showed, kept so 'auto' still knows it after a restart, for a message
-  // without a Telegram language, and for what sync sends there unprompted.
+  // without a Telegram language, and for what sync sends there unprompted. Best effort: the update
+  // offset has already moved on, so a failed write must not drop the message.
   private async rememberChatLanguage(tgChatId: string, language: ReplyLanguage): Promise<void> {
     if (this.chatLanguages.get(tgChatId) === language) return
     this.chatLanguages.set(tgChatId, language)
-    await this.orca.storage.set(this.key('chatLanguages'), toPlainJson(Object.fromEntries(this.chatLanguages)))
+    try {
+      await this.orca.storage.set(this.key('chatLanguages'), toPlainJson(Object.fromEntries(this.chatLanguages)))
+    } catch (err) {
+      await this.appendLog('warn', 'bridge', `Could not store the language of Telegram chat ${tgChatId}`, describeError(err))
+    }
   }
 
   private async readToken(): Promise<string | null> {

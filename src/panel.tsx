@@ -342,10 +342,9 @@ async function saveConfig(bridge: BridgeView, orcaBot: string): Promise<void> {
       ...(cleanVoiceKey ? { voiceApiKey: cleanVoiceKey } : {})
     }
     const next = await plugin.request('bridge.saveConfig', payload)
-    set(tokenDraft, '')
-    set(voiceKeyDraft, '')
     set(bridgeState, next)
-    hydrateForm(next, true)
+    // Back to the card, whose summary shows what was saved; the note sits at the top, now in view.
+    closeEditor()
     set(feedback, { tone: 'success', text: 'Settings saved.' })
   } catch (err) {
     set(feedback, {
@@ -845,6 +844,12 @@ function bridgeEditor(bridge: BridgeView, botName: string, isBusy: boolean, conf
         </Collapsible>
 
         <Stack gap="xs">
+          {/* A failed save keeps the editor open; its reason belongs next to the button pressed. */}
+          {read(feedback)?.tone === 'danger' && (
+            <Text tone="danger" size="xs">
+              {clip(read(feedback)!.text)}
+            </Text>
+          )}
           {confirming && (
             <Text tone="danger" size="xs">
               Removing stops this bot and deletes its token, chats and settings.

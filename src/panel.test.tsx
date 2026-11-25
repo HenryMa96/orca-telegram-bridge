@@ -200,6 +200,7 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   assert.equal('enabled' in saved[0], false)
   assert.ok(view.find({ text: 'Settings saved.' }))
 
+  await openEditor(view, 'b1')
   await view.press({ text: 'Test connection' })
   assert.deepEqual(tested, [{ bridgeId: 'b1' }])
   assert.ok(view.find({ text: /Connected to @demo_orca_bot/ }))
@@ -657,10 +658,36 @@ test('the reply language select shows the saved language and saves the chosen on
   await view.select({ label: 'Telegram reply language' }, 'es')
   await view.press({ text: 'Save' })
   assert.equal(saved[0].replyLanguage, 'es')
+  // A save closes the editor; the card is back and the note is shown.
+  assert.equal(view.find({ label: 'Telegram reply language' }), null)
+  assert.equal(view.find({ text: 'Save' }), null)
+  assert.ok(view.findAll({ type: 'Callout' }).some((c) => c.props.title === 'Settings saved.'))
+
+  await openEditor(view, 'b1')
+  await openAdvanced(view)
   await view.select({ label: 'Telegram reply language' }, 'auto')
   await view.press({ text: 'Save' })
   assert.equal(saved[1].replyLanguage, 'auto')
   assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+// A failed save must stay where the user is looking: the editor stays open and says why by its buttons.
+test('a failed save keeps the editor open and shows the reason next to the buttons', async () => {
+  const state = makeState({ bridges: [makeBridge('b1')] })
+  const host = panelHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': () => {
+        throw new Error('This bot token is already used by the bridge "Other".')
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  await openEditor(view, 'b1')
+  await view.press({ text: 'Save' })
+  assert.ok(view.find({ text: 'Save' }), 'the editor is still open')
+  assert.ok(view.find({ type: 'Text', text: /already used by the bridge "Other"/ }))
   await view.unmount()
 })
 
@@ -718,6 +745,8 @@ test('Save sends the voice fields and the typed key, then clears the key field',
   assert.equal(saved[0].voiceProvider, 'openai')
   assert.equal(saved[0].voiceModel, 'whisper-1')
   assert.equal(saved[0].voiceApiKey, 'sk-secret')
+  // The saved key is never shown again: the reopened editor starts with an empty key field.
+  await openEditor(view, 'b1')
   assert.equal(view.valueOf({ label: 'Transcription API key' }), '')
   assert.deepEqual(view.errors, [])
   await view.unmount()
@@ -1263,6 +1292,8 @@ test('one group choice says what the bot reads and when it answers, and Save map
   assert.equal(saved[0].allowGroups, true)
   assert.equal(saved[0].groupMode, 'all')
   assert.equal(saved[0].groupReply, 'helpful')
+  // Reopened, the editor shows what was saved.
+  await openEditor(view, 'b1')
   assert.equal(view.valueOf(groups), 'all-helpful')
 
   await view.select(groups, 'off')
@@ -1273,6 +1304,7 @@ test('one group choice says what the bot reads and when it answers, and Save map
   assert.equal(saved[1].groupMode, 'all')
   assert.equal(saved[1].groupReply, 'helpful')
 
+  await openEditor(view, 'b1')
   await view.select(groups, 'all-mentioned')
   await view.press({ text: 'Save' })
   assert.deepEqual([saved[2].allowGroups, saved[2].groupMode, saved[2].groupReply], [true, 'all', 'mentioned'])
