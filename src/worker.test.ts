@@ -390,6 +390,46 @@ for (const scenario of ['no Orca bots found', 'Orca bots found'] as const) {
   })
 }
 
+// Orca's NO_REPLY: a bot answer that is only the marker says nothing, so Telegram gets no reply.
+test('a direct reply that is only NO_REPLY sends nothing to Telegram; words before it still go', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds: '555000111', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps()
+  let answer: string | null = null
+  const readSession = deps.orcaCli.readSession
+  deps.orcaCli.readSession = async (sessionId) => {
+    const session = await readSession(sessionId)
+    if (answer === null) return session
+    const said = answer
+    return {
+      ...session,
+      entries: session.entries.map((e) => (e.kind === 'message' && e.role === 'assistant' ? { ...e, text: said } : e))
+    }
+  }
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+  const repliesTo = (messageId: number) => deps.sentMessages.filter((m) => m.replyToMessageId === messageId)
+  try {
+    await within(controller.handleIncomingUpdate(textUpdate(1, 555000111, 'first')), 'normal reply')
+    assert.equal(repliesTo(101).at(-1)?.text, 'Reply #1 from Assistant')
+
+    answer = '**NO_REPLY.**'
+    await within(controller.handleIncomingUpdate(textUpdate(2, 555000111, 'second')), 'quiet reply')
+    assert.equal(deps.sentToBots.length, 2)
+    assert.deepEqual(repliesTo(102), [])
+    assert.equal(deps.sentMessages.some((m) => m.text.includes('NO_REPLY')), false)
+
+    answer = 'Nothing changed. NO_REPLY'
+    await within(controller.handleIncomingUpdate(textUpdate(3, 555000111, 'third')), 'words before the marker')
+    assert.equal(repliesTo(103).at(-1)?.text, 'Nothing changed.')
+  } finally {
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+})
+
 // Orca rejects a panel handler answer that is not plain JSON ("answered with a non-JSON value"), and
 // mockHost does not check answers, so this mirrors Orca's rule: the first non-JSON value's path, or null.
 function nonJsonPath(value: unknown, at = '$'): string | null {
