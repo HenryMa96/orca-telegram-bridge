@@ -1,6 +1,8 @@
 # Publishing Guide (Agent Runbook)
 
-This document is a self-contained checklist for preparing and publishing `orca-telegram-bridge` to a public GitHub repository so it can be automatically indexed by the **Orca Community Plugins** directory (`https://orca.dev/plugins`).
+This document is the checklist for releasing `orca-telegram-bridge` from `github.com/drecchia/orca-telegram-bridge` and for getting it listed in the **Orca Community Plugins** directory (`https://orca.dev/plugins`). For how users install the plugin, see [README.md → Install](./README.md#install).
+
+> **Listing blocker: this repository is a fork.** `drecchia/orca-telegram-bridge` is a GitHub fork of `HenryMa96/orca-telegram-bridge`. The directory leaves forks out (`https://orca.dev/plugins/add`, "What gets a plugin left out"). Until that changes, users install from GitHub (`orca plugin install drecchia/orca-telegram-bridge`), and the catalog id `drecchia.telegram-bridge` does not resolve. To get listed, the repository must stop being a fork: ask GitHub Support to detach it, or delete/rename this fork and push the code to a new, non-fork repository under `drecchia`. A new repository changes the install URL; existing GitHub installs must reinstall from it and approve again. The plugin key stays `drecchia.telegram-bridge` while the owner stays `drecchia`.
 
 > **Note on Official vs. Community Catalogs**
 > - `stablyai/orca-plugins` only accepts first-party plugins maintained by Stably (`CONTRIBUTING.md` explicitly rejects external PRs).
@@ -21,38 +23,24 @@ Before pushing to a public GitHub repository, verify:
 
 ---
 
-## 2. Manifest (`orca-plugin.json`) Updates for Public Release
+## 2. Manifest (`orca-plugin.json`)
 
-Current manifest already includes:
+The manifest already has everything the directory needs. Do not change these fields for a release:
 - `"manifestVersion": 2`
 - `"id": "telegram-bridge"`
+- `"publisher": "drecchia"`: the repository owner. The directory leaves out a plugin whose `publisher` differs from the owner. Orca installs under `<owner>.<id>` = `drecchia.telegram-bridge` either way.
+- `"repository"`, `"homepage"`: `https://github.com/drecchia/orca-telegram-bridge`
+- `"author"`: `{ "name": "drecchia", "url": "https://github.com/drecchia" }`
 - `"execution": "trusted-worker"`
 - `"engines": { "orca": ">=1.4.248" }`
 - `"license": "MIT"` (matching `./LICENSE`)
 - `"icon": "assets/icon.png"` (256×256 static PNG)
 - Minimal capabilities: `storage:own`, `secrets:own`, `settings:own`
 
-Before tagging on GitHub, update/add these fields in `orca-plugin.json`:
+For each release:
 
-1. **Repository & Homepage** (recommended):
-   ```json
-   "repository": "https://github.com/<owner>/<repo>",
-   "homepage": "https://github.com/<owner>/<repo>"
-   ```
-2. **Author** (optional):
-   ```json
-   "author": {
-     "name": "<owner>",
-     "url": "https://github.com/<owner>"
-   }
-   ```
-3. **Publisher** (check target rule):
-   - With `engines.orca >= 1.4.246`, Orca derives `publisher` from the GitHub repository owner if omitted.
-   - `https://orca.dev/plugins/add/` also mentions setting `"publisher"` to the GitHub repository owner; setting `"publisher": "<owner>"` (exact match, not starting with `orca-` / `stablyai`) satisfies both.
-4. **Version**:
-   - Confirm `"version"` (e.g. `"0.1.0"` or `"1.0.0"`) matches the Git tag `v<version>` you will push.
-   - Once indexed in `releases.lock.json`, a published version's commit and `contentHash` are immutable — always bump `version` for subsequent releases.
-5. **Optional Store Artwork**:
+1. **Version**: bump `"version"`. The Git tag must be `v<version>` (e.g. `"version": "1.2.3"` → tag `v1.2.3`). Once a version is listed, its commit and `contentHash` are permanent; a moved tag does not replace it. Always bump `version` for the next release.
+2. **Optional store artwork**:
    - `cover`: 16:10 image (recommended `1600x1000`, minimum `800x500`, max `1024 KB`, PNG/JPEG/WEBP, static) with `alt`.
    - `screenshots`: up to 6 images (minimum `1280x800`, max `1536 KB` each, static) with `alt`.
 
@@ -77,30 +65,27 @@ npx tsc -p . --noEmit
 
 ---
 
-## 4. Publish to GitHub
+## 4. Release on GitHub
 
-1. Create a **public**, non-fork, non-archived GitHub repository (e.g. `https://github.com/<owner>/orca-telegram-bridge`).
-2. Add the GitHub remote and push `main`:
+The repository is `https://github.com/drecchia/orca-telegram-bridge` (public, remote `origin`).
+
+1. Commit the version bump, then push `main`:
    ```sh
-   git remote add github https://github.com/<owner>/orca-telegram-bridge.git
-   git push -u github main
+   git push origin main
    ```
-3. Create and push an annotated version tag matching `version` in `orca-plugin.json`:
+2. Add the `orca-plugin` repository topic (needed for the directory to look at the repository at all):
    ```sh
-   git tag -a v0.1.0 -m v0.1.0
-   git push github v0.1.0
+   gh repo edit drecchia/orca-telegram-bridge --add-topic orca-plugin
    ```
-4. Add the `orca-plugin` repository topic:
+3. Create and push an annotated tag equal to `v` + `version` in `orca-plugin.json` (replace `X.Y.Z`):
    ```sh
-   gh repo edit <owner>/orca-telegram-bridge --add-topic orca-plugin
+   git tag -a vX.Y.Z -m vX.Y.Z
+   git push origin vX.Y.Z
    ```
-5. Check indexing status (typically updates within ~1 hour):
-   - Visit `https://orca.dev/plugins/<owner>/orca-telegram-bridge`
-   - Once indexed, users can install via:
-     ```sh
-     orca plugin install <owner>.telegram-bridge
-     ```
-     or directly from GitHub:
-     ```sh
-     orca plugin install <owner>/orca-telegram-bridge
-     ```
+   `orca plugin install drecchia/orca-telegram-bridge` (no version) now installs this tag, because Orca picks the newest `vX.Y.Z` tag.
+4. Test the install from the tag. If this folder is loaded as a development plugin, run `orca plugin dev unload .` first. A dev folder overrides an install with the same key.
+   ```sh
+   orca plugin install drecchia/orca-telegram-bridge@vX.Y.Z
+   ```
+   It stops with `approval_required` (exit code `3`). Check the listed access, publisher and repository, then run the printed `--approve <fingerprint>` command.
+5. Check the listing status (usually updates within an hour): `https://orca.dev/plugins/drecchia/orca-telegram-bridge`. While the repository is a fork, it stays unlisted (see the blocker at the top). Once listed, `orca plugin install drecchia.telegram-bridge` works too.

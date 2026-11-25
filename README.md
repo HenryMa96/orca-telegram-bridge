@@ -2,6 +2,8 @@
 
 An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegram bot directly to your local Orca bots for real-time two-way chat.
 
+Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-telegram-bridge).
+
 ## Features
 
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
@@ -23,30 +25,105 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects your Telegr
 
 ## Install
 
-Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-telegram-bridge).
+Two ways work today: from this GitHub repository (CLI or Orca Settings) and from a local clone. The Orca catalog way is not available yet.
 
-Once listed on [orca.dev/plugins](https://orca.dev/plugins), install directly:
+Already using `henryma96.telegram-bridge`? Read [Moving from henryma96.telegram-bridge](#moving-from-henryma96telegram-bridge) first.
 
-```sh
-orca plugin install drecchia.telegram-bridge
-```
+| Way | Use it when |
+| --- | --- |
+| [From this GitHub repository](#from-this-github-repository-recommended) | You want to use the plugin. This is the normal way today. |
+| [From the Orca catalog](#from-the-orca-catalog-not-available-yet) | Not available yet. This fork is not listed. |
+| [From a local clone](#from-a-local-clone-development) | You want to change the code. |
 
-or straight from this repository:
+The plugin key is `drecchia.telegram-bridge`. Orca uses the repository owner (`drecchia`) as the publisher.
+
+### From this GitHub repository (recommended)
+
+Orca installs the newest `vX.Y.Z` tag of this repository and pins it to that exact commit:
 
 ```sh
 orca plugin install drecchia/orca-telegram-bridge
 ```
 
+To install one exact version, add its tag (see the repository tags):
+
+```sh
+orca plugin install drecchia/orca-telegram-bridge@vX.Y.Z
+```
+
+**Approve the plugin.** This plugin runs code, so the first run stops with `approval_required` (exit code `3`). Nothing is installed yet. Orca prints:
+
+- what the plugin would be granted and why (its capabilities `storage:own`, `secrets:own`, `settings:own`, plus its panel and commands);
+- the publisher (`drecchia`) and the source repository (`github.com/drecchia/orca-telegram-bridge`), because the plugin does not come from Orca's official catalog;
+- the exact command to run again with `--approve <fingerprint>`.
+
+Check the list. If you trust it, run the printed command. It looks like this:
+
+```sh
+orca plugin install drecchia/orca-telegram-bridge --approve <fingerprint>
+```
+
+The fingerprint is bound to this plugin, version, files and access. Installing a different version by hand needs a new fingerprint. Updates that ask for no new access keep the approval (see [Update](#update)).
+
+Without the CLI: in Orca, open **Settings → Plugins**, choose **Add plugin**, then **From a Git URL…**. Paste `https://github.com/drecchia/orca-telegram-bridge#vX.Y.Z`, choose **Install**, review the access, then enable it.
+
+### From the Orca catalog (not available yet)
+
+When the plugin is listed on [orca.dev/plugins](https://orca.dev/plugins), you can install it by id:
+
+```sh
+orca plugin install drecchia.telegram-bridge
+```
+
+Today this does not work. This repository is a GitHub fork of [HenryMa96/orca-telegram-bridge](https://github.com/henryma96/orca-telegram-bridge), and the directory leaves forks out ([Add your plugin](https://orca.dev/plugins/add)). The current status is on [orca.dev/plugins/drecchia/orca-telegram-bridge](https://orca.dev/plugins/drecchia/orca-telegram-bridge). Use the GitHub install above. After listing, the approval step is the same. Existing GitHub installs keep updating from GitHub; you do not need to switch.
+
+### From a local clone (development)
+
+Load the working folder as a development plugin:
+
+```sh
+git clone https://github.com/drecchia/orca-telegram-bridge.git
+cd orca-telegram-bridge
+orca plugin dev load . --json
+```
+
+The first load also stops with `approval_required` (exit code `3`). Run it again with the printed fingerprint:
+
+```sh
+orca plugin dev load . --approve <fingerprint> --json
+```
+
+Orca reloads the plugin when its files change. Code edits run without a new approval. New access needs one. If Orca missed a change, reload by hand:
+
+```sh
+orca plugin dev reload . --json
+```
+
+To remove the development copy, run `orca plugin dev unload .`. For checks and releases, see [PUBLISHING.md](./PUBLISHING.md).
+
+### Update
+
+- GitHub install: run `orca plugin update drecchia.telegram-bridge`, or run the install command again with the new `@vX.Y.Z` tag. If the new version asks for more access, Orca stops with `approval_required` and keeps the running version. Run the printed `--approve <fingerprint>` command.
+- Local clone: `git pull`, then `orca plugin dev reload . --json`.
+
+### Moving from `henryma96.telegram-bridge`
+
+The upstream plugin has the key `henryma96.telegram-bridge`. This fork has a different key, so Orca treats it as a different plugin. The bot token, settings and stored data do not carry over.
+
+1. Remove the old plugin. If you installed it from GitHub or the catalog, run `orca plugin uninstall henryma96.telegram-bridge`. If you loaded a local folder (upstream's Setup step), run `orca plugin dev unload <that folder>`. Two copies that poll the same bot token conflict.
+2. Install this fork (see above).
+3. Do the [Setup](#setup) steps again.
+
 ## Setup
 
-1. Install or load the plugin in Orca:
-   ```sh
-   orca plugin dev load . --json
-   ```
-   Review the requested capabilities (`storage:own`, `secrets:own`, `settings:own`) and re-run with the printed `--approve <fingerprint>` flag.
-2. Open the **Telegram** sidebar panel in Orca.
-3. Paste your `@BotFather` token, choose a default Orca bot (or leave blank to auto-select the first bot), optionally set an HTTP proxy (e.g. `http://127.0.0.1:7890`), and click **Save Settings** -> **Test Connection**.
-4. Send a message to your Telegram bot, then click **Allow \<your ID\>** in the panel banner.
+Do these steps after the plugin is installed and approved.
+
+1. Open the **Telegram** sidebar panel in Orca.
+2. Paste your `@BotFather` bot token.
+3. Choose a default Orca bot, or keep **(Auto-select first Orca bot)**.
+4. Optional: set an HTTP proxy (e.g. `http://127.0.0.1:7890`).
+5. Click **Save Settings**, then **Test Connection**.
+6. Send a message to your Telegram bot. Then click **Allow \<your ID\>** in the panel banner.
 
 ## Telegram Commands
 
@@ -65,36 +142,16 @@ orca plugin install drecchia/orca-telegram-bridge
 | `/run <id>` | Trigger an Orca automation immediately |
 | `/status` | Show Telegram bot, target Orca bot, session, sync, and polling status |
 
-## Develop & Validate
+## Debugging
 
-```sh
-orca plugin validate . --json
-orca plugin test . --json
-orca plugin check . --json
-orca plugin release-entry . --json
-orca plugin dev reload . --json
-```
+- The **Logs** tab lists the newest 40 of up to 200 stored entries. Filter by level (all, errors, warnings and errors, debug only). Entries with details expand to show the error context: Orca CLI args, exit code and stderr; Telegram method, HTTP status and description; chat ids, timings and the top of the stack.
+- Turn on **Debug logging** in the Logs tab (or the `debugLogging` setting, off by default) to also record `debug` entries: Telegram and Orca CLI calls with timings, dispatch start/finish, sync ticks that forward something, config changes (field names only), poll loop start/stop/backoff and errors that were ignored before. Turn it off again when done; errors and warnings keep their details either way.
+- Every message and detail is redacted: the bot token and any `bot<digits>:<secret>` pattern become `bot<redacted>`. Message text from users and bots is never logged, only lengths and ids.
+- For a bug report, click **Export logs**. It saves a text file with a diagnostics header (plugin version, platform, Node version, resolved `orca` CLI path, status, config without the token, bot and binding counts) and every stored entry with its details.
 
-## Publishing to Orca Community Plugins
+## Develop & Release
 
-See [PUBLISHING.md](./PUBLISHING.md) for the full pre-publish audit and step-by-step release runbook.
-
-When ready to publish to a public GitHub repository for automatic indexing on `orca.dev/plugins`:
-
-1. Ensure `LICENSE` (MIT) and `orca-plugin.json` (`"license": "MIT"`) are present, and optionally add `"repository"`, `"homepage"`, `"author"`, and `"publisher"` (set to your GitHub owner name) in `orca-plugin.json`.
-2. Run all local checks and confirm exit code `0`:
-   ```sh
-   orca plugin validate . --json
-   orca plugin test . --json
-   orca plugin check . --json
-   ```
-3. Push to a public, non-fork GitHub repository, tag the release matching `version` in `orca-plugin.json`, and add the `orca-plugin` topic:
-   ```sh
-   git tag -a v0.1.0 -m v0.1.0
-   git push origin v0.1.0
-   gh repo edit <owner>/orca-telegram-bridge --add-topic orca-plugin
-   ```
-4. Check listing status at `https://orca.dev/plugins/<owner>/orca-telegram-bridge`.
+To work on the code, use the [local clone install](#from-a-local-clone-development). [PUBLISHING.md](./PUBLISHING.md) is the full runbook: the pre-release audit, the checks (`orca plugin validate`, `test`, `check`, `release-entry`), tagging a `vX.Y.Z` release, and the catalog listing status.
 
 ## License
 
