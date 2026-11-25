@@ -179,12 +179,27 @@ export interface TelegramClient {
     },
     options?: TelegramRequestOptions
   ): Promise<boolean>
+  // `photo` bytes are uploaded; a string is an https URL that Telegram downloads itself.
   sendPhoto(
     token: string,
     params: {
       chatId: number | string
-      photo: Buffer
+      photo: Buffer | string
       filename?: string
+      contentType?: string
+      caption?: string
+      replyToMessageId?: number
+    },
+    options?: TelegramRequestOptions
+  ): Promise<TelegramMessage>
+  // `document` bytes are uploaded; a string is an https URL that Telegram downloads itself.
+  sendDocument(
+    token: string,
+    params: {
+      chatId: number | string
+      document: Buffer | string
+      filename?: string
+      contentType?: string
       caption?: string
       replyToMessageId?: number
     },
@@ -374,7 +389,7 @@ async function sendTelegramMultipart<T>(
   }
   chunks.push(
     Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType}\r\n\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename.replace(/["\\\r\n]/g, '_')}"\r\nContent-Type: ${file.contentType}\r\n\r\n`,
       'utf8'
     )
   )
@@ -641,6 +656,51 @@ async function retryOnceAfterFloodWait<T>(send: () => Promise<T>, signal?: Abort
   }
 }
 
+// Uploads bytes as multipart, or passes a URL string for Telegram to download.
+function sendTelegramFile(
+  token: string,
+  method: 'sendPhoto' | 'sendDocument',
+  field: 'photo' | 'document',
+  file: Buffer | string,
+  params: {
+    chatId: number | string
+    filename: string
+    contentType: string
+    caption?: string
+    replyToMessageId?: number
+  },
+  options: TelegramRequestOptions
+): Promise<TelegramMessage> {
+  // Still deliver the reply when the user deleted the message it answers.
+  const replyParameters =
+    params.replyToMessageId === undefined
+      ? undefined
+      : { message_id: params.replyToMessageId, allow_sending_without_reply: true }
+  if (typeof file === 'string') {
+    const body: Record<string, unknown> = { chat_id: params.chatId, [field]: file }
+    if (params.caption) body.caption = params.caption
+    if (replyParameters) body.reply_parameters = replyParameters
+    return retryOnceAfterFloodWait(
+      () => callTelegramApi<TelegramMessage>(token, method, body, options),
+      options.signal
+    )
+  }
+  const fields: Record<string, string> = { chat_id: String(params.chatId) }
+  if (params.caption) fields.caption = params.caption
+  if (replyParameters) fields.reply_parameters = JSON.stringify(replyParameters)
+  return retryOnceAfterFloodWait(
+    () =>
+      sendTelegramMultipart<TelegramMessage>(
+        token,
+        method,
+        fields,
+        { field, filename: params.filename, contentType: params.contentType, data: file },
+        options
+      ),
+    options.signal
+  )
+}
+
 export function createTelegramClient(): TelegramClient {
   return {
     getMe(token, options) {
@@ -702,31 +762,35 @@ export function createTelegramClient(): TelegramClient {
       return callTelegramApi<boolean>(token, 'answerCallbackQuery', body, options)
     },
     sendPhoto(token, params, options) {
-      const fields: Record<string, string> = {
-        chat_id: String(params.chatId)
-      }
-      if (params.caption) fields.caption = params.caption
-      if (params.replyToMessageId !== undefined) {
-        fields.reply_parameters = JSON.stringify({
-          message_id: params.replyToMessageId,
-          allow_sending_without_reply: true
-        })
-      }
-      return retryOnceAfterFloodWait(
-        () =>
-          sendTelegramMultipart<TelegramMessage>(
-            token,
-            'sendPhoto',
-            fields,
-            {
-              field: 'photo',
-              filename: params.filename || 'table.png',
-              contentType: 'image/png',
-              data: params.photo
-            },
-            { ...options, timeoutMs: options?.timeoutMs ?? 25_000 }
-          ),
-        options?.signal
+      return sendTelegramFile(
+        token,
+        'sendPhoto',
+        'photo',
+        params.photo,
+        {
+          chatId: params.chatId,
+          filename: params.filename || 'table.png',
+          contentType: params.contentType || 'image/png',
+          caption: params.caption,
+          replyToMessageId: params.replyToMessageId
+        },
+        { ...options, timeoutMs: options?.timeoutMs ?? 25_000 }
+      )
+    },
+    sendDocument(token, params, options) {
+      return sendTelegramFile(
+        token,
+        'sendDocument',
+        'document',
+        params.document,
+        {
+          chatId: params.chatId,
+          filename: params.filename || 'file',
+          contentType: params.contentType || 'application/octet-stream',
+          caption: params.caption,
+          replyToMessageId: params.replyToMessageId
+        },
+        { ...options, timeoutMs: options?.timeoutMs ?? 120_000 }
       )
     },
     sendChatAction(token, params, options) {

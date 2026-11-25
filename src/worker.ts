@@ -16,6 +16,12 @@ import {
   type OrcaCliRunner,
   type OrcaMessageItem
 } from './orca-bridge'
+import {
+  extractAttachments,
+  loadLocalAttachment,
+  type AttachmentProblem,
+  type OutboundAttachment
+} from './outbound-media'
 import type {
   BotSummary,
   BridgeConfig,
@@ -477,8 +483,14 @@ function traceTelegram(client: TelegramClient, tracer: Tracer): TelegramClient {
       trace('answerCallbackQuery', () => client.answerCallbackQuery(token, params, options)),
     sendPhoto: (token, params, options) =>
       trace(
-        `sendPhoto chat=${params.chatId} ${params.photo.length} bytes`,
+        `sendPhoto chat=${params.chatId} ${typeof params.photo === 'string' ? 'by URL' : `${params.photo.length} bytes`}`,
         () => client.sendPhoto(token, params, options),
+        (sent) => `message ${sent.message_id}`
+      ),
+    sendDocument: (token, params, options) =>
+      trace(
+        `sendDocument chat=${params.chatId} ${typeof params.document === 'string' ? 'by URL' : `${params.document.length} bytes`}`,
+        () => client.sendDocument(token, params, options),
         (sent) => `message ${sent.message_id}`
       ),
     sendChatAction: (token, params, options) =>
@@ -1293,7 +1305,7 @@ export class BridgeRuntime {
         'dispatch',
         `[${binding.botName} -> TG ${tgChatId}] Sent ${delivery.messageCount} message(s)${
           delivery.imageCount > 0 ? ` + ${delivery.imageCount} table image(s)` : ''
-        }.`
+        }${delivery.attachmentCount > 0 ? ` + ${delivery.attachmentCount} attachment(s)` : ''}.`
       )
       this.emitState()
     } catch (err) {
@@ -1544,15 +1556,17 @@ export class BridgeRuntime {
     }
   }
 
+  // Text first, then table images, then the files and URLs the reply attached with `![caption](target)`.
   private async sendFormattedReplyToTelegram(
     token: string,
     chatId: number | string,
     rawMarkdown: string,
     replyToMessageId?: number
-  ): Promise<{ messageCount: number; imageCount: number }> {
+  ): Promise<{ messageCount: number; imageCount: number; attachmentCount: number }> {
     const renderTable = this.deps.renderTable ?? renderTableToPng
     const i18n = this.i18n
-    const { textWithMarkers, tables } = extractTablesFromMarkdown(rawMarkdown, i18n.tableMarker)
+    const { text, attachments } = extractAttachments(rawMarkdown)
+    const { textWithMarkers, tables } = extractTablesFromMarkdown(text, i18n.tableMarker)
     const renderedImages: { index: number; png: Buffer }[] = []
 
     for (let i = 0; i < tables.length; i++) {
@@ -1566,9 +1580,10 @@ export class BridgeRuntime {
     const finalText =
       renderedImages.length === tables.length && renderedImages.length > 0
         ? textWithMarkers
-        : rawMarkdown
+        : text
 
-    const chunks = splitTelegramMessage(finalText, 3500)
+    // A reply that is only attachments sends no "(empty reply)" text.
+    const chunks = attachments.length > 0 && !finalText.trim() ? [] : splitTelegramMessage(finalText, 3500)
     for (let i = 0; i < chunks.length; i++) {
       await this.safeSendTelegram(
         token,
@@ -1593,7 +1608,147 @@ export class BridgeRuntime {
       }
     }
 
-    return { messageCount: chunks.length, imageCount }
+    // Without text, the first message that goes out answers the user's message.
+    let replyTo = chunks.length === 0 ? replyToMessageId : undefined
+    let attachmentCount = 0
+    const failures: string[] = []
+    // An open bridge answers anyone, so files from this computer go out only once it is restricted.
+    const localFilesAllowed = parseAllowedIds(this.config.allowedUserIds).size > 0
+    const heldBack: string[] = []
+    for (const attachment of attachments) {
+      if (attachment.target.kind === 'file' && !localFilesAllowed) {
+        heldBack.push(attachment.target.path)
+        continue
+      }
+      const failure = await this.sendOutboundAttachment(token, chatId, attachment, replyTo)
+      if (failure) {
+        failures.push(failure)
+      } else {
+        attachmentCount++
+        replyTo = undefined
+      }
+    }
+    if (heldBack.length > 0) {
+      failures.push(i18n.attachmentNeedsAllowlist)
+      await this.appendLog(
+        'warn',
+        'telegram',
+        `${heldBack.length} local file attachment(s) for chat ${chatId} not sent: the allowlist is empty, so the bridge is open to everyone`,
+        heldBack.map((p) => `path=${p}`).join('\n')
+      )
+    }
+    if (failures.length > 0) {
+      await this.safeSendTelegramChunks(token, chatId, failures.join('\n'), replyTo)
+    }
+
+    return {
+      messageCount: chunks.length + (failures.length > 0 ? 1 : 0),
+      imageCount,
+      attachmentCount
+    }
+  }
+
+  // Sends one attachment from a bot reply. Returns the line telling the Telegram user why it was
+  // not sent (file name only; logs carry the full path), or null once Telegram took it.
+  private async sendOutboundAttachment(
+    token: string,
+    chatId: number | string,
+    attachment: OutboundAttachment,
+    replyToMessageId: number | undefined
+  ): Promise<string | null> {
+    const i18n = this.i18n
+    const { target, name } = attachment
+    const caption = attachment.caption || undefined
+    let upload: {
+      method: 'photo' | 'document'
+      file: Buffer | string
+      filename?: string
+      contentType?: string
+    }
+    // Logged in place of the file: the path, or the URL without its query (it may hold a key).
+    let source: string
+    if (target.kind === 'url') {
+      const url = new URL(target.url)
+      source = `${url.origin}${url.pathname}`
+      upload = { method: target.image ? 'photo' : 'document', file: target.url }
+    } else {
+      source = target.path
+      const loaded = await loadLocalAttachment(target.path)
+      if (!loaded.ok) {
+        const reasons: Record<AttachmentProblem, string> = {
+          missing: i18n.attachmentMissing,
+          unreadable: i18n.attachmentUnreadable,
+          too_large: i18n.attachmentTooLarge,
+          not_allowed: i18n.attachmentNotAllowed,
+          not_image: i18n.attachmentNotImage
+        }
+        await this.appendLog(
+          'warn',
+          'telegram',
+          `Attachment ${name} for chat ${chatId} not sent: ${loaded.problem}`,
+          [`path=${target.path}`, ...(loaded.realPath ? [`realPath=${loaded.realPath}`] : [])].join('\n')
+        )
+        return i18n.attachmentFailed(name, reasons[loaded.problem])
+      }
+      const { file } = loaded
+      upload = { method: file.method, file: file.data, filename: file.filename, contentType: file.contentType }
+    }
+
+    const options = {
+      proxyUrl: this.config.proxyUrl,
+      timeoutMs: typeof upload.file === 'string' ? 60_000 : 120_000
+    }
+    const sendDocument = () =>
+      this.deps.telegram.sendDocument(
+        token,
+        {
+          chatId,
+          document: upload.file,
+          filename: upload.filename,
+          contentType: upload.contentType,
+          caption,
+          replyToMessageId
+        },
+        options
+      )
+    try {
+      if (upload.method === 'document') {
+        await sendDocument()
+        return null
+      }
+      try {
+        await this.deps.telegram.sendPhoto(
+          token,
+          { chatId, photo: upload.file, filename: upload.filename, contentType: upload.contentType, caption, replyToMessageId },
+          options
+        )
+      } catch (err) {
+        // Telegram refuses photos it cannot process (dimensions, size, URL content); as a
+        // document the same file goes through unchanged.
+        if (!(err instanceof TelegramApiError) || (err.statusCode !== 400 && err.statusCode !== 413)) throw err
+        await this.appendLog(
+          'debug',
+          'telegram',
+          `Telegram refused ${name} as a photo; sending it as a document`,
+          describeError(err, { tgChatId: chatId, path: source })
+        )
+        await sendDocument()
+      }
+      return null
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await this.appendLog(
+        'warn',
+        'telegram',
+        `Sending attachment ${name} to chat ${chatId} failed: ${message}`,
+        describeError(err, {
+          tgChatId: chatId,
+          path: source,
+          bytes: typeof upload.file === 'string' ? undefined : upload.file.length
+        })
+      )
+      return i18n.attachmentFailed(name, i18n.attachmentRejected)
+    }
   }
 
   private async handleSlashCommand(

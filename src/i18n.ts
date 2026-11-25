@@ -48,6 +48,15 @@ export type Messages = {
   // Short reasons for voiceFailed.
   voiceTooLarge: string
   voiceEmpty: string
+  // One line per file or URL from a bot reply that could not be sent; the reasons below fill it.
+  attachmentFailed: (name: string, reason: string) => string
+  attachmentMissing: string
+  attachmentUnreadable: string
+  attachmentTooLarge: string
+  attachmentNotAllowed: string
+  attachmentNotImage: string
+  attachmentRejected: string
+  attachmentNeedsAllowlist: string
   actionFailed: (detail: string) => string
   noBotsAvailable: string
   shortenedNote: string
@@ -122,6 +131,14 @@ const en: Messages = {
   voiceFailed: (reason) => `Could not transcribe the voice message: ${reason}`,
   voiceTooLarge: 'the file is larger than 20 MB',
   voiceEmpty: 'no speech was recognized',
+  attachmentFailed: (name, reason) => `Could not attach ${name}: ${reason}`,
+  attachmentMissing: 'the file was not found',
+  attachmentUnreadable: 'the file could not be read',
+  attachmentTooLarge: 'the file is larger than 50 MB',
+  attachmentNotAllowed: 'this file type or folder is not allowed',
+  attachmentNotImage: 'the file is not a valid image',
+  attachmentRejected: 'Telegram did not accept it',
+  attachmentNeedsAllowlist: 'Files from this computer are only sent when the bot is restricted to Allowed Telegram IDs.',
   actionFailed: (detail) => `Action failed: ${detail}`,
   noBotsAvailable: 'No Orca bot found. Create at least one bot in Orca first.',
   shortenedNote: '(The reply was too long and was shortened. Open Orca to see the full text.)',
@@ -222,6 +239,15 @@ const ptBR: Messages = {
   voiceFailed: (reason) => `Não foi possível transcrever a mensagem de voz: ${reason}`,
   voiceTooLarge: 'o arquivo passa de 20 MB',
   voiceEmpty: 'nenhuma fala foi reconhecida',
+  attachmentFailed: (name, reason) => `Não foi possível anexar ${name}: ${reason}`,
+  attachmentMissing: 'o arquivo não foi encontrado',
+  attachmentUnreadable: 'o arquivo não pôde ser lido',
+  attachmentTooLarge: 'o arquivo passa de 50 MB',
+  attachmentNotAllowed: 'este tipo de arquivo ou pasta não é permitido',
+  attachmentNotImage: 'o arquivo não é uma imagem válida',
+  attachmentRejected: 'o Telegram não o aceitou',
+  attachmentNeedsAllowlist:
+    'Arquivos deste computador só são enviados quando o bot está restrito aos IDs do Telegram permitidos.',
   actionFailed: (detail) => `Falha na ação: ${detail}`,
   noBotsAvailable: 'Nenhum bot do Orca encontrado. Crie pelo menos um bot no Orca primeiro.',
   shortenedNote: '(A resposta era longa demais e foi encurtada. Abra o Orca para ver o texto completo.)',
@@ -321,6 +347,14 @@ const zhCN: Messages = {
   voiceFailed: (reason) => `语音消息转写失败：${reason}`,
   voiceTooLarge: '文件超过 20 MB',
   voiceEmpty: '未识别到语音内容',
+  attachmentFailed: (name, reason) => `无法附加 ${name}：${reason}`,
+  attachmentMissing: '找不到该文件',
+  attachmentUnreadable: '无法读取该文件',
+  attachmentTooLarge: '文件超过 50 MB',
+  attachmentNotAllowed: '不允许发送此类型或此文件夹中的文件',
+  attachmentNotImage: '该文件不是有效的图片',
+  attachmentRejected: 'Telegram 未接受该文件',
+  attachmentNeedsAllowlist: '仅当机器人限定为允许的 Telegram ID 时，才会发送这台电脑上的文件。',
   actionFailed: (detail) => `操作失败：${detail}`,
   noBotsAvailable: '当前未检测到可用的 Orca Bot，请先在 Orca 中创建至少一个 Bot。',
   shortenedNote: '（回复过长已截断，请在 Orca 中查看完整内容）',

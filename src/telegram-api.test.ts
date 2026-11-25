@@ -171,3 +171,61 @@ test('splitTelegramMessage never splits an emoji into lone surrogates', () => {
   }
   assert.equal(chunks.join(''), text)
 })
+
+const OK_MESSAGE = JSON.stringify({ ok: true, result: { message_id: 9, date: 1, chat: { id: 5, type: 'private' } } })
+
+test('sendDocument uploads the bytes as the "document" field with their name, type and caption', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(OK_MESSAGE)
+    },
+    async (proxyUrl) => {
+      await client.sendDocument(
+        TOKEN,
+        {
+          chatId: 5,
+          document: Buffer.from('a,b\n1,2\n'),
+          filename: 'data "q3".csv',
+          contentType: 'text/csv',
+          caption: 'Data',
+          replyToMessageId: 42
+        },
+        { proxyUrl }
+      )
+    }
+  )
+  const [req] = requests
+  assert.match(req.path, /\/sendDocument$/)
+  // A quote in the name must not end the header value early.
+  assert.ok(req.body.includes('name="document"; filename="data _q3_.csv"\r\nContent-Type: text/csv\r\n\r\na,b\n1,2\n'), req.body)
+  assert.ok(req.body.includes('name="caption"\r\n\r\nData\r\n'), req.body)
+  assert.ok(req.body.includes('"allow_sending_without_reply":true'), req.body)
+})
+
+test('sendPhoto uploads with the given content type and sends a URL string as JSON for Telegram to fetch', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(OK_MESSAGE)
+    },
+    async (proxyUrl) => {
+      await client.sendPhoto(
+        TOKEN,
+        { chatId: 5, photo: Buffer.from([0xff, 0xd8, 0xff]), filename: 'shot.jpg', contentType: 'image/jpeg' },
+        { proxyUrl }
+      )
+      await client.sendPhoto(TOKEN, { chatId: 5, photo: 'https://example.com/logo.png', caption: 'Logo' }, { proxyUrl })
+      await client.sendDocument(TOKEN, { chatId: 5, document: 'https://example.com/q3.xlsx' }, { proxyUrl })
+    }
+  )
+  const [upload, photoByUrl, documentByUrl] = requests
+  assert.ok(upload.body.includes('filename="shot.jpg"\r\nContent-Type: image/jpeg\r\n'), upload.body)
+  assert.deepEqual(JSON.parse(photoByUrl.body), { chat_id: 5, photo: 'https://example.com/logo.png', caption: 'Logo' })
+  assert.match(documentByUrl.path, /\/sendDocument$/)
+  assert.deepEqual(JSON.parse(documentByUrl.body), { chat_id: 5, document: 'https://example.com/q3.xlsx' })
+})

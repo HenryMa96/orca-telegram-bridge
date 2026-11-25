@@ -684,7 +684,8 @@ export async function dispatchToOrcaBotAndWait(
     // Not "owner": with open access and groups the sender can be anyone, and the Orca bot must not
     // give them the owner's trust.
     `Telegram message from user (${params.senderLabel}, chat ${params.tgChatId}) ${requestMarker}.`,
-    'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).'
+    'Reply directly in this chat; your final message will be sent back to Telegram (use standard Markdown tables; avoid wide ASCII box tables).',
+    'To send an image or file to the Telegram user, put it on its own line as Markdown ![short caption](absolute local path or https URL); wrap a path with spaces in <>. Images: PNG, JPEG, GIF, WEBP (up to 10 MB). Documents: PDF, CSV, TSV, TXT, MD and Office/OpenDocument files (up to 50 MB).'
   ]
   if (imagePaths.length > 0) {
     bodyParts.push(

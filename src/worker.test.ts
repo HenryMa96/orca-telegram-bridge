@@ -10,6 +10,7 @@ import {
   computeTailHashes,
   extractMessageItems,
   findUnsyncedTail,
+  isTelegramOriginatedUserMessage,
   OrcaCliError,
   type OrcaChatSummary,
   type OrcaCliRunner,
@@ -40,7 +41,26 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     parseMode?: string
     replyMarkup?: TelegramInlineKeyboardMarkup
   }[] = []
-  const sentPhotos: { chatId: number | string; bytes: number; caption?: string }[] = []
+  const sentPhotos: {
+    chatId: number | string
+    bytes: number
+    url?: string
+    filename?: string
+    contentType?: string
+    caption?: string
+    replyToMessageId?: number
+  }[] = []
+  const sentDocuments: {
+    chatId: number | string
+    bytes: number
+    url?: string
+    filename?: string
+    contentType?: string
+    caption?: string
+    replyToMessageId?: number
+  }[] = []
+  // Every message, photo and document in the order the bridge sent them.
+  const outbox: string[] = []
   const sentActions: { chatId: number | string; action: string }[] = []
   const answeredCallbacks: { callbackQueryId: string; text?: string; showAlert?: boolean }[] = []
   const registeredCommands: TelegramBotCommand[][] = []
@@ -78,6 +98,7 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
       return []
     },
     async sendMessage(token, params) {
+      outbox.push(`message:${params.text}`)
       sentMessages.push({
         token,
         chatId: params.chatId,
@@ -102,13 +123,35 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
       return true
     },
     async sendPhoto(_token, params) {
+      outbox.push(`photo:${params.filename ?? ''}`)
       sentPhotos.push({
         chatId: params.chatId,
-        bytes: params.photo.length,
-        caption: params.caption
+        bytes: typeof params.photo === 'string' ? 0 : params.photo.length,
+        url: typeof params.photo === 'string' ? params.photo : undefined,
+        filename: params.filename,
+        contentType: params.contentType,
+        caption: params.caption,
+        replyToMessageId: params.replyToMessageId
       })
       return {
         message_id: 950 + sentPhotos.length,
+        chat: { id: Number(params.chatId), type: 'private' },
+        date: Math.floor(Date.now() / 1000)
+      }
+    },
+    async sendDocument(_token, params) {
+      outbox.push(`document:${params.filename ?? ''}`)
+      sentDocuments.push({
+        chatId: params.chatId,
+        bytes: typeof params.document === 'string' ? 0 : params.document.length,
+        url: typeof params.document === 'string' ? params.document : undefined,
+        filename: params.filename,
+        contentType: params.contentType,
+        caption: params.caption,
+        replyToMessageId: params.replyToMessageId
+      })
+      return {
+        message_id: 970 + sentDocuments.length,
         chat: { id: Number(params.chatId), type: 'private' },
         date: Math.floor(Date.now() / 1000)
       }
@@ -222,6 +265,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     orcaCli,
     sentMessages,
     sentPhotos,
+    sentDocuments,
+    outbox,
     sentActions,
     answeredCallbacks,
     registeredCommands,
@@ -3036,5 +3081,307 @@ test('removing a bridge deletes its voice key', async () => {
   await withVoiceBridge({ config: VOICE_ON, voiceKey: VOICE_KEY }, async ({ worker, host }) => {
     await within(worker.request('bridge.remove', { bridgeId: 'b-voice001' }), 'remove')
     assert.equal(host.data().secrets['voiceKey.b-voice001'], undefined)
+  })
+})
+
+const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24, 7)])
+
+async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-media-'))
+  try {
+    await run(dir)
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+}
+
+// The Orca bot answers the Telegram message 'Show me the chart' with `reply`; `check` then sees
+// what reached Telegram. The allowlist holds the sender unless `allowedUserIds` says otherwise.
+async function replyWith(
+  reply: string,
+  check: (deps: ReturnType<typeof makeMockDeps>, manager: BridgeManager) => void | Promise<void>,
+  setup: {
+    allowedUserIds?: string
+    telegram?: Partial<TelegramClient>
+    renderTable?: BridgeDeps['renderTable']
+  } = {}
+): Promise<void> {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: setup.allowedUserIds ?? '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300
+    }
+  })
+  const deps = makeMockDeps({ telegram: setup.telegram })
+  const baseReadSession = deps.orcaCli.readSession
+  deps.orcaCli.readSession = async (sessionId, limit) => {
+    const session = await baseReadSession(sessionId, limit)
+    return {
+      ...session,
+      entries: session.entries.map((e) => (e.role === 'assistant' ? { ...e, text: reply } : e))
+    }
+  }
+  const { manager, controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1,
+    renderTable: setup.renderTable ?? (async () => null)
+  })
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'Show me the chart'))
+    await check(deps, manager)
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+}
+
+test('a reply with ![CPU](local png) sends the text without that line, then the PNG as a captioned photo', async () => {
+  await withTempDir(async (dir) => {
+    const png = path.join(dir, 'cpu.png')
+    await fs.writeFile(png, PNG_BYTES)
+    await replyWith(`CPU use today:\n\n![CPU](${png})\n\nPeak at noon.`, (deps) => {
+      assert.deepEqual(deps.outbox, ['message:CPU use today:\n\nPeak at noon.', 'photo:cpu.png'])
+      const [photo] = deps.sentPhotos
+      assert.equal(photo.caption, 'CPU')
+      assert.equal(photo.contentType, 'image/png')
+      assert.equal(photo.bytes, PNG_BYTES.length)
+      assert.equal(photo.url, undefined)
+    })
+  })
+})
+
+test('PDF and CSV references go out as documents; id_rsa, .env and .ssh files are refused by name only', async () => {
+  await withTempDir(async (dir) => {
+    const docs = path.join(dir, 'my docs')
+    await fs.mkdir(path.join(dir, '.ssh'))
+    await fs.mkdir(docs)
+    await fs.writeFile(path.join(docs, 'report.pdf'), '%PDF-1.4 test')
+    await fs.writeFile(path.join(dir, 'data.csv'), 'a,b\n1,2\n')
+    await fs.writeFile(path.join(dir, 'id_rsa'), 'not a key')
+    await fs.writeFile(path.join(dir, '.env'), 'TOKEN=x')
+    await fs.writeFile(path.join(dir, '.ssh', 'notes.txt'), 'host x')
+    const reply = [
+      'Files:',
+      `![Report](<${path.join(docs, 'report.pdf')}>)`,
+      `![Data](${path.join(dir, 'data.csv')})`,
+      `![Key](${path.join(dir, 'id_rsa')})`,
+      `![Env](${path.join(dir, '.env')})`,
+      `![Notes](${path.join(dir, '.ssh', 'notes.txt')})`
+    ].join('\n')
+    await replyWith(reply, (deps) => {
+      assert.deepEqual(
+        deps.sentDocuments.map((d) => [d.filename, d.contentType, d.caption]),
+        [
+          ['report.pdf', 'application/pdf', 'Report'],
+          ['data.csv', 'text/csv', 'Data']
+        ]
+      )
+      const en = t('en')
+      assert.equal(deps.sentMessages[0].text, 'Files:')
+      assert.equal(
+        deps.sentMessages.at(-1)?.text,
+        [
+          en.attachmentFailed('id_rsa', en.attachmentNotAllowed),
+          en.attachmentFailed('.env', en.attachmentNotAllowed),
+          en.attachmentFailed('notes.txt', en.attachmentNotAllowed)
+        ].join('\n')
+      )
+      assert.ok(
+        deps.sentMessages.every((m) => !m.text.includes(dir)),
+        'a Telegram message shows a local folder'
+      )
+    })
+  })
+})
+
+test('a file named .png that is not a PNG is refused and its path stays in the log only', async () => {
+  await withTempDir(async (dir) => {
+    const fake = path.join(dir, 'chart.png')
+    await fs.writeFile(fake, 'just text, no image signature')
+    await replyWith(`![Chart](${fake})`, (deps, manager) => {
+      assert.equal(deps.sentPhotos.length, 0)
+      assert.equal(deps.sentDocuments.length, 0)
+      const en = t('en')
+      assert.deepEqual(
+        deps.sentMessages.map((m) => m.text),
+        [en.attachmentFailed('chart.png', en.attachmentNotImage)]
+      )
+      const warn = manager.getState().logs.find((e) => e.level === 'warn' && e.message.includes('chart.png'))
+      assert.ok(warn?.details?.includes(fake), JSON.stringify(warn))
+    })
+  })
+})
+
+test('an https image URL is sent by URL, an https file URL as a document, an http URL stays as text', async () => {
+  const reply = [
+    'Links:',
+    '![Logo](https://example.com/img/logo.png?size=2)',
+    '![Sheet](https://example.com/files/q3.xlsx)',
+    '![Old](http://example.com/old.png)'
+  ].join('\n')
+  await replyWith(reply, (deps) => {
+    assert.deepEqual(deps.sentPhotos.map((p) => [p.url, p.caption]), [['https://example.com/img/logo.png?size=2', 'Logo']])
+    assert.deepEqual(deps.sentDocuments.map((d) => [d.url, d.caption]), [['https://example.com/files/q3.xlsx', 'Sheet']])
+    const text = deps.sentMessages[0].text
+    assert.ok(text.includes('http://example.com/old.png'), text)
+    assert.ok(!text.includes('https://'), text)
+  })
+})
+
+test('a photo Telegram refuses is sent again as a document with its caption', async () => {
+  await withTempDir(async (dir) => {
+    const png = path.join(dir, 'wide.png')
+    await fs.writeFile(png, PNG_BYTES)
+    const photoTries: string[] = []
+    await replyWith(
+      `![Wide chart](${png})`,
+      (deps) => {
+        assert.deepEqual(photoTries, ['wide.png'])
+        assert.deepEqual(
+          deps.sentDocuments.map((d) => [d.filename, d.contentType, d.caption, d.bytes]),
+          [['wide.png', 'image/png', 'Wide chart', PNG_BYTES.length]]
+        )
+        // Nothing failed, so no failure line; the document answers the user's message.
+        assert.equal(deps.sentMessages.length, 0)
+        assert.equal(deps.sentDocuments[0].replyToMessageId, 101)
+      },
+      {
+        telegram: {
+          async sendPhoto(_token, params) {
+            photoTries.push(params.filename ?? '')
+            throw new TelegramApiError('Bad Request: PHOTO_INVALID_DIMENSIONS', 400)
+          }
+        }
+      }
+    )
+  })
+})
+
+test('attachments go out after the table images', async () => {
+  await withTempDir(async (dir) => {
+    const png = path.join(dir, 'cpu.png')
+    await fs.writeFile(png, PNG_BYTES)
+    const reply = `| Host | CPU |\n| --- | --- |\n| a | 5% |\n\n![CPU](${png})`
+    await replyWith(
+      reply,
+      (deps) => {
+        assert.deepEqual(
+          deps.outbox.map((e) => (e.startsWith('message:') ? 'message' : e)),
+          ['message', 'photo:table-1.png', 'photo:cpu.png']
+        )
+        assert.ok(!deps.sentMessages[0].text.includes('cpu.png'), deps.sentMessages[0].text)
+      },
+      { renderTable: async () => PNG_BYTES }
+    )
+  })
+})
+
+test('while the bridge is open to everyone local files are held back with one line; https URLs still go out', async () => {
+  await withTempDir(async (dir) => {
+    const png = path.join(dir, 'cpu.png')
+    const pdf = path.join(dir, 'report.pdf')
+    await fs.writeFile(png, PNG_BYTES)
+    await fs.writeFile(pdf, '%PDF-1.4 test')
+    const reply = `Done.\n![CPU](${png})\n![Report](${pdf})\n![Logo](https://example.com/logo.png)`
+    await replyWith(
+      reply,
+      (deps, manager) => {
+        assert.deepEqual(deps.sentPhotos.map((p) => p.url), ['https://example.com/logo.png'])
+        assert.equal(deps.sentDocuments.length, 0)
+        assert.deepEqual(
+          deps.sentMessages.map((m) => m.text),
+          ['Done.', t('en').attachmentNeedsAllowlist]
+        )
+        const warn = manager.getState().logs.find((e) => e.level === 'warn' && e.message.includes('local file attachment'))
+        assert.ok(warn?.details?.includes(pdf), JSON.stringify(warn))
+      },
+      { allowedUserIds: '' }
+    )
+  })
+})
+
+test('the handoff tells the Orca bot how to attach files and still carries the Telegram marker', async () => {
+  await replyWith('ok', (deps) => {
+    const body = deps.sentToBots[0].body
+    assert.equal(isTelegramOriginatedUserMessage(body), true)
+    const lines = body.split('\n')
+    assert.match(lines[1], /^Reply directly in this chat/)
+    assert.match(lines[2], /!\[short caption\]\(absolute local path or https URL\)/)
+    assert.equal(lines.at(-1), 'Show me the chart')
+  })
+})
+
+test('Orca -> Telegram sync sends the attachments of a bot reply too', async () => {
+  await withTempDir(async (dir) => {
+    const pdf = path.join(dir, 'summary.pdf')
+    await fs.writeFile(pdf, '%PDF-1.4 test')
+    const boundChatId = 'orca-bound-media'
+    let chatActivityAt = 1000
+    const session: OrcaSessionRead = {
+      orcaSessionId: boundChatId,
+      state: 'done',
+      entries: [{ kind: 'message', role: 'assistant', text: 'Old reply' }]
+    }
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      secrets: { botToken: '123456:TEST_TOKEN' },
+      settings: {
+        enabled: false,
+        defaultBot: 'Assistant',
+        allowedUserIds: '777888',
+        proxyUrl: '',
+        replyTimeoutSec: 300,
+        syncOrcaOutbound: true
+      },
+      storage: {
+        'tg.bindings': [
+          { tgChatId: '777888', botId: 'bot-1', botName: 'Assistant', orcaChatId: boundChatId, updatedAt: 1000 }
+        ]
+      }
+    })
+    const deps = makeMockDeps({
+      orcaCli: {
+        async listBotChats() {
+          return [
+            {
+              id: boundChatId,
+              title: 'Bound Chat',
+              lastActivityAt: chatActivityAt,
+              lastAsked: null,
+              lastSaid: null,
+              home: false,
+              self: false,
+              closed: false
+            }
+          ]
+        },
+        async readSession() {
+          return { ...session, entries: [...session.entries] }
+        }
+      }
+    })
+    const { controller, worker } = await mountController(host, {
+      telegram: deps.telegram,
+      orcaCli: deps.orcaCli,
+      pollIntervalMs: 10
+    })
+    try {
+      await controller.syncOrcaBoundChatsOnce()
+      chatActivityAt = 2000
+      session.entries.push({ kind: 'message', role: 'assistant', text: `Summary attached.\n\n![Summary](${pdf})` })
+      await controller.syncOrcaBoundChatsOnce()
+      assert.deepEqual(deps.outbox, ['message:Summary attached.', 'document:summary.pdf'])
+      assert.equal(deps.sentDocuments[0].chatId, '777888')
+      assert.equal(deps.sentDocuments[0].caption, 'Summary')
+    } finally {
+      await controller.dispose()
+      await worker.deactivate()
+    }
   })
 })

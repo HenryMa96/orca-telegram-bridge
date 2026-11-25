@@ -13,7 +13,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **As many bridges as you need.** Each bridge pairs one Telegram bot with one Orca bot, so `@ci_bot` can front your CI watcher and `@dev_bot` your coding assistant. Every bridge has its own token, access list, language, proxy, group and voice settings, and they all run at once: a bridge that fails never stops the others.
 - **Private chats and groups**, open to everyone or restricted to the Telegram user and group IDs you list.
 - **Voice messages**, transcribed with OpenRouter or OpenAI and answered as text.
-- **Images in, rich replies out**: photos reach the Orca bot as files; Markdown and tables come back formatted.
+- **Images and files both ways**: photos reach the Orca bot as files, and the Orca bot can send back charts, screenshots and documents; Markdown and tables come back formatted.
 - **No server to run**: the plugin long-polls Telegram from inside Orca. No public IP, webhook or extra daemon.
 
 ## Features
@@ -26,6 +26,7 @@ Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-tel
 - **HTTP proxy support** (`proxyUrl` or `HTTPS_PROXY` / `HTTP_PROXY`)
 - **Per-chat Orca context binding** — keeps multi-turn conversation history in a dedicated Orca chat per Telegram chat and automatically tracks Orca bot renames by `botId`
 - **Telegram → Orca image forwarding** — downloads compressed photos and uncompressed image documents locally and passes their file path(s) to the Orca bot (with optional caption)
+- **Orca → Telegram images and documents** — the Orca bot attaches a file by writing `![caption](path or https URL)`; the plugin sends it as a photo or document
 - **Voice messages**: per bridge, voice messages and audio files are transcribed with OpenRouter or OpenAI and reach the Orca bot as text
 - **Optional two-way Orca-side sync** (`syncOrcaOutbound`) — optionally forwards messages you send directly in Orca (and bot replies) from bound chats back to Telegram
 - **Telegram `/` command menu** (`setMyCommands`) + **interactive inline buttons**: `/help`, `/new`, `/home`, `/bots`, `/use`, `/chats`, `/bind`, `/rename`, `/sync`, `/automations`, `/run`, `/status`
@@ -213,6 +214,26 @@ Then a voice message, or an audio file (mp3, m4a, ogg, wav, flac, webm), reaches
 - The bridge's HTTP proxy, when set, is used for the transcription too.
 - With **Voice messages** off, or on without a key, the sender gets a short reply that voice messages are not enabled for this bot.
 - If the transcription fails, the sender gets a short reply with the reason, and the Logs tab has the details.
+
+## Images and files from the Orca bot
+
+An Orca bot can only answer in text, so the plugin gives it a convention: to send an image or a file, the bot writes it on its own line as
+
+```markdown
+![CPU usage, last hour](C:\Users\me\AppData\Local\Temp\cpu.png)
+```
+
+The plugin tells the Orca bot about this in every message, takes those lines out of the reply, sends the text, then sends each file with its caption. It works for direct replies and for [Orca → Telegram sync](#features).
+
+- **Images** (PNG, JPEG, GIF, WEBP) go as photos. The plugin checks the file's content, not only its extension. A photo Telegram refuses (too large or too long) goes again as a file.
+- **Documents**: PDF, CSV, TSV, TXT, MD, XLSX, XLS, DOCX, DOC, PPTX, PPT, ODT, ODS, ODP.
+- **https links** to images or documents: Telegram downloads them itself, so nothing leaves your computer.
+- Limits from Telegram: photos up to 10 MB (5 MB by link), documents up to 50 MB (20 MB by link).
+- A file that is missing, too large or not allowed is not sent; the chat gets one short line with the file name (never the full path) and the reason.
+
+**Files from your computer are sent only when the bridge is restricted** to [Allowed Telegram IDs](#who-can-talk-to-the-bot). While the bot is open to everyone, a file reference gets a short "only when restricted" line instead, so a stranger cannot ask the bot for your files; https links still work. The same rule already applies to Orca → Telegram sync and to group **All messages**.
+
+Even when restricted, the Orca bot reads files with your rights, and an allowed person can ask it for one. The plugin always refuses files in credential folders (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.config/gcloud`) and `.env` files, even through a shortcut or link, and sends only the image and document types above. Allow only people you trust if the bot can see private documents.
 
 ## Telegram Commands
 
