@@ -30,7 +30,11 @@ function cleanCellText(raw: string): string {
     .trim()
 }
 
-export function extractTablesFromMarkdown(md: string): {
+// `tableMarker` writes the line that replaces table n (1-based) in the reply text.
+export function extractTablesFromMarkdown(
+  md: string,
+  tableMarker: (n: number) => string
+): {
   textWithMarkers: string
   tables: ExtractedTable[]
 } {
@@ -68,7 +72,7 @@ export function extractTablesFromMarkdown(md: string): {
 
       if (headers.length >= 2 && rows.length >= 1) {
         tables.push({ headers, rows })
-        outLines.push(`📊 **表格 ${tables.length}**（见下方图片）`)
+        outLines.push(tableMarker(tables.length))
         i = j - 1
         continue
       }

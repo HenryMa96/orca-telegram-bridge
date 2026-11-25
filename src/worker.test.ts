@@ -4,6 +4,7 @@ import path from 'node:path'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import { assert, mockHost, mountWorker, test, type MockHost } from 'orca/testing'
 import type { OrcaWorkerApi } from 'orca/worker'
+import { t } from './i18n'
 import {
   computeTailHashes,
   extractMessageItems,
@@ -292,11 +293,11 @@ test('extractTablesFromMarkdown extracts GFM tables outside code fences', () => 
     '| a | b |',
     '```'
   ].join('\n')
-  const { textWithMarkers, tables } = extractTablesFromMarkdown(md)
+  const { textWithMarkers, tables } = extractTablesFromMarkdown(md, t('en').tableMarker)
   assert.equal(tables.length, 1)
   assert.deepEqual(tables[0].headers, ['名称', '状态'])
   assert.deepEqual(tables[0].rows, [['DemoWorkspace', '正常']])
-  assert.match(textWithMarkers, /📊 \*\*表格 1\*\*/)
+  assert.match(textWithMarkers, /📊 \*\*Table 1\*\* \(see image below\)/)
   assert.match(textWithMarkers, /\| code \| fence \|/)
 })
 
@@ -1189,7 +1190,7 @@ test('saving settings that do not touch the connection keeps an in-flight reply 
     release.resolve()
     await within(replied.promise, 'the reply to reach Telegram')
     assert.equal(deps.sentMessages[0].text, 'Reply #1 from Assistant')
-    assert.ok(!deps.sentMessages.some((m) => m.text.startsWith('处理失败')))
+    assert.ok(!deps.sentMessages.some((m) => m.text.startsWith('Processing failed')))
   } finally {
     release.resolve()
     await controller.dispose()
@@ -1222,7 +1223,7 @@ test('an Orca CLI failure in /home or a Home button answers the user and keeps p
   const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
   try {
     await within(replied.promise, 'an error reply to /home')
-    assert.match(deps.sentMessages[0].text, /处理失败：orca bot chats failed/)
+    assert.match(deps.sentMessages[0].text, /Processing failed: orca bot chats failed/)
     assert.equal(controller.getState().status, 'connected')
     assert.equal(controller.getState().lastError, null)
 
@@ -1368,7 +1369,7 @@ test('an SVG image document is refused instead of being handed to the bot as .jp
       }
     })
     assert.equal(deps.sentToBots.length, 0)
-    assert.match(deps.sentMessages[0].text, /暂不支持该图片格式/)
+    assert.match(deps.sentMessages[0].text, /This image format is not supported/)
   } finally {
     await controller.dispose()
     await worker.deactivate()
@@ -1499,7 +1500,7 @@ test('a failing orca CLI call shows its args, exit code and stderr in the panel 
     assert.match(entry.details ?? '', /bot=Assistant/)
     assert.match(entry.details ?? '', /elapsedMs=\d+/)
     // The user is still told it failed.
-    assert.match(deps.sentMessages.at(-1)?.text ?? '', /处理失败/)
+    assert.match(deps.sentMessages.at(-1)?.text ?? '', /Processing failed/)
   } finally {
     await worker.deactivate()
   }
@@ -1534,7 +1535,7 @@ test('the bot token never reaches log messages, details, storage, orca.log or th
     assert.match(surfaces.state, /bot<redacted>/)
     assert.match(surfaces.export, /bot<redacted>/)
     const reply = deps.sentMessages.at(-1)?.text ?? ''
-    assert.match(reply, /^处理失败：/)
+    assert.match(reply, /^Processing failed: /)
     assert.ok(!reply.includes(REAL_TOKEN) && !reply.includes('bot123:ABC'), 'the Telegram reply holds the token')
   } finally {
     await worker.deactivate()
@@ -1682,6 +1683,152 @@ test('entries stored by 0.2.0 without a scope load into state and export', async
     const text = (await controller.exportLogs()).text
     assert.match(text, /2026-01-01T00:00:00\.000Z INFO \[-\] old entry one\n2026-01-02T00:00:00\.000Z ERROR \[-\] old failure\n/)
   } finally {
+    await worker.deactivate()
+  }
+})
+
+const CJK = /[\u4e00-\u9fff]/
+
+// What a stranger reads after messaging the bot while the allowlist is empty.
+async function unauthorizedReply(
+  replyLanguage?: string
+): Promise<{ reply: string; language: string }> {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      ...(replyLanguage === undefined ? {} : { replyLanguage })
+    }
+  })
+  const deps = makeMockDeps()
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'hello'))
+    return { reply: deps.sentMessages[0]?.text ?? '', language: controller.getState().config.replyLanguage }
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+}
+
+test('by default the bridge answers a stranger in English with their Telegram ID', async () => {
+  const { reply, language } = await unauthorizedReply()
+  assert.equal(language, 'en')
+  assert.match(reply, /^Access denied\. Your Telegram ID is 777888\./)
+  assert.ok(!CJK.test(reply), `the English reply holds Chinese text: ${reply}`)
+})
+
+test('with Portuguese chosen the bridge answers a stranger in Portuguese', async () => {
+  const { reply } = await unauthorizedReply('pt-BR')
+  assert.match(reply, /^Acesso negado\. Seu ID do Telegram é 777888\./)
+})
+
+test('with Chinese chosen the bridge keeps its original Chinese text', async () => {
+  const { reply } = await unauthorizedReply('zh-CN')
+  assert.equal(reply, '未授权访问。你的 Telegram ID 是 777888，请先在 Orca 的 Telegram 面板中将其加入白名单。')
+})
+
+test('an unknown stored reply language falls back to English', async () => {
+  const { reply, language } = await unauthorizedReply('fr')
+  assert.equal(language, 'en')
+  assert.match(reply, /^Access denied\./)
+})
+
+test('saving a new reply language sends the Telegram command menu again in that language', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  // Each long poll stays open until the test answers it, as Telegram does while no message arrives.
+  const polls: PromiseWithResolvers<TelegramUpdate[]>[] = []
+  const deps = makeMockDeps({
+    telegram: {
+      getUpdates(_token, _params, options) {
+        const poll = Promise.withResolvers<TelegramUpdate[]>()
+        polls.push(poll)
+        options?.signal?.addEventListener('abort', () => poll.resolve([]), { once: true })
+        return poll.promise
+      }
+    }
+  })
+  const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+  try {
+    await until(() => polls.length === 1, 'the first poll')
+    assert.equal(deps.registeredCommands.length, 1)
+    assert.equal(deps.registeredCommands[0].find((c) => c.command === 'help')?.description, 'Show available commands')
+
+    await within(
+      controller.saveConfig({
+        enabled: true,
+        defaultBot: 'Assistant',
+        allowedUserIds: '777888',
+        proxyUrl: '',
+        replyTimeoutSec: 300,
+        syncOrcaOutbound: false,
+        replyLanguage: 'pt-BR'
+      }),
+      'saveConfig with a new language'
+    )
+    polls[0].resolve([])
+    await until(() => deps.registeredCommands.length === 2, 'the command menu in Portuguese')
+
+    const [english, portuguese] = deps.registeredCommands
+    assert.deepEqual(
+      portuguese.map((c) => c.command),
+      english.map((c) => c.command)
+    )
+    assert.equal(portuguese.find((c) => c.command === 'help')?.description, 'Mostrar os comandos disponíveis')
+    assert.equal(controller.getState().config.replyLanguage, 'pt-BR')
+  } finally {
+    await controller.dispose()
+    await worker.deactivate()
+  }
+})
+
+test('a reply that Orca shortened ends with the note in the chosen language', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: {
+      enabled: false,
+      defaultBot: 'Assistant',
+      allowedUserIds: '777888',
+      proxyUrl: '',
+      replyTimeoutSec: 300,
+      replyLanguage: 'pt-BR'
+    }
+  })
+  const deps = makeMockDeps()
+  const baseReadSession = deps.orcaCli.readSession
+  deps.orcaCli.readSession = async (sessionId, limit) => {
+    const session = await baseReadSession(sessionId, limit)
+    return {
+      ...session,
+      entries: session.entries.map((e) => (e.role === 'assistant' ? { ...e, shortened: true } : e))
+    }
+  }
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    await controller.handleIncomingUpdate(textUpdate(1, 777888, 'Write the full report'))
+    const reply = deps.sentMessages.at(-1)?.text ?? ''
+    assert.ok(reply.startsWith('Reply #1 from Assistant'), reply)
+    assert.ok(
+      reply.endsWith('(A resposta era longa demais e foi encurtada. Abra o Orca para ver o texto completo.)'),
+      reply
+    )
+    assert.ok(!CJK.test(reply), `the Portuguese reply holds Chinese text: ${reply}`)
+  } finally {
+    await controller.dispose()
     await worker.deactivate()
   }
 })

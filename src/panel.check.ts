@@ -9,7 +9,8 @@ export default defineCheck({
       proxyUrl: '',
       replyTimeoutSec: 300,
       syncOrcaOutbound: false,
-      debugLogging: false
+      debugLogging: false,
+      replyLanguage: 'en'
     }
   },
   configuredPaused: {
@@ -23,7 +24,8 @@ export default defineCheck({
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
       syncOrcaOutbound: true,
-      debugLogging: true
+      debugLogging: true,
+      replyLanguage: 'pt-BR'
     },
     storage: {
       'tg.bindings': [

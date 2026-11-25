@@ -98,6 +98,15 @@
         "default": false
       },
       {
+        "key": "replyLanguage",
+        "title": "Telegram Reply Language",
+        "description": "Language of the bridge's own Telegram replies and command menu: en (English), pt-BR (Português do Brasil) or zh-CN (中文). Bot replies are not translated.",
+        "type": "string",
+        "default": "en",
+        "enum": ["en", "pt-BR", "zh-CN"],
+        "enumLabels": ["English", "Português (Brasil)", "中文"]
+      },
+      {
         "key": "debugLogging",
         "title": "Debug Logging",
         "description": "Record detailed debug entries (Telegram and Orca CLI calls with timings, dispatch steps, swallowed errors) in the Logs tab. Tokens are redacted.",

@@ -36,6 +36,7 @@ import type {
   BridgeState,
   SaveConfigInput
 } from './protocol'
+import type { ReplyLanguage } from './i18n'
 
 type LogFilter = 'all' | 'errors' | 'warnings' | 'debug'
 
@@ -50,6 +51,7 @@ const allowedIdsDraft = atom('')
 const proxyUrlDraft = atom('')
 const timeoutDraft = atom('300')
 const syncOrcaOutboundDraft = atom(false)
+const replyLanguageDraft = atom<ReplyLanguage>('en')
 const busy = atom(false)
 const feedback = atom<{ tone: 'success' | 'danger' | 'accent'; text: string } | null>(null)
 const formHydrated = atom(false)
@@ -65,6 +67,11 @@ const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
   { value: 'errors', label: 'Errors' },
   { value: 'warnings', label: 'Warnings and errors' },
   { value: 'debug', label: 'Debug only' }
+]
+const REPLY_LANGUAGE_OPTIONS: Array<{ value: ReplyLanguage; label: string }> = [
+  { value: 'en', label: 'English' },
+  { value: 'pt-BR', label: 'Português (Brasil)' },
+  { value: 'zh-CN', label: '中文' }
 ]
 const EXPORT_UNAVAILABLE = 'Export needs the Orca desktop app'
 
@@ -89,6 +96,7 @@ function hydrateForm(state: BridgeState, force = false): void {
   set(proxyUrlDraft, state.config.proxyUrl)
   set(timeoutDraft, String(state.config.replyTimeoutSec))
   set(syncOrcaOutboundDraft, state.config.syncOrcaOutbound)
+  set(replyLanguageDraft, state.config.replyLanguage)
   set(formHydrated, true)
   set(formDirty, false)
 }
@@ -134,6 +142,7 @@ async function saveConfig(): Promise<void> {
       proxyUrl: read(proxyUrlDraft).trim(),
       replyTimeoutSec: Number.isFinite(parsedTimeout) ? parsedTimeout : 300,
       syncOrcaOutbound: read(syncOrcaOutboundDraft),
+      replyLanguage: read(replyLanguageDraft),
       ...(cleanToken ? { botToken: cleanToken } : {})
     }
     const next = await plugin.request('bridge.saveConfig', payload)
@@ -464,6 +473,12 @@ export default function Panel() {
                   value={read(timeoutDraft)}
                   placeholder="300"
                   onChange={(v) => edit(timeoutDraft, v)}
+                />
+                <Select
+                  label="Telegram reply language"
+                  value={read(replyLanguageDraft)}
+                  options={REPLY_LANGUAGE_OPTIONS}
+                  onChange={(v) => edit(replyLanguageDraft, v as ReplyLanguage)}
                 />
                 <Switch
                   label="Enable automatic polling"

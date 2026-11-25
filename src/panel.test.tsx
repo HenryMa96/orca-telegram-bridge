@@ -19,7 +19,8 @@ function makeState(overrides: Partial<BridgeState> = {}): BridgeState {
       proxyUrl: 'http://127.0.0.1:7890',
       replyTimeoutSec: 300,
       syncOrcaOutbound: false,
-      debugLogging: false
+      debugLogging: false,
+      replyLanguage: 'en'
     },
     bots: [
       { id: 'bot-1', name: 'Assistant', specialty: 'Workspace assistant', agent: 'claude' }
@@ -132,6 +133,28 @@ test('default bot select offers auto with a non-empty value and saves it as empt
   await view.select({ label: 'Default Orca Bot' }, '__auto__')
   await view.press({ text: 'Save Settings' })
   assert.equal(saved!.defaultBot, '')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('the reply language select shows the saved language and saves the chosen one', async () => {
+  let saved: Record<string, unknown> | null = null
+  const state = makeState({ config: { ...makeState().config, replyLanguage: 'zh-CN' } })
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => state,
+      'bridge.saveConfig': (input: Record<string, unknown>) => {
+        saved = input
+        return state
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.equal(view.valueOf(view.find({ label: 'Telegram reply language' })!), 'zh-CN')
+
+  await view.select({ label: 'Telegram reply language' }, 'pt-BR')
+  await view.press({ text: 'Save Settings' })
+  assert.equal(saved!.replyLanguage, 'pt-BR')
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

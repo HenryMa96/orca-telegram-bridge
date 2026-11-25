@@ -1,4 +1,6 @@
 // The panel <-> worker contract, declared once: src/panel.tsx and src/worker.ts both read it.
+import type { ReplyLanguage } from './i18n'
+
 export {}
 
 export type BridgeConnectionStatus =
@@ -48,6 +50,7 @@ export type BridgeConfig = {
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
   debugLogging: boolean
+  replyLanguage: ReplyLanguage
 }
 
 export type BridgeState = {
@@ -75,6 +78,8 @@ export type SaveConfigInput = {
   proxyUrl: string
   replyTimeoutSec: number
   syncOrcaOutbound: boolean
+  // Optional for callers from 0.2.1; absent keeps the current language.
+  replyLanguage?: ReplyLanguage
 }
 
 export type TestConnectionResult = {

@@ -1,5 +1,10 @@
 import { assert, test } from 'orca/testing'
-import { exceedsTelegramPhotoLimits, renderTableToPng, type ExtractedTable } from './table-render'
+import {
+  exceedsTelegramPhotoLimits,
+  extractTablesFromMarkdown,
+  renderTableToPng,
+  type ExtractedTable
+} from './table-render'
 
 const table = (cols: number, rows: number): ExtractedTable => ({
   headers: Array.from({ length: cols }, (_, c) => `H${c}`),
@@ -16,4 +21,11 @@ test('a table too tall for Telegram sendPhoto keeps its markdown instead of beco
 test('an ordinary table is still eligible for an image', () => {
   assert.equal(exceedsTelegramPhotoLimits(table(3, 10)), false)
   assert.equal(exceedsTelegramPhotoLimits(table(6, 40)), false)
+})
+
+test('each table is replaced by the marker line the caller gives, numbered from 1', () => {
+  const md = ['Intro', '| a | b |', '| --- | --- |', '| 1 | 2 |', '', 'Middle', '| c | d |', '| --- | --- |', '| 3 | 4 |'].join('\n')
+  const { textWithMarkers, tables } = extractTablesFromMarkdown(md, (n) => `[Tabela ${n}]`)
+  assert.equal(tables.length, 2)
+  assert.equal(textWithMarkers, 'Intro\n[Tabela 1]\n\nMiddle\n[Tabela 2]')
 })
