@@ -91,7 +91,8 @@ const MAX_LABEL = 500
 const ORCA_BOT_LABEL = 'Orca bot (this Telegram bot talks only to it)'
 const NEW_BOT_LABEL = 'New Telegram bot'
 const NEEDS_ID = 'Add at least one Telegram ID, or choose Anyone on Telegram.'
-const ALL_NEEDS_IDS = 'All messages works only with "Only these people and groups". While anyone can talk, the bot reads only messages for it.'
+const ALL_NEEDS_IDS =
+  'Following the conversation works only with "Only these people and groups". While anyone can talk, the bot reads only messages for it.'
 
 const LOG_FILTERS: Array<{ value: LogFilter; label: string }> = [
   { value: 'all', label: 'All levels' },
@@ -108,16 +109,35 @@ const ACCESS_OPTIONS: Array<{ value: AccessMode; label: string }> = [
   { value: 'restricted', label: 'Only these people and groups' },
   { value: 'open', label: 'Anyone on Telegram' }
 ]
-// 'off' stands for allowGroups false; the other values are the group mode.
-const GROUP_OPTIONS: Array<{ value: 'off' | GroupMode; label: string }> = [
-  { value: 'off', label: 'Off' },
-  { value: 'addressed', label: 'Only messages for the bot' },
-  { value: 'all', label: 'All messages' }
+// One choice says both what the bot reads in a group and when it answers; it maps to allowGroups,
+// groupMode and groupReply.
+type GroupBehavior = 'off' | 'addressed' | 'all-mentioned' | 'all-helpful'
+const GROUP_OPTIONS: Array<{ value: GroupBehavior; label: string; description: string }> = [
+  { value: 'off', label: 'Off', description: 'The bot ignores groups and leaves any group it is added to.' },
+  {
+    value: 'addressed',
+    label: 'Answers when called',
+    description:
+      'Reads only messages for it (an @mention, a reply to the bot or a command) and answers each one. Other messages never reach the Orca bot.'
+  },
+  {
+    value: 'all-mentioned',
+    label: 'Follows the conversation, answers when called',
+    description:
+      'Reads every message as context, and answers only an @mention, a reply to the bot or a command.'
+  },
+  {
+    value: 'all-helpful',
+    label: 'Follows the conversation, joins in when useful',
+    description:
+      'Reads every message. Answers when called, and on its own when it can clearly help; otherwise stays silent.'
+  }
 ]
-const GROUP_REPLY_OPTIONS: Array<{ value: GroupReply; label: string }> = [
-  { value: 'mentioned', label: 'Only when addressed' },
-  { value: 'helpful', label: 'When it can help' }
-]
+
+function groupBehavior(allowGroups: boolean, groupMode: GroupMode, groupReply: GroupReply): GroupBehavior {
+  if (!allowGroups) return 'off'
+  return groupMode === 'addressed' ? 'addressed' : `all-${groupReply}`
+}
 const VOICE_PROVIDER_OPTIONS: Array<{ value: VoiceProvider; label: string }> = [
   { value: 'openrouter', label: 'OpenRouter' },
   { value: 'openai', label: 'OpenAI' }
@@ -486,15 +506,16 @@ function hasAllowedIds(raw: string): boolean {
 }
 
 // The card's plain-words line for groups. While the bot is open to everyone the worker reads
-// only messages for it, even with All messages saved.
+// only messages that call it, even with a Follows the conversation option saved.
 function groupsSummary(bridge: BridgeView, openToEveryone: boolean): string {
   const { allowGroups, groupMode, groupReply } = bridge.config
-  if (!allowGroups) return 'Groups: off'
-  if (groupMode === 'addressed') return 'Groups: messages for the bot'
-  if (openToEveryone) return 'Groups: messages for the bot (all messages needs an ID list)'
-  return groupReply === 'helpful'
-    ? 'Groups: reads all, replies when it can help'
-    : 'Groups: reads all, replies when addressed'
+  const behavior = groupBehavior(allowGroups, groupMode, groupReply)
+  if (behavior === 'off') return 'Groups: off'
+  if (behavior === 'addressed') return 'Groups: answers when called'
+  if (openToEveryone) return 'Groups: answers when called (following the conversation needs an ID list)'
+  return behavior === 'all-helpful'
+    ? 'Groups: follows the conversation, joins in when useful'
+    : 'Groups: follows the conversation, answers when called'
 }
 
 function bridgeCard(bridge: BridgeView, isBusy: boolean) {
@@ -599,7 +620,8 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
   }
   const accessMode = read(accessModeDraft)
   const idsError = read(allowedIdsError)
-  const groupChoice = read(allowGroupsDraft) ? read(groupModeDraft) : 'off'
+  const groupChoice = groupBehavior(read(allowGroupsDraft), read(groupModeDraft), read(groupReplyDraft))
+  const followsAll = groupChoice === 'all-mentioned' || groupChoice === 'all-helpful'
   const voiceOn = read(voiceEnabledDraft)
   const voiceProvider = read(voiceProviderDraft)
 
@@ -675,34 +697,27 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
         <Stack gap="sm">
           <Heading level={3}>Groups</Heading>
           <RadioGroup
-            label="Group messages"
+            label="In groups"
             labelHidden
             value={groupChoice}
             options={GROUP_OPTIONS}
             onChange={(v) => {
-              if (v === 'off') {
-                edit(allowGroupsDraft, false)
-                return
+              const choice = v as GroupBehavior
+              edit(allowGroupsDraft, choice !== 'off')
+              if (choice === 'addressed') edit(groupModeDraft, 'addressed')
+              if (choice === 'all-mentioned' || choice === 'all-helpful') {
+                edit(groupModeDraft, 'all')
+                edit(groupReplyDraft, choice === 'all-helpful' ? 'helpful' : 'mentioned')
               }
-              edit(allowGroupsDraft, true)
-              edit(groupModeDraft, v as GroupMode)
             }}
           />
-          {groupChoice === 'all' && (
-            <Stack gap="xs">
-              <RadioGroup
-                label="Replies"
-                value={read(groupReplyDraft)}
-                options={GROUP_REPLY_OPTIONS}
-                onChange={(v) => edit(groupReplyDraft, v as GroupReply)}
-              />
-              <Text muted size="xs">
-                Addressed means a mention, a reply to the bot or a command for it. Each group
-                message is sent to the Orca bot, so it uses a bot turn per message.
-              </Text>
-            </Stack>
+          {followsAll && (
+            <Text muted size="xs">
+              Following the conversation sends every group message to the Orca bot: one bot turn
+              per message.
+            </Text>
           )}
-          {groupChoice === 'all' && accessMode === 'open' && (
+          {followsAll && accessMode === 'open' && (
             <Text muted size="xs">
               {ALL_NEEDS_IDS}
             </Text>
@@ -717,7 +732,7 @@ function bridgeEditor(bridge: BridgeView, state: BridgeState, isBusy: boolean, c
               <Stack gap="xs">
                 <Text size="xs">
                   In groups the bot gets only commands and replies to its messages. For @mentions
-                  and all messages:
+                  and to follow the conversation:
                 </Text>
                 <Text size="xs">1. In @BotFather, send /setprivacy and pick this bot.</Text>
                 <Text size="xs">2. Choose Disable.</Text>

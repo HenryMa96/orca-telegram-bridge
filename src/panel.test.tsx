@@ -1003,7 +1003,7 @@ test('the editor has sections and keeps the rare options in a closed Advanced', 
   await view.unmount()
 })
 
-const ALL_NOTE = /All messages works only with "Only these people and groups"/
+const ALL_NOTE = /Following the conversation works only with "Only these people and groups"/
 const PRIVACY_TITLE = 'Privacy mode is on'
 const JOIN_TITLE = 'This bot cannot join groups'
 
@@ -1018,7 +1018,7 @@ async function mountGroups(
   return view
 }
 
-test('the reply policy shows only with All messages, and Save sends the group choice', async () => {
+test('one group choice says what the bot reads and when it answers, and Save maps it to the three fields', async () => {
   const state = makeState()
   const saved: SaveConfigInput[] = []
   const host = mockHost({
@@ -1040,29 +1040,37 @@ test('the reply policy shows only with All messages, and Save sends the group ch
   })
   const view = await mount(panel, { host })
   await openEditor(view, 'b1')
-  assert.equal(view.valueOf({ label: 'Group messages' }), 'off')
-  assert.equal(view.find({ label: 'Replies' }), null)
+  const groups = { label: 'In groups' }
+  assert.equal(view.valueOf(groups), 'off')
+  // Every option but Off says what the bot reads and when it answers.
+  const options = view.find(groups)!.props.options as { value: string; description: string }[]
+  for (const option of options.filter((o) => o.value !== 'off')) {
+    assert.match(option.description, /^Reads .*[Aa]nswers/, option.value)
+  }
+  assert.equal(view.find({ text: /one bot turn per message/ }), null)
 
-  await view.select({ label: 'Group messages' }, 'addressed')
-  assert.equal(view.find({ label: 'Replies' }), null)
+  await view.select(groups, 'addressed')
+  assert.equal(view.find({ text: /one bot turn per message/ }), null)
 
-  await view.select({ label: 'Group messages' }, 'all')
-  assert.equal(view.valueOf({ label: 'Replies' }), 'mentioned')
-  assert.ok(view.find({ text: /Addressed means a mention, a reply to the bot or a command for it\..*uses a bot turn per message/ }))
-  await view.select({ label: 'Replies' }, 'helpful')
+  await view.select(groups, 'all-helpful')
+  assert.ok(view.find({ text: /Following the conversation sends every group message to the Orca bot: one bot turn per message\./ }))
   await view.press({ text: 'Save' })
   assert.equal(saved[0].allowGroups, true)
   assert.equal(saved[0].groupMode, 'all')
   assert.equal(saved[0].groupReply, 'helpful')
-  assert.equal(view.valueOf({ label: 'Replies' }), 'helpful')
+  assert.equal(view.valueOf(groups), 'all-helpful')
 
-  await view.select({ label: 'Group messages' }, 'off')
-  assert.equal(view.find({ label: 'Replies' }), null)
+  await view.select(groups, 'off')
+  assert.equal(view.find({ text: /one bot turn per message/ }), null)
   await view.press({ text: 'Save' })
   assert.equal(saved[1].allowGroups, false)
   // Off keeps the mode and reply policy for the next time groups are turned on
   assert.equal(saved[1].groupMode, 'all')
   assert.equal(saved[1].groupReply, 'helpful')
+
+  await view.select(groups, 'all-mentioned')
+  await view.press({ text: 'Save' })
+  assert.deepEqual([saved[2].allowGroups, saved[2].groupMode, saved[2].groupReply], [true, 'all', 'mentioned'])
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])
   await view.unmount()
@@ -1087,15 +1095,15 @@ test('each bridge card says how it reads groups', async () => {
   const host = mockHost({ requests: { 'bridge.getState': () => state } })
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: 'Groups: off' }))
-  assert.ok(view.find({ text: 'Groups: messages for the bot' }))
-  assert.ok(view.find({ text: 'Groups: reads all, replies when addressed' }))
-  assert.ok(view.find({ text: 'Groups: reads all, replies when it can help' }))
-  assert.ok(view.find({ text: 'Groups: messages for the bot (all messages needs an ID list)' }))
+  assert.ok(view.find({ text: 'Groups: answers when called' }))
+  assert.ok(view.find({ text: 'Groups: follows the conversation, answers when called' }))
+  assert.ok(view.find({ text: 'Groups: follows the conversation, joins in when useful' }))
+  assert.ok(view.find({ text: 'Groups: answers when called (following the conversation needs an ID list)' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })
 
-test('All messages with an open list says it reads only messages for the bot', async () => {
+test('following the conversation with an open list says it reads only messages for the bot', async () => {
   const open = await mountGroups({ allowGroups: true, groupMode: 'all', allowedUserIds: '' })
   assert.ok(open.find({ text: ALL_NOTE }))
   await open.unmount()

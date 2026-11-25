@@ -167,22 +167,23 @@ Removing an ID stops the bot from answering that person or group, and stops sync
 
 ### Use the bot in a group
 
-Groups are off for a new bridge. Choose per bridge in the Setup tab → the bridge's **Edit** → **Groups**:
+Groups are off for a new bridge. Choose per bridge in the Setup tab → the bridge's **Edit** → **Groups**. Each option says what the bot reads and when it answers. "Called" means an `@yourbot` mention, a reply to one of the bot's messages, or a command for it (`/help@yourbot`).
 
-- **Off**: the bot ignores group messages. If someone adds it to a group, it leaves the group at once and the Logs tab says so.
-- **Only messages for the bot**: commands addressed to it (`/help@yourbot`), replies to its messages and, with privacy mode off, `@yourbot` mentions. The mention is removed before the text goes to the Orca bot. Normal conversation in the group is ignored.
-- **All messages**: every message an allowed person writes in the group goes to the Orca bot, so it follows the whole conversation. One more choice appears, **Replies**:
-  - **Only when addressed** (default for a new bridge): the bot answers only messages for it (a mention, a reply to the bot, a command for it). Other messages only give it context; the bridge never posts an answer to them.
-  - **When it can help**: the bot may also answer a message not addressed to it, when it can clearly help; otherwise it stays silent (`NO_REPLY`).
+| Option | Reads | Answers |
+|---|---|---|
+| **Off** | nothing; it leaves any group it is added to (the Logs tab says so) | never |
+| **Answers when called** | only messages that call it; other messages never reach the Orca bot | each message that calls it |
+| **Follows the conversation, answers when called** | every message, as context | only when called |
+| **Follows the conversation, joins in when useful** | every message | when called, and on its own when it can clearly help; otherwise it stays silent (`NO_REPLY`) |
 
-  Each group message starts one Orca bot turn, so a busy group costs more. Messages not addressed to the bot never get a typing indicator or an error line in the group; problems go to the Logs tab. **All messages** works only with **Only these people and groups**; while the bridge is open to everyone, the bot reads only messages for it, so strangers in a busy group cannot start an Orca run with every line.
+The mention is removed before the text goes to the Orca bot. With the two **Follows the conversation** options, each group message starts one Orca bot turn, so a busy group costs more. Messages that do not call the bot never get a typing indicator or an error line in the group; problems go to the Logs tab. These two options work only with **Only these people and groups**; while the bridge is open to everyone, the bot reads only messages that call it, so strangers in a busy group cannot start an Orca run with every line.
 
-A bridge updated from 0.4.0 or older starts with **Only messages for the bot**, the behavior it had before. A bridge that already used **All messages** before 0.8.0 starts with **When it can help**, so it keeps answering in the group; choose **Only when addressed** to make it answer only messages for it.
+A bridge updated from 0.4.0 or older starts with **Answers when called**, the behavior it had before. A bridge that used **All messages** and was last saved before 0.8.0 starts with **Follows the conversation, joins in when useful**, so it keeps answering in the group. A bridge saved on 0.8.0 keeps the reply choice it saved then.
 
 Telegram decides two things that the plugin cannot change. Set them for the bot in `@BotFather`; after the bot has connected once, the bridge's editor warns under **Groups** when one of them blocks the option you chose:
 
 - **Allow Groups?** (`/setjoingroups`): must be enabled, or Telegram refuses to add the bot to a group.
-- **Privacy mode** (`/setprivacy`; [Telegram: privacy mode](https://core.telegram.org/bots/features#privacy-mode)): on by default. While it is on, the bot receives only commands addressed to it and replies to its own messages: `@yourbot` mentions and **All messages** do not work. Choose **Disable**, then remove the bot from the group and add it again; Telegram applies the change only then. A bot that is a group admin receives every message either way.
+- **Privacy mode** (`/setprivacy`; [Telegram: privacy mode](https://core.telegram.org/bots/features#privacy-mode)): on by default. While it is on, the bot receives only commands addressed to it and replies to its own messages: `@yourbot` mentions and the **Follows the conversation** options do not work. Choose **Disable**, then remove the bot from the group and add it again; Telegram applies the change only then. A bot that is a group admin receives every message either way.
 
 Then:
 
@@ -226,7 +227,7 @@ The plugin tells the Orca bot about this in every message, takes those lines out
 - Limits from Telegram: photos up to 10 MB (5 MB by link), documents up to 50 MB (20 MB by link).
 - A file that is missing, too large or not allowed is not sent; the chat gets one short line with the file name (never the full path) and the reason.
 
-**Files from your computer are sent only when the bridge is restricted** to [Only these people and groups](#who-can-talk-to-the-bot). While the bot is open to everyone, a file reference gets a short "only when restricted" line instead, so a stranger cannot ask the bot for your files; https links still work. The same rule already applies to Orca → Telegram sync and to group **All messages**.
+**Files from your computer are sent only when the bridge is restricted** to [Only these people and groups](#who-can-talk-to-the-bot). While the bot is open to everyone, a file reference gets a short "only when restricted" line instead, so a stranger cannot ask the bot for your files; https links still work. The same rule already applies to Orca → Telegram sync and to the group **Follows the conversation** options.
 
 Even when restricted, the Orca bot reads files with your rights, and an allowed person can ask it for one. The plugin always refuses files in credential folders (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.config/gcloud`) and `.env` files, even through a shortcut or link, and sends only the image and document types above. Allow only people you trust if the bot can see private documents.
 
