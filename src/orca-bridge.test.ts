@@ -70,7 +70,8 @@ function makeRunner(options: {
     async runAutomation() {},
     async sendToBot({ body }) {
       sentBodies.push(body)
-    }
+    },
+    async openPanel() {}
   }
   return { runner, sentBodies, readLimits, postSendReads: () => postSendReads }
 }

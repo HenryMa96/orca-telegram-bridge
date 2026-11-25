@@ -48,6 +48,7 @@ export interface OrcaCliRunner {
   renameChat(sessionId: string, name: string): Promise<void>
   listAutomations(): Promise<OrcaAutomationSummary[]>
   runAutomation(id: string): Promise<void>
+  openPanel(pluginKey: string, panelId: string): Promise<void>
   sendToBot(params: {
     botName: string
     chatId: string | 'new'
@@ -437,6 +438,9 @@ export function createOrcaCliRunner(): OrcaCliRunner {
     },
     async runAutomation(id) {
       await runOrcaJson<unknown>(['automations', 'run', id, '--json'])
+    },
+    async openPanel(pluginKey, panelId) {
+      await runOrcaJson<unknown>(['plugin', 'open', pluginKey, '--panel', panelId, '--json'])
     },
     async sendToBot({ botName, chatId, subject, body, signal }) {
       await runOrcaJson<unknown>(

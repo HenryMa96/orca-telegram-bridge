@@ -90,6 +90,8 @@ test('renders bridge status, allows saving config, and handles unauthorized user
   await view.press({ text: 'Save Settings' })
   assert.ok(lastSavedInput !== null)
   assert.equal('botToken' in lastSavedInput!, false)
+  // Bot on/off lives only in the Bot card; saving the form must not touch it.
+  assert.equal('enabled' in lastSavedInput!, false)
   assert.ok(view.find({ text: 'Settings saved.' }))
 
   await view.press({ text: 'Test Connection' })
@@ -160,12 +162,12 @@ test('the reply language select shows the saved language and saves the chosen on
 })
 
 test('failing worker request shows feedback and refresh keeps unsaved edits', async () => {
-  let failToggle = true
+  let failSetEnabled = true
   const host = mockHost({
     requests: {
       'bridge.getState': () => makeState(),
-      'bridge.togglePolling': () => {
-        if (failToggle) throw new Error('worker exploded')
+      'bridge.setEnabled': () => {
+        if (failSetEnabled) throw new Error('worker exploded')
         return makeState()
       }
     }
@@ -173,12 +175,72 @@ test('failing worker request shows feedback and refresh keeps unsaved edits', as
   const view = await mount(panel, { host })
   await view.type({ label: 'HTTP Proxy URL (optional)' }, 'http://10.0.0.1:8080', { replace: true })
 
-  await view.press({ text: 'Pause Polling' })
+  await view.toggle({ label: 'Bot active' })
   assert.ok(view.find({ text: /worker exploded/ }))
+  // the switch shows the worker's state, so a failed request leaves it on
+  assert.equal(view.valueOf({ label: 'Bot active' }), true)
   // busy must be released so controls stay usable after the failure
-  failToggle = false
+  assert.equal(view.find({ label: 'Bot active' })!.props.disabled, false)
+  failSetEnabled = false
   await view.press({ text: 'Refresh' })
   assert.equal(view.valueOf(view.find({ label: 'HTTP Proxy URL (optional)' })!), 'http://10.0.0.1:8080')
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('turning Bot active off asks the worker at once and shows the paused state', async () => {
+  let current = makeState()
+  const sent: Array<{ enabled: boolean }> = []
+  const host = mockHost({
+    requests: {
+      'bridge.getState': () => current,
+      'bridge.setEnabled': (input: { enabled: boolean }) => {
+        sent.push(input)
+        current = makeState({
+          status: input.enabled ? 'connected' : 'stopped',
+          polling: input.enabled,
+          config: { ...current.config, enabled: input.enabled }
+        })
+        return current
+      }
+    }
+  })
+  const view = await mount(panel, { host })
+  assert.equal(view.valueOf({ label: 'Bot active' }), true)
+  assert.ok(view.find({ text: 'Connected' }))
+
+  await view.toggle({ label: 'Bot active' })
+  assert.deepEqual(sent, [{ enabled: false }])
+  assert.equal(view.valueOf({ label: 'Bot active' }), false)
+  assert.ok(view.find({ text: 'Paused' }))
+  assert.equal(view.find({ text: 'Connected' }), null)
+  // the old header toggle must not come back as 'Start Polling' once paused
+  assert.equal(view.find({ text: 'Start Polling' }), null)
+  assert.deepEqual(view.errors, [])
+  await view.unmount()
+})
+
+test('bot on/off has one control: no polling button and no polling switch in the form', async () => {
+  const host = mockHost({ requests: { 'bridge.getState': () => makeState() } })
+  const view = await mount(panel, { host })
+  assert.equal(view.find({ text: 'Pause Polling' }), null)
+  assert.equal(view.find({ text: 'Start Polling' }), null)
+  assert.equal(view.find({ label: 'Enable automatic polling' }), null)
+  assert.equal(view.findAll({ label: 'Bot active' }).length, 1)
+  await view.unmount()
+})
+
+test('without a saved token the Bot active switch is disabled and says why', async () => {
+  const state = makeState({
+    status: 'needs_token',
+    polling: false,
+    botUsername: null,
+    config: { ...makeState().config, hasToken: false }
+  })
+  const host = mockHost({ requests: { 'bridge.getState': () => state } })
+  const view = await mount(panel, { host })
+  assert.equal(view.find({ label: 'Bot active' })!.props.disabled, true)
+  assert.ok(view.find({ text: 'Save a bot token first.' }))
   assert.deepEqual(view.errors, [])
   await view.unmount()
 })

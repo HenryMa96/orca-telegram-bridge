@@ -35,11 +35,15 @@
         "text": "TG: Init",
         "icon": "bot",
         "tone": "neutral",
-        "tooltip": "Telegram Bridge status (click to toggle polling)",
-        "command": "telegram-bridge.togglePolling"
+        "tooltip": "Telegram Bridge status (click to open the panel)",
+        "command": "telegram-bridge.openPanel"
       }
     ],
     "commands": [
+      {
+        "id": "telegram-bridge.openPanel",
+        "title": "Telegram Bridge: Open Panel"
+      },
       {
         "id": "telegram-bridge.togglePolling",
         "title": "Telegram Bridge: Toggle Polling"

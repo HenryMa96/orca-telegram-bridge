@@ -45,7 +45,6 @@ const activeTab = atom<'setup' | 'bindings' | 'logs'>('setup', 'setup', { persis
 const logFilter = atom<LogFilter>('logFilter', 'all', { persist: 'plugin' })
 
 const tokenDraft = atom('')
-const enabledDraft = atom(true)
 const defaultBotDraft = atom('')
 const allowedIdsDraft = atom('')
 const proxyUrlDraft = atom('')
@@ -90,7 +89,6 @@ function edit<T>(draft: Atom<T>, value: T): void {
 
 function hydrateForm(state: BridgeState, force = false): void {
   if (!force && read(formHydrated)) return
-  set(enabledDraft, state.config.enabled)
   set(defaultBotDraft, state.config.defaultBot || AUTO_BOT)
   set(allowedIdsDraft, state.config.allowedUserIds)
   set(proxyUrlDraft, state.config.proxyUrl)
@@ -136,7 +134,6 @@ async function saveConfig(): Promise<void> {
     const parsedTimeout = Number.parseInt(read(timeoutDraft), 10)
     const cleanToken = read(tokenDraft).trim()
     const payload: SaveConfigInput = {
-      enabled: read(enabledDraft),
       defaultBot: read(defaultBotDraft) === AUTO_BOT ? '' : read(defaultBotDraft).trim(),
       allowedUserIds: read(allowedIdsDraft).trim(),
       proxyUrl: read(proxyUrlDraft).trim(),
@@ -184,11 +181,11 @@ async function testConnection(): Promise<void> {
   }
 }
 
-async function togglePolling(): Promise<void> {
+async function setEnabled(enabled: boolean): Promise<void> {
   set(busy, true)
   set(feedback, null)
   try {
-    const next = await plugin.request('bridge.togglePolling')
+    const next = await plugin.request('bridge.setEnabled', { enabled })
     set(bridgeState, next)
     hydrateForm(next, !read(formDirty))
   } catch (err) {
@@ -413,14 +410,6 @@ export default function Panel() {
       <Row gap="xs" wrap>
         <Button
           size="sm"
-          variant={state.polling ? 'outline' : 'solid'}
-          disabled={isBusy || !state.config.hasToken}
-          onPress={togglePolling}
-        >
-          {state.polling ? 'Pause Polling' : 'Start Polling'}
-        </Button>
-        <Button
-          size="sm"
           variant="outline"
           disabled={isBusy || !state.config.hasToken}
           onPress={testConnection}
@@ -439,6 +428,24 @@ export default function Panel() {
       >
         <Tab value="setup" label="Setup">
           <Stack gap="sm">
+            <Card title="Bot" description="Turns the Telegram bot on or off right away.">
+              <Stack gap="xs">
+                <Row justify="between" align="center">
+                  <Switch
+                    label="Bot active"
+                    checked={state.config.enabled}
+                    disabled={isBusy || !state.config.hasToken}
+                    onChange={(v) => void setEnabled(v)}
+                  />
+                  <Badge tone={badge.tone}>{badge.label}</Badge>
+                </Row>
+                {!state.config.hasToken && (
+                  <Text muted size="xs">
+                    Save a bot token first.
+                  </Text>
+                )}
+              </Stack>
+            </Card>
             {openToEveryone && (
               <Callout tone="warning" title="Open to everyone" icon="warning">
                 <Text size="xs">
@@ -491,11 +498,6 @@ export default function Panel() {
                   value={read(replyLanguageDraft)}
                   options={REPLY_LANGUAGE_OPTIONS}
                   onChange={(v) => edit(replyLanguageDraft, v as ReplyLanguage)}
-                />
-                <Switch
-                  label="Enable automatic polling"
-                  checked={read(enabledDraft)}
-                  onChange={(v) => edit(enabledDraft, v)}
                 />
                 <Switch
                   label="Sync Orca-side messages to Telegram"

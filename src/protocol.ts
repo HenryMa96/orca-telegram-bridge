@@ -72,7 +72,8 @@ export type BridgeState = {
 export type SaveConfigInput = {
   botToken?: string
   clearToken?: boolean
-  enabled: boolean
+  // Absent keeps the current state; the panel switches polling with `bridge.setEnabled`.
+  enabled?: boolean
   defaultBot: string
   allowedUserIds: string
   proxyUrl: string
@@ -101,6 +102,7 @@ declare module 'orca' {
     'bridge.saveConfig': { input: SaveConfigInput; output: BridgeState }
     'bridge.testConnection': { output: TestConnectionResult }
     'bridge.togglePolling': { output: BridgeState }
+    'bridge.setEnabled': { input: { enabled: boolean }; output: BridgeState }
     'bridge.allowUserId': { input: { userId: string }; output: BridgeState }
     'bridge.resetBinding': { input: { tgChatId: string }; output: BridgeState }
     'bridge.clearLogs': { output: BridgeState }

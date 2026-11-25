@@ -44,6 +44,7 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
   const sentToBots: { botName: string; chatId: string; subject: string; body: string }[] = []
   const renamedChats: { sessionId: string; name: string }[] = []
   const triggeredAutomations: string[] = []
+  const openedPanels: { pluginKey: string; panelId: string }[] = []
 
   let chats: OrcaChatSummary[] = [
     {
@@ -163,6 +164,9 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     async runAutomation(id) {
       triggeredAutomations.push(id)
     },
+    async openPanel(pluginKey, panelId) {
+      openedPanels.push({ pluginKey, panelId })
+    },
     async sendToBot({ botName, chatId, subject, body }) {
       sentToBots.push({ botName, chatId, subject, body })
       readPollCount = 0
@@ -211,7 +215,8 @@ function makeMockDeps(overrides: Partial<{ telegram: Partial<TelegramClient>; or
     registeredCommands,
     sentToBots,
     renamedChats,
-    triggeredAutomations
+    triggeredAutomations,
+    openedPanels
   }
 }
 
@@ -2131,4 +2136,110 @@ test('outbound sync forwards nothing while the allowlist is empty', async () => 
     await controller.dispose()
     await worker.deactivate()
   }
+})
+
+async function withPolling(
+  enabled: boolean,
+  run: (controller: TelegramBridgeController, host: MockHost, deps: ReturnType<typeof makeMockDeps>) => Promise<void>,
+  orcaCli: Partial<OrcaCliRunner> = {}
+): Promise<void> {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled, defaultBot: 'Assistant', allowedUserIds: '42', proxyUrl: '', replyTimeoutSec: 300 }
+  })
+  const deps = makeMockDeps({ orcaCli })
+  const { controller, worker } = await mountController(host, {
+    telegram: deps.telegram,
+    orcaCli: deps.orcaCli,
+    pollIntervalMs: 1
+  })
+  try {
+    await run(controller, host, deps)
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+}
+
+test('the open-panel command opens this plugin panel by its manifest key', async () => {
+  await withPolling(false, async (controller, _host, deps) => {
+    assert.equal(await controller.openPanel(), 'Telegram panel opened')
+    assert.deepEqual(deps.openedPanels, [{ pluginKey: 'drecchia.telegram-bridge', panelId: 'telegram-bridge' }])
+  })
+})
+
+test('a failed open-panel command is logged as a warning and answered, not thrown', async () => {
+  await withPolling(
+    false,
+    async (controller) => {
+      const answer = await controller.openPanel()
+      assert.match(answer, /no_workspace/)
+      assert.match(answer, /Open a workspace in Orca first/)
+      const entry = controller.getState().logs.find((e) => e.level === 'warn' && e.scope === 'orca-cli')
+      assert.ok(entry, 'warn log entry')
+      assert.match(entry.message, /Failed to open the Telegram panel/)
+    },
+    {
+      async openPanel() {
+        throw new Error('no_workspace: no workspace is showing')
+      }
+    }
+  )
+})
+
+test('setEnabled stops and starts polling at once and repeating a value changes nothing', async () => {
+  await withPolling(true, async (controller, host) => {
+    await until(() => controller.getState().polling, 'polling to start')
+
+    const off = await within(controller.setEnabled(false), 'setEnabled(false)')
+    assert.equal(off.polling, false)
+    assert.equal(off.status, 'stopped')
+    assert.equal(host.data().settings.enabled, false)
+
+    const again = await within(controller.setEnabled(false), 'setEnabled(false) again')
+    assert.equal(again.config.enabled, false)
+    assert.equal(again.polling, false)
+
+    const on = await within(controller.setEnabled(true), 'setEnabled(true)')
+    assert.equal(on.config.enabled, true)
+    assert.equal(on.polling, true)
+    assert.equal(host.data().settings.enabled, true)
+
+    const stillOn = await within(controller.setEnabled(true), 'setEnabled(true) again')
+    assert.equal(stillOn.config.enabled, true)
+    assert.equal(stillOn.polling, true)
+  })
+})
+
+test('saving settings without the enabled field keeps polling running', async () => {
+  await withPolling(true, async (controller, host) => {
+    await until(() => controller.getState().polling, 'polling to start')
+    const saved = await within(
+      controller.saveConfig({
+        defaultBot: 'Assistant',
+        allowedUserIds: '42, 43',
+        proxyUrl: '',
+        replyTimeoutSec: 300,
+        syncOrcaOutbound: false
+      }),
+      'saveConfig'
+    )
+    assert.equal(saved.config.enabled, true)
+    assert.equal(saved.polling, true)
+    assert.equal(host.data().settings.enabled, true)
+  })
+})
+
+test('a stranger blocked in two groups is logged once per group', async () => {
+  await withAccess('42', async (controller) => {
+    const otherGroup: Partial<TelegramMessage> = { chat: { id: -100600, type: 'supergroup', title: 'Other' } }
+    await controller.handleIncomingUpdate(groupUpdate(1, 777, '@demo_orca_bot hi'))
+    await controller.handleIncomingUpdate(groupUpdate(2, 777, '@demo_orca_bot hi', otherGroup))
+    await controller.handleIncomingUpdate(groupUpdate(3, 777, '@demo_orca_bot again'))
+    const warns = controller.getState().logs.filter((e) => e.level === 'warn').map((e) => e.message)
+    assert.equal(warns.filter((m) => m.includes('in group -100500')).length, 1)
+    assert.equal(warns.filter((m) => m.includes('in group -100600')).length, 1)
+  })
 })

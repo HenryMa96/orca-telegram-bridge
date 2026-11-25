@@ -305,19 +305,30 @@ function fileTimestamp(date: Date): string {
   )}${pad(date.getMinutes())}${pad(date.getSeconds())}`
 }
 
-async function readPluginInfo(): Promise<{ name: string; version: string }> {
+type PluginInfo = { name: string; version: string; key: string | null }
+
+async function readPluginInfo(): Promise<PluginInfo> {
   try {
     const raw = JSON.parse(
       await fs.readFile(new URL('../orca-plugin.json', import.meta.url), 'utf8')
-    ) as { name?: unknown; version?: unknown }
+    ) as { name?: unknown; version?: unknown; id?: unknown; publisher?: unknown }
     return {
       name: typeof raw.name === 'string' ? raw.name : 'unknown',
-      version: typeof raw.version === 'string' ? raw.version : 'unknown'
+      version: typeof raw.version === 'string' ? raw.version : 'unknown',
+      // Orca keys a plugin as `<publisher>.<id>`; `orca plugin open` needs that key.
+      key: typeof raw.publisher === 'string' && typeof raw.id === 'string' ? `${raw.publisher}.${raw.id}` : null
     }
   } catch {
     // The manifest is not readable where this module was loaded from.
-    return { name: 'unknown', version: 'unknown' }
+    return { name: 'unknown', version: 'unknown', key: null }
   }
+}
+
+let pluginKeyPromise: Promise<string | null> | null = null
+
+function readPluginKey(): Promise<string | null> {
+  pluginKeyPromise ??= readPluginInfo().then((info) => info.key)
+  return pluginKeyPromise
 }
 
 export class TelegramBridgeController {
@@ -508,7 +519,8 @@ export class TelegramBridgeController {
     const replyLanguage =
       input.replyLanguage === undefined ? prev.replyLanguage : normalizeLanguage(input.replyLanguage)
 
-    await this.orca.settings.set('enabled', Boolean(input.enabled))
+    const enabled = input.enabled ?? prev.enabled
+    await this.orca.settings.set('enabled', enabled)
     await this.orca.settings.set('defaultBot', defaultBot)
     await this.orca.settings.set('allowedUserIds', input.allowedUserIds.trim())
     await this.orca.settings.set('proxyUrl', input.proxyUrl.trim())
@@ -518,7 +530,7 @@ export class TelegramBridgeController {
 
     this.config = {
       hasToken: Boolean(this.cachedToken),
-      enabled: Boolean(input.enabled),
+      enabled,
       defaultBot,
       allowedUserIds: input.allowedUserIds.trim(),
       proxyUrl: input.proxyUrl.trim(),
@@ -599,20 +611,30 @@ export class TelegramBridgeController {
     }
   }
 
-  async togglePolling(): Promise<BridgeState> {
+  togglePolling(): Promise<BridgeState> {
+    return this.runConfigOp(() => this.applyEnabled(!this.config.enabled))
+  }
+
+  setEnabled(enabled: boolean): Promise<BridgeState> {
+    return this.runConfigOp(() => this.applyEnabled(enabled))
+  }
+
+  private async applyEnabled(nextEnabled: boolean): Promise<BridgeState> {
     if (!this.config.hasToken) {
       this.status = 'needs_token'
       this.lastError = 'Configure a Telegram Bot Token first.'
       this.emitState()
       return this.getState()
     }
+    if (nextEnabled === this.config.enabled && nextEnabled === Boolean(this.pollAbort)) {
+      return this.getState()
+    }
 
-    const nextEnabled = !this.config.enabled
     await this.orca.settings.set('enabled', nextEnabled)
     this.config.enabled = nextEnabled
 
     if (nextEnabled) {
-      this.startPolling()
+      if (!this.pollAbort) this.startPolling()
       await this.appendLog('info', 'telegram', 'Telegram polling resumed.')
     } else {
       await this.stopPolling()
@@ -621,6 +643,25 @@ export class TelegramBridgeController {
     }
     this.emitState()
     return this.getState()
+  }
+
+  // Shows this plugin's panel in Orca's right sidebar (the status bar item runs this).
+  async openPanel(): Promise<string> {
+    const key = await readPluginKey()
+    if (!key) {
+      const message = 'Cannot open the Telegram panel: the plugin manifest is not readable.'
+      await this.appendLog('warn', 'orca-cli', message)
+      return message
+    }
+    try {
+      await this.deps.orcaCli.openPanel(key, 'telegram-bridge')
+      return 'Telegram panel opened'
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err)
+      const message = /no_workspace/.test(raw) ? `${raw} (Open a workspace in Orca first)` : raw
+      await this.appendLog('warn', 'orca-cli', `Failed to open the Telegram panel: ${message}`, describeError(err))
+      return message
+    }
   }
 
   async allowUserId(userId: string): Promise<BridgeState> {
@@ -751,6 +792,7 @@ export class TelegramBridgeController {
     if (!isAllowed(allowed, fromId, tgChatId)) {
       const firstInWindow = await this.recordBlockedUser(
         fromId,
+        tgChatId,
         // In a group, also name the group: its ID is what the owner adds to allow the whole group.
         `Blocked unauthorized Telegram user ${fromId} (${formatSenderLabel(msg)})${tgChatId !== fromId ? ` in group ${tgChatId}` : ''}.`
       )
@@ -814,7 +856,7 @@ export class TelegramBridgeController {
     const token = await this.readToken()
 
     if (!isAllowed(allowed, fromId, tgChatId)) {
-      await this.recordBlockedUser(fromId, `Blocked unauthorized Telegram callback from ${fromId}.`)
+      await this.recordBlockedUser(fromId, tgChatId, `Blocked unauthorized Telegram callback from ${fromId}.`)
       if (token) {
         await this.safeAnswerCallbackQuery(token, cq.id, this.i18n.callbackUnauthorized, true)
       }
@@ -870,15 +912,17 @@ export class TelegramBridgeController {
     return next
   }
 
-  // Any stranger can flood the bot; log and post each blocked id at most once a minute.
-  // Returns false while the id is still inside that window.
-  private async recordBlockedUser(fromId: string, logMessage: string): Promise<boolean> {
+  // Any stranger can flood the bot; log and post each blocked id at most once a minute per chat.
+  // Returns false while that sender and chat are still inside the window.
+  private async recordBlockedUser(fromId: string, tgChatId: string, logMessage: string): Promise<boolean> {
     const now = Date.now()
     for (const [id, at] of this.blockedLoggedAt) {
       if (now - at >= BLOCK_LOG_INTERVAL_MS) this.blockedLoggedAt.delete(id)
     }
-    if (this.blockedLoggedAt.has(fromId)) return false
-    this.blockedLoggedAt.set(fromId, now)
+    // Keyed by chat too: each group the sender writes from is logged, as its ID is what the owner allows.
+    const key = `${fromId}:${tgChatId}`
+    if (this.blockedLoggedAt.has(key)) return false
+    this.blockedLoggedAt.set(key, now)
     this.lastBlockedUserId = fromId
     await this.orca.storage.set(STORAGE_LAST_BLOCKED, fromId)
     await this.appendLog('warn', 'bridge', logMessage)
@@ -2664,7 +2708,9 @@ export class TelegramBridgeController {
           `orca orchestration send --to bot:${params.botName} --chat ${params.chatId}`,
           () => cli.sendToBot(params),
           () => `body ${params.body.length} chars`
-        )
+        ),
+      openPanel: (pluginKey, panelId) =>
+        trace(`orca plugin open ${pluginKey} --panel ${panelId}`, () => cli.openPanel(pluginKey, panelId))
     }
   }
 
@@ -2692,23 +2738,23 @@ export class TelegramBridgeController {
     if (state.status === 'needs_token') {
       text = 'TG: Setup'
       tone = 'warning'
-      tooltip = 'Telegram Bridge: add Bot Token in the Telegram panel'
+      tooltip = 'Telegram Bridge: add Bot Token in the Telegram panel (click to open the panel)'
     } else if (state.status === 'connecting') {
       text = 'TG: Connecting'
       tone = 'accent'
-      tooltip = 'Telegram Bridge: connecting to Telegram...'
+      tooltip = 'Telegram Bridge: connecting to Telegram... (click to open the panel)'
     } else if (state.status === 'connected') {
       text = state.botUsername ? `TG: @${state.botUsername}` : 'TG: Online'
       tone = 'success'
-      tooltip = `Telegram Bridge connected -> ${state.config.defaultBot} (click to pause)`
+      tooltip = `Telegram Bridge connected -> ${state.config.defaultBot} (click to open the panel)`
     } else if (state.status === 'error') {
       text = 'TG: Error'
       tone = 'danger'
-      tooltip = `Telegram Bridge error: ${state.lastError || 'unknown'}`
+      tooltip = `Telegram Bridge error: ${state.lastError || 'unknown'} (click to open the panel)`
     } else {
       text = 'TG: Paused'
       tone = 'neutral'
-      tooltip = 'Telegram Bridge paused (click to resume)'
+      tooltip = 'Telegram Bridge paused (click to open the panel)'
     }
 
     try {
@@ -2744,6 +2790,7 @@ export async function activateWithDeps(
   orca.panels.handle('bridge.saveConfig', (input) => controller.saveConfig(input))
   orca.panels.handle('bridge.testConnection', () => controller.testConnection())
   orca.panels.handle('bridge.togglePolling', () => controller.togglePolling())
+  orca.panels.handle('bridge.setEnabled', ({ enabled }) => controller.setEnabled(Boolean(enabled)))
   orca.panels.handle('bridge.allowUserId', ({ userId }) => controller.allowUserId(userId))
   orca.panels.handle('bridge.resetBinding', ({ tgChatId }) => controller.resetBinding(tgChatId))
   orca.panels.handle('bridge.clearLogs', () => controller.clearLogs())
@@ -2754,6 +2801,7 @@ export async function activateWithDeps(
     const next = await controller.togglePolling()
     return `Telegram Bridge: ${next.status}`
   })
+  orca.commands.register('telegram-bridge.openPanel', () => controller.openPanel())
   orca.commands.register('telegram-bridge.testConnection', async () => {
     const res = await controller.testConnection()
     return res.ok ? `Connected as @${res.username || res.botId}` : `Failed: ${res.error}`

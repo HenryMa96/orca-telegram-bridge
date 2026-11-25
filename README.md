@@ -121,12 +121,12 @@ The upstream plugin has the key `henryma96.telegram-bridge`. This fork has a dif
 
 Do these steps after the plugin is installed and approved.
 
-1. Open the **Telegram** sidebar panel in Orca.
+1. Open the **Telegram** sidebar panel in Orca. The **TG** item in Orca's status bar shows the bot's state; click it to open this panel.
 2. Paste your `@BotFather` bot token.
 3. Choose a default Orca bot, or keep **(Auto-select first Orca bot)**. The list shows the bots on this computer (the folders in `~/.orca/bots`).
 4. Choose the **Telegram reply language**: English (default), Português (Brasil) or 中文. The bot uses it for its own replies and its command menu. The Orca bot's answers keep the language the Orca bot writes in.
 5. Optional: set an HTTP proxy (e.g. `http://127.0.0.1:7890`).
-6. Click **Save Settings**, then **Test Connection**.
+6. Click **Save Settings**, then **Test Connection**. The **Bot active** switch at the top of the Setup tab turns the bot on or off at once; no Save needed.
 7. Decide who can use the bot. By default it is open to everyone. See [Who can talk to the bot](#who-can-talk-to-the-bot).
 
 ## Who can talk to the bot
