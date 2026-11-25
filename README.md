@@ -4,9 +4,21 @@ An Orca `trusted-worker` + `components` sidebar plugin that connects Telegram bo
 
 Fork of the original plugin by [HenryMa96](https://github.com/henryma96/orca-telegram-bridge).
 
+<p align="center">
+  <img src="docs/images/setup-card.png" alt="The Telegram panel in Orca: a bridge card showing the Telegram bot and its Orca bot, the Bot active switch, Connected status, group mode and voice provider" width="560">
+</p>
+
+**Talk to your Orca bots from Telegram, from your phone, anywhere.**
+
+- **As many bridges as you need.** Each bridge pairs one Telegram bot with one Orca bot, so `@ci_bot` can front your CI watcher and `@dev_bot` your coding assistant. Every bridge has its own token, access list, language, proxy, group and voice settings, and they all run at once: a bridge that fails never stops the others.
+- **Private chats and groups**, open to everyone or restricted to the Telegram user and group IDs you list.
+- **Voice messages**, transcribed with OpenRouter or OpenAI and answered as text.
+- **Images in, rich replies out**: photos reach the Orca bot as files; Markdown and tables come back formatted.
+- **No server to run**: the plugin long-polls Telegram from inside Orca. No public IP, webhook or extra daemon.
+
 ## Features
 
-- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `BabyShark`, `@dev_bot` → `VerissimaDev`), each with its own token, access list, language, proxy and on/off switch
+- **Several bridges**: one Telegram bot per Orca bot (for example `@ci_bot` → `CIWatcher`, `@dev_bot` → `DevHelper`), each with its own token, access list, language, proxy and on/off switch
 - **Always-on long polling** (`getUpdates`) inside Orca's worker (no public IP, webhook, or external daemon required)
 - **Open or restricted access**: open to everyone while the ID list is empty; add Telegram user or group IDs to restrict it, with one-click **Allow** in the sidebar panel
 - **Telegram groups**: in a group the bot answers commands addressed to it, replies to its own messages and, with Telegram privacy mode off, `@yourbot` mentions
@@ -131,6 +143,10 @@ Do these steps after the plugin is installed and approved. Repeat steps 2–7 fo
 6. Click **Save**, then **Test Connection**. The **Bot active** switch on the bridge's card turns it on or off at once; no Save needed.
 7. Decide who can use this bot. By default it is open to everyone. See [Who can talk to the bot](#who-can-talk-to-the-bot).
 
+<p align="center">
+  <img src="docs/images/bridge-editor.png" alt="The bridge editor: name, bot token, pinned Orca bot, allowed Telegram IDs, proxy, reply timeout, reply language, Orca-side sync, group options and voice transcription settings" width="420">
+</p>
+
 To remove a bridge, click **Remove** on its card, then confirm. Orca forgets its token and its chats; its log entries stay in the Logs tab.
 
 Why not a connector inside Orca's **Bot settings → Connectors**? A plugin cannot add connectors there: Orca's connectors (Slack, Linear, GitHub, Google, Webhook) are built in. A native Telegram connector is requested upstream in [stablyai/orca#45959](https://github.com/stablyai/orca/issues/45959).
@@ -219,9 +235,43 @@ Then a voice message, or an audio file (mp3, m4a, ogg, wav, flac, webm), reaches
 
 - The **Logs** tab lists the newest 40 of up to 200 stored entries. Filter by level (all, errors, warnings and errors, debug only). Entries with details expand to show the error context: Orca CLI args, exit code and stderr; Telegram method, HTTP status and description; chat ids, timings and the top of the stack.
 - Turn on **Debug logging** in the Logs tab (or the `debugLogging` setting, off by default) to also record `debug` entries: Telegram and Orca CLI calls with timings, dispatch start/finish, sync ticks that forward something, config changes (field names only), poll loop start/stop/backoff and errors that were ignored before. Turn it off again when done; errors and warnings keep their details either way.
-- Antivirus HTTPS scanning (for example Kaspersky), VPNs and corporate proxies re-sign HTTPS with their own root certificate, and Node rejects it: `self-signed certificate in certificate chain`. Voice transcription trusts your operating system's certificates as well as Node's, like a browser does, so it works through such scanning (the provider API key then passes through the scanner). Telegram calls deliberately keep Node's own list, because they carry the bot token: if the scanner intercepts `api.telegram.org`, exclude that host from HTTPS scanning in the antivirus or proxy.
+- Error `self-signed certificate in certificate chain`? See [Troubleshooting](#self-signed-certificate-in-certificate-chain).
 - Every message and detail is redacted: the bot token and any `bot<digits>:<secret>` pattern become `bot<redacted>`. Message text from users and bots is never logged, only lengths and ids.
 - For a bug report, click **Export logs**. It saves a text file with a diagnostics header (plugin version, platform, Node version, resolved `orca` CLI path, status, config without the token, bot and binding counts) and every stored entry with its details.
+
+## Troubleshooting
+
+### `self-signed certificate in certificate chain`
+
+<p align="center">
+  <img src="docs/images/logs-certificate-error.png" alt="The Logs tab with two warnings: voice messages not transcribed because the OpenRouter request failed with a self-signed certificate error" width="420">
+</p>
+
+**What it means.** Something between your computer and the service re-signs HTTPS with its own certificate: antivirus HTTPS scanning (Kaspersky, ESET, Avast, Bitdefender…), a VPN, or a corporate proxy. Windows trusts that certificate, so your browser works, but the Node runtime inside Orca has its own certificate list and refuses it. The scanner may pick some sites only; with Kaspersky we saw `openrouter.ai` intercepted while `api.telegram.org` and `api.openai.com` were not.
+
+**What the plugin does.**
+
+- **Voice transcription** (OpenRouter, OpenAI) trusts Windows' certificates as well as Node's, like a browser, so it works through the scanner. The transcription API key then passes through the scanner.
+- **Telegram** keeps Node's own list on purpose, because every Telegram request carries the bot token. If the scanner intercepts `api.telegram.org`, the bridge stops with this error instead of handing the token to the scanner.
+
+**Bypass: exclude the hosts from HTTPS scanning.** This fixes Telegram, and keeps the transcription key out of the scanner too. Exclude:
+
+```text
+api.telegram.org
+openrouter.ai
+api.openai.com
+```
+
+In **Kaspersky** Standard, Plus or Premium ([Kaspersky: encrypted connections settings](https://support.kaspersky.com/kaspersky-for-windows/21.28/157530)):
+
+1. Open Kaspersky and click **Settings** (the gear at the bottom).
+2. Go to **Security settings**, then click **Network settings** in the **Advanced settings** block.
+3. Open **Encrypted connections scan** and click **Configure trusted addresses**.
+4. Click **Add**, type `api.telegram.org`, click **Add**. Repeat for `openrouter.ai` and `api.openai.com`.
+
+Other antivirus products call the same setting HTTPS scanning, SSL/TLS filtering or web protection exclusions. Behind a corporate proxy, ask IT to exclude these hosts from TLS inspection.
+
+Then send the Telegram message or voice message again. The Logs tab shows the result.
 
 ## Develop & Release
 
