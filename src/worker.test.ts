@@ -1328,6 +1328,52 @@ test('a slow bot reply in one Telegram chat does not hold up another chat', asyn
   }
 })
 
+// With Auto, a chat's own texts keep its sender's language even while another chat, in another
+// language, is handled in between.
+test('with Auto, two chats handled side by side each get the bridge texts in their own language', async () => {
+  const host = mockHost({
+    capabilities: CAPABILITIES,
+    secrets: { botToken: '123456:TEST_TOKEN' },
+    settings: { enabled: true, defaultBot: 'Assistant', allowedUserIds: '111, 222', proxyUrl: '', replyTimeoutSec: 300, replyLanguage: 'auto' }
+  })
+  const portuguese = textUpdate(1, 111, 'pergunta lenta')
+  portuguese.message!.from!.language_code = 'pt-br'
+  const spanish = textUpdate(2, 222, 'pregunta rápida')
+  spanish.message!.from!.language_code = 'es'
+  const deps = makeMockDeps({ telegram: { getUpdates: scriptedGetUpdates([[portuguese, spanish]]) } })
+  const releaseA = Promise.withResolvers<void>()
+  const failedA = Promise.withResolvers<void>()
+  const failedB = Promise.withResolvers<void>()
+  // Both bots fail, so the bridge answers with its own text; chat 111's fails only after 222's.
+  deps.orcaCli.sendToBot = async (params) => {
+    if (params.body.includes('chat 111')) await releaseA.promise
+    throw new Error('bot unavailable')
+  }
+  const baseSendMessage = deps.telegram.sendMessage
+  deps.telegram.sendMessage = async (token, params, options) => {
+    const sent = await baseSendMessage(token, params, options)
+    if (String(params.chatId) === '111') failedA.resolve()
+    if (String(params.chatId) === '222') failedB.resolve()
+    return sent
+  }
+  const { controller, worker } = await within(
+    mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, pollIntervalMs: 1, retryBackoffMs: 1 }),
+    'mount'
+  )
+  try {
+    await within(failedB.promise, 'chat 222 answered while chat 111 waits')
+    releaseA.resolve()
+    await within(failedA.promise, 'chat 111 answered after its bot fails')
+    const textOf = (chatId: string) => deps.sentMessages.find((m) => String(m.chatId) === chatId)?.text ?? ''
+    assert.match(textOf('222'), /^Error al procesar: /)
+    assert.match(textOf('111'), /^Falha no processamento: /)
+  } finally {
+    releaseA.resolve()
+    await within(controller.dispose(), 'dispose')
+    await worker.deactivate()
+  }
+})
+
 test('pausing after Telegram rejects the token (401) does not hang while outbound sync is on', async () => {
   const host = mockHost({
     capabilities: CAPABILITIES,
@@ -2090,12 +2136,12 @@ test('Auto sets a command menu per language; a fixed language sets every menu in
         }
       }
     })
-    const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli })
+    const { controller, worker } = await within(mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli }), 'mount')
     try {
       await until(() => deps.registeredMenus.length === 4, 'four command menus')
       return deps.registeredMenus.map((m) => [m.languageCode, m.commands.find((c) => c.command === 'help')?.description])
     } finally {
-      await controller.dispose()
+      await within(controller.dispose(), 'dispose')
       await worker.deactivate()
     }
   }
@@ -2118,7 +2164,10 @@ test("with Auto the Orca bot is told to answer in the user's language; a fixed l
       settings: { enabled: false, defaultBot: 'Assistant', allowedUserIds: '777888', proxyUrl: '', replyTimeoutSec: 300, replyLanguage }
     })
     const deps = makeMockDeps()
-    const { controller, worker } = await mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 })
+    const { controller, worker } = await within(
+      mountController(host, { telegram: deps.telegram, orcaCli: deps.orcaCli, logFlushMs: 0 }),
+      'mount'
+    )
     try {
       await within(controller.handleIncomingUpdate(textUpdate(1, 777888, '¿cuál es el saldo?')), 'message')
       return deps.sentToBots[0]?.body ?? ''

@@ -154,6 +154,27 @@ test('getUpdates asks for membership changes and leaveChat posts the chat id', a
   assert.deepEqual(JSON.parse(leave.body), { chat_id: -100500 })
 })
 
+// Telegram ignores unknown fields, so a misspelled language_code would quietly drop the per-language menus.
+test('setMyCommands sends language_code only for a language menu', async () => {
+  const requests: FakeRequest[] = []
+  await withFakeTelegram(
+    (req, res) => {
+      requests.push(req)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: true, result: true }))
+    },
+    async (proxyUrl) => {
+      const commands = [{ command: 'help', description: 'Ayuda' }]
+      await client.setMyCommands(TOKEN, commands, { proxyUrl })
+      await client.setMyCommands(TOKEN, commands, { proxyUrl }, 'es')
+    }
+  )
+  const [byDefault, spanish] = requests
+  assert.match(byDefault.path, /\/setMyCommands$/)
+  assert.deepEqual(JSON.parse(byDefault.body), { commands: [{ command: 'help', description: 'Ayuda' }] })
+  assert.deepEqual(JSON.parse(spanish.body), { commands: [{ command: 'help', description: 'Ayuda' }], language_code: 'es' })
+})
+
 test('an https:// proxy URL fails with a clear message', async () => {
   await assert.rejects(
     client.getMe(TOKEN, { proxyUrl: 'https://127.0.0.1:1', timeoutMs: 1000 }),
