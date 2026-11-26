@@ -110,7 +110,8 @@ const STORAGE_LOGS = 'tg.logs'
 const STORAGE_AUDIT = 'tg.audit'
 // commandScopes: the user/group ids that got a command menu of their own, so a removed id's menu is deleted.
 // knownNames: the names of the listed ids, shown next to them in the editor.
-const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'chatLanguages', 'commandScopes', 'knownNames'] as const
+// unlistedGroup: the latest group not on a restricted list that the bot heard from, for the panel's Allow.
+const BRIDGE_STORAGE_NAMES = ['offset', 'bindings', 'syncCursors', 'lastBlocked', 'unlistedGroup', 'chatLanguages', 'commandScopes', 'knownNames'] as const
 // What 0.4.0 and earlier stored for their single bridge; moved into "Bridge 1" on the first start.
 const LEGACY_SECRET_BOT_TOKEN = 'botToken'
 // chatLanguages, commandScopes and knownNames came later, so 0.4.0 had nothing to move for them.
@@ -815,6 +816,7 @@ export class BridgeRuntime {
   private telegramCaps: BridgeView['telegramCaps'] = null
   private lastError: string | null = null
   private lastBlockedUserId: string | null = null
+  private unlistedGroup: BridgeView['unlistedGroup'] = null
   private lastPollAt: number | null = null
   private bindings: ChatBinding[] = []
   private syncCursors: Record<string, SyncCursor> = {}
@@ -945,6 +947,15 @@ export class BridgeRuntime {
       botDisplayName: this.botDisplayName,
       lastError: this.lastError,
       lastBlockedUserId: this.lastBlockedUserId,
+      // Hidden once the group is listed by hand in the editor, while groups are off, or while the
+      // bridge is open to everyone.
+      unlistedGroup:
+        this.unlistedGroup &&
+        this.config.allowGroups &&
+        this.config.restricted &&
+        !parseAllowedIds(this.config.allowedUserIds).has(this.unlistedGroup.id)
+          ? this.unlistedGroup
+          : null,
       lastPollAt: this.lastPollAt,
       config: { ...this.config },
       bindings: [...this.bindings].sort((a, b) => b.updatedAt - a.updatedAt),
@@ -1191,7 +1202,8 @@ export class BridgeRuntime {
       this.lastBlockedUserId = null
       await this.orca.storage.set(this.key('lastBlocked'), null)
     }
-    await this.appendLog('info', 'config', `Added Telegram user ${clean} to allowlist.`)
+    await this.forgetUnlistedGroup(clean)
+    await this.appendLog('info', 'config', `Added Telegram ${clean.startsWith('-') ? 'group' : 'user'} ${clean} to allowlist.`)
     await this.auditPanel('allow', clean)
     this.emitState()
   }
@@ -1271,6 +1283,19 @@ export class BridgeRuntime {
       if (!this.leftGroups.has(tgChatId)) await this.leaveGroup(msg.chat, 'debug')
       return null
     }
+    const allowed = parseAllowedIds(this.config.allowedUserIds)
+    // Any line from a group not on a restricted list, even one ignored below or sent by a listed
+    // person, puts the group in the panel's "Allow group" banner and logs its ID once a minute.
+    if (inGroup && this.config.restricted && !allowed.has(tgChatId)) {
+      await this.recordUnlistedGroup(msg.chat)
+      if (this.firstInBlockWindow(`group:${tgChatId}`)) {
+        await this.appendLog(
+          'warn',
+          'bridge',
+          `Group ${tgChatId}${msg.chat.title ? ` (${msg.chat.title})` : ''} is not on the allowlist: only listed people reach the bot there. To allow everyone in it, press Allow group in the panel.`
+        )
+      }
+    }
     const image = extractIncomingImage(msg)
     const unsupportedImage =
       !image && Boolean(msg.document?.mime_type?.toLowerCase().startsWith('image/'))
@@ -1294,7 +1319,6 @@ export class BridgeRuntime {
     if (!text && !image && !unsupportedImage && !voice && !file) return null
 
     const fromId = msg.from ? String(msg.from.id) : tgChatId
-    const allowed = parseAllowedIds(this.config.allowedUserIds)
 
     if (!isAllowed(this.config.restricted, allowed, fromId, tgChatId)) {
       // In 'all' mode a group's other members talk among themselves; only what they address to the
@@ -1739,18 +1763,39 @@ export class BridgeRuntime {
   // Any stranger can flood the bot; log and post each blocked id at most once a minute per chat.
   // Returns false while that sender and chat are still inside the window.
   private async recordBlockedUser(fromId: string, tgChatId: string, logMessage: string): Promise<boolean> {
-    const now = Date.now()
-    for (const [id, at] of this.blockedLoggedAt) {
-      if (now - at >= BLOCK_LOG_INTERVAL_MS) this.blockedLoggedAt.delete(id)
-    }
     // Keyed by chat too: each group the sender writes from is logged, as its ID is what the owner allows.
-    const key = `${fromId}:${tgChatId}`
-    if (this.blockedLoggedAt.has(key)) return false
-    this.blockedLoggedAt.set(key, now)
+    if (!this.firstInBlockWindow(`${fromId}:${tgChatId}`)) return false
     this.lastBlockedUserId = fromId
     await this.orca.storage.set(this.key('lastBlocked'), fromId)
     await this.appendLog('warn', 'bridge', logMessage)
     this.emitState()
+    return true
+  }
+
+  // A group not on the list, for the panel's "Allow group" banner. Only the latest one is kept.
+  private async recordUnlistedGroup(chat: TelegramChat): Promise<void> {
+    const id = String(chat.id)
+    const title = (chat.title ?? '').trim()
+    if (this.unlistedGroup?.id === id && this.unlistedGroup.title === title) return
+    this.unlistedGroup = { id, title }
+    await this.orca.storage.set(this.key('unlistedGroup'), toPlainJson(this.unlistedGroup))
+    this.emitState()
+  }
+
+  // Once the group is allowed or the bot is out of it, the banner has nothing to offer.
+  private async forgetUnlistedGroup(id: string): Promise<void> {
+    if (this.unlistedGroup?.id !== id) return
+    this.unlistedGroup = null
+    await this.orca.storage.set(this.key('unlistedGroup'), null)
+  }
+
+  private firstInBlockWindow(key: string): boolean {
+    const now = Date.now()
+    for (const [id, at] of this.blockedLoggedAt) {
+      if (now - at >= BLOCK_LOG_INTERVAL_MS) this.blockedLoggedAt.delete(id)
+    }
+    if (this.blockedLoggedAt.has(key)) return false
+    this.blockedLoggedAt.set(key, now)
     return true
   }
 
@@ -1761,6 +1806,11 @@ export class BridgeRuntime {
   private async handleMembership(change: TelegramChatMemberUpdated): Promise<void> {
     const status = change.new_chat_member.status
     if (!isGroupChat(change.chat)) return
+    if (status === 'left' || status === 'kicked') {
+      await this.forgetUnlistedGroup(String(change.chat.id))
+      this.emitState()
+      return
+    }
     if (status !== 'member' && status !== 'administrator') return
     if (!this.config.allowGroups) {
       await this.leaveGroup(change.chat, 'info')
@@ -1784,6 +1834,7 @@ export class BridgeRuntime {
     }
     if (this.config.restricted && !parseAllowedIds(this.config.allowedUserIds).has(tgChatId)) {
       parts.push(`To allow everyone in it, add ${tgChatId} under "Only these people and groups".`)
+      await this.recordUnlistedGroup(chat)
     }
     await this.appendLog('info', 'bridge', parts.join(' '))
     this.emitState()
@@ -1804,6 +1855,7 @@ export class BridgeRuntime {
   private async leaveGroup(chat: TelegramChat, level: 'info' | 'debug'): Promise<void> {
     const tgChatId = String(chat.id)
     this.leftGroups.add(tgChatId)
+    await this.forgetUnlistedGroup(tgChatId)
     const token = await this.readToken()
     if (!token) return
     try {
@@ -3805,6 +3857,12 @@ export class BridgeRuntime {
 
     const savedBlocked = await this.orca.storage.get(this.key('lastBlocked'))
     this.lastBlockedUserId = typeof savedBlocked === 'string' ? savedBlocked : null
+
+    const savedGroup = (await this.orca.storage.get(this.key('unlistedGroup'))) as { id?: unknown; title?: unknown } | null
+    this.unlistedGroup =
+      typeof savedGroup?.id === 'string'
+        ? { id: savedGroup.id, title: typeof savedGroup.title === 'string' ? savedGroup.title : '' }
+        : null
 
     const savedCursors = await this.orca.storage.get(this.key('syncCursors'))
     this.syncCursors =
